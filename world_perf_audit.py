@@ -674,7 +674,7 @@ SAFE, LOOK, GAMEPLAY = "safe", "look", "gameplay"
 IMPACT_LABELS = {SAFE: "No visual change", LOOK: "Changes the look", GAMEPLAY: "Can change behaviour"}
 IMPACT_SHORT = {SAFE: "Safe", LOOK: "Visual", GAMEPLAY: "Behaviour"}
 IMPACT_COLORS = {SAFE: "#4caf6a", LOOK: "#e0a03a", GAMEPLAY: "#a77bdb"}
-_REVERTABLE = ("prop", "call", "struct", "nanite", "lods", "ini")
+_REVERTABLE = ("prop", "call", "struct", "nanite", "lods", "ini", "cvar")
 
 
 def _ser(v):
@@ -725,6 +725,26 @@ class ChangeRecorder(object):
         d = {"k": kind}
         d.update(data)
         self.changes.append(d)
+
+    def cvar(self, name, value):
+        """Set a console variable now (so you see the result) and in DefaultEngine.ini [SystemSettings]
+        (so it sticks after a restart). Both old values are recorded."""
+        self.changes.append({"k": "cvar", "name": name, "label": name, "old": _cvar_str(name),
+                             "ini_old": _get_project_ini("SystemSettings", name)})
+        _run_console("%s %s" % (name, value))
+        _set_project_ini("SystemSettings", name, str(value))
+
+
+def _cvar_str(name):
+    try:
+        v = float(unreal.SystemLibrary.get_console_variable_float_value(name))
+        return str(int(v)) if v.is_integer() else ("%g" % v)
+    except Exception:
+        return None
+
+
+def _run_console(cmd):
+    unreal.SystemLibrary.execute_console_command(_editor_world(), cmd)
 
 
 def _resolve(path):
@@ -787,6 +807,10 @@ def _revert_changes(changes):
                 _remove_lods(_resolve(ch["path"]))
             elif k == "ini":
                 _set_project_ini(ch["section"], ch["key"], ch["old"], ch.get("file", "DefaultEngine.ini"))
+            elif k == "cvar":
+                if ch.get("old") is not None:
+                    _run_console("%s %s" % (ch["name"], ch["old"]))
+                _set_project_ini("SystemSettings", ch["name"], ch.get("ini_old"))
             else:
                 raise RuntimeError("%s: %s" % (ch.get("label", k), ch.get("why", "only Ctrl+Z / source control can undo this")))
         except Exception as e:
@@ -1406,6 +1430,29 @@ def _check_volumetric_shadow(ctx):
         metric="%d lights" % len(lights), cost=_score(sev, len(lights) / 12.0), targets=lights,
         fix=fix, fix_label="Disable Cast Volumetric Shadow on these lights",
         impact=LOOK, impact_note="Volumetric fog is no longer shadowed by these lights (light shafts from them disappear).")
+
+
+@check("light_contact_shadows", CAT_LIGHT, "Local lights with contact shadows")
+def _check_contact_shadows(ctx):
+    lights = [c for c in _local_lights(ctx)
+              if _mobility(c) != "STATIC" and float(_prop(c, "contact_shadow_length", 0.0) or 0.0) > 0.0]
+    if not lights:
+        return
+    sev = MEDIUM if len(lights) > 8 else LOW
+
+    def fix(rec, lights=lights):
+        for c in lights:
+            rec.set(c, "contact_shadow_length", 0.0)
+        return "Contact Shadow Length = 0 on %d lights" % len(lights)
+
+    yield Issue(
+        "light_contact_shadows", CAT_LIGHT, sev, "Contact shadows on local lights", "%d lights" % len(lights),
+        detail=("%d local lights have Contact Shadow Length > 0: each one ray-marches the depth buffer for every pixel "
+                "it lights (part of the deferred lighting / shadow projection cost): %s" % (len(lights), _names(lights))),
+        solution="Keep contact shadows on the sun and hero lights; set Light > Contact Shadow Length = 0 on the rest.",
+        metric="%d lights" % len(lights), cost=_score(sev, len(lights) / 30.0), targets=lights,
+        fix=fix, fix_label="Set Contact Shadow Length = 0 on these lights",
+        impact=LOOK, impact_note="These lights lose their small screen-space contact shadows near surfaces.")
 
 
 @check("light_function", CAT_LIGHT, "Lights using light functions")
@@ -2656,6 +2703,11 @@ def scan(selected_only=False, check_keys=None):
         ctx.build_stats()
     except Exception:
         pass
+    if _STATE.get("gpu_profile") and not selected_only:     # re-link measured GPU findings to the new scan
+        try:
+            issues += gpu_profile_issues(_STATE["gpu_profile"], issues)
+        except Exception:
+            _warn("Could not re-link the GPU profile:\n%s" % traceback.format_exc())
     issues.sort(key=lambda i: (-i.cost, -i.severity, i.title))
     world = _editor_world()
     scope = scan_scope(actors)
@@ -3185,70 +3237,90 @@ tr:hover td{background:#232323}.o{color:#8fb8ff}</style></head><body>
 _PROFILE = {"handle": None, "busy": False}
 
 # (keywords in the GPU stat name, label, related scan category, why it costs, what to do,
-#  scan fixes that reduce it: [(check key, optional text the issue title/object must contain)])
+#  scan fixes that reduce it: [(check key, optional text the issue title/object must contain)],
+#  console-variable tweaks for it: [(cvar, "min"|"max", target, what changes)])
 _GPU_PASS_RULES = [
     (("shadowdepth", "virtualshadow", "shadowprojection", "vsm", "shadow"), "Shadows", CAT_LIGHT,
      "Shadow map / Virtual Shadow Map rendering. Usual causes: many shadow-casting movable lights, big light "
      "radii, WPO or moving meshes invalidating VSM pages every frame, dense non-Nanite shadow casters.",
      "Look at the Lighting & Shadows and Meshes findings (shadowed lights, WPO Disable Distance, tiny shadow "
      "casters). Debug with 'r.Shadow.Virtual.Visualize' / 'stat shadowrendering'.",
-     [("light_radius",), ("light_max_draw_distance",), ("light_cascades",), ("mesh_wpo_distance",), ("mesh_tiny_shadows",), ("mesh_high_poly",)]),
+     [("light_radius",), ("light_max_draw_distance",), ("light_cascades",), ("mesh_wpo_distance",), ("mesh_tiny_shadows",), ("mesh_high_poly",),
+      ("light_contact_shadows",)],
+     []),
     (("lumen", "diffuseindirect", "radiancecache", "screenprobe"), "Lumen GI & reflections", CAT_POST,
      "Lumen cost scales with resolution and the Lumen quality settings in post-process volumes / scalability.",
      "Check the Post Process findings (Final Gather / Reflection quality overrides), lower 'Lumen Scene Detail', "
      "use 'r.Lumen.Visualize' and 'stat lumen' to see which part is heavy.",
-     [("pp_expensive_settings", "Lumen")]),
+     [("pp_expensive_settings", "Lumen")],
+     []),
     (("translucen", "distortion"), "Translucency / FX overdraw", CAT_VFX,
      "Every overlapping translucent pixel is shaded again: big particle cards, many layers, lit or expensive "
      "particle materials.",
      "Look at the Niagara / VFX and Materials findings. View Mode > Optimization > Quad Overdraw / Shader "
      "Complexity on your FX; fewer/smaller cards, cheaper unlit materials, particle LOD by distance.",
-     [("pp_expensive_settings", "translucency")]),
+     [("pp_expensive_settings", "translucency")],
+     [("r.SeparateTranslucencyScreenPercentage", "max", 50,
+       "Translucency (particles, FX) renders at half resolution: much cheaper overdraw, slightly softer FX.")]),
     (("basepass", "prepass", "nanite", "visbuffer", "depthpass"), "Geometry & materials (base pass)", CAT_MESH,
      "Rasterising and shading the opaque scene: dense non-Nanite meshes, many draw calls, expensive materials.",
      "Look at the Meshes & Geometry and Materials findings (Nanite, LODs, cull distances, instruction counts). "
      "Use 'stat nanite' and View Mode > Shader Complexity.",
-     [("mesh_high_poly",), ("mesh_missing_lods",), ("mesh_cull_distance",), ("mesh_ism_cull",), ("mesh_stacked_duplicates",)]),
+     [("mesh_high_poly",), ("mesh_missing_lods",), ("mesh_cull_distance",), ("mesh_ism_cull",), ("mesh_stacked_duplicates",),
+      ("mesh_wpo_distance",)],
+     []),
     (("volumetricfog", "heightfog", "fog"), "Fog / volumetric fog", CAT_LIGHT,
      "Volumetric fog grid plus every light that injects into it (shadowed point/spot lights are the expensive ones).",
      "Disable 'Cast Volumetric Shadow' on secondary lights (Lighting findings), keep r.VolumetricFog.GridPixelSize "
      "at 8+ and GridSizeZ at 64.",
-     [("light_volumetric_shadow",)]),
+     [("light_volumetric_shadow",)],
+     [("r.VolumetricFog.GridPixelSize", "min", 16,
+       "Volumetric fog uses half the froxel resolution: 2-4x cheaper, slightly softer fog and light shafts."),
+      ("r.VolumetricFog.GridSizeZ", "max", 64, "Fewer depth slices for volumetric fog (default quality).")]),
     (("cloud", "skyatmosphere"), "Sky & clouds", CAT_SCENE,
      "Volumetric clouds / sky atmosphere ray marching.",
      "Lower cloud 'View Sample Count Scale' / shadow samples, or use r.VolumetricCloud.* scalability.",
-     [("skylight_realtime",)]),
+     [("skylight_realtime",)],
+     []),
     (("lights", "directlighting", "lightcomposition", "clustered", "deferredlight", "lighting"), "Direct lighting",
      CAT_LIGHT, "Deferred lighting of every pixel touched by each light's radius.",
      "Fewer/smaller local lights, Max Draw Distance on lights (Lighting findings), consider MegaLights for "
      "light-heavy scenes.",
-     [("light_radius",), ("light_max_draw_distance",)]),
+     [("light_radius",), ("light_max_draw_distance",), ("light_contact_shadows",)],
+     []),
     (("postprocess", "bloom", "depthoffield", "dof", "motionblur", "tonemap", "tsr", "temporal", "upscal"),
      "Post processing / TSR", CAT_POST,
      "Full-screen passes at output resolution: TSR, DOF, motion blur, bloom (FFT is expensive), post materials.",
      "Check the Post Process findings (FFT bloom, post materials); lower screen percentage or TSR quality "
      "('r.TSR.*'), cinematic DOF only where needed.",
-     [("pp_expensive_settings", "bloom")]),
+     [("pp_expensive_settings", "bloom")],
+     []),
     (("niagara", "particle", "fxsystem", "gpusim"), "Niagara GPU simulation", CAT_VFX,
      "GPU particle simulation and sorting.",
      "Cap particle counts, use Effect Types with distance culling (VFX findings), avoid sorting when not needed.",
+     [],
      []),
     (("scenecapture", "planar", "reflectioncapture"), "Scene captures / planar reflections", CAT_POST,
      "The scene is rendered again for a capture or mirror.",
      "Turn off Capture Every Frame, lower capture resolution, prefer Lumen/SSR over planar reflections.",
-     [("scene_capture",)]),
+     [("scene_capture",)],
+     []),
     (("ssr", "screenspacereflection", "ssao", "ambientocclusion", "hzb"), "Screen-space effects", CAT_POST,
      "SSR / SSAO / HZB passes.", "Lower their quality in the post-process volume or scalability settings.",
-     [("pp_expensive_settings", "SSR")]),
+     [("pp_expensive_settings", "SSR")],
+     []),
     (("raytrac", "rtgi", "rtao"), "Ray tracing", CAT_POST,
      "Hardware ray-traced effects.", "Disable RT effects you don't need (post-process / project settings).",
-     [("pp_expensive_settings", "Ray-traced"), ("pp_expensive_settings", "Hit Lighting")]),
+     [("pp_expensive_settings", "Ray-traced"), ("pp_expensive_settings", "Hit Lighting")],
+     []),
     (("hair", "groom"), "Hair / grooms", CAT_ANIM, "Strand-based hair rendering.",
      "Use hair cards / LODs at distance.",
+     [],
      []),
     (("skincache", "skin"), "Skinning", CAT_ANIM, "GPU skinning of skeletal meshes.",
      "Skeletal mesh LODs, fewer bones on lower LODs (Animation findings).",
-     [("anim_skel_lods",), ("anim_uro",), ("anim_offscreen_tick",)]),
+     [("anim_skel_lods",), ("anim_uro",), ("anim_offscreen_tick",)],
+     []),
 ]
 
 
@@ -3336,6 +3408,28 @@ def _group_kwargs(children, what):
             "impact_note": "Applies (each one can be reverted):\n" + "\n".join(lines)}
 
 
+def _cvar_children(tweaks, pass_label):
+    """Hidden child issues that change a console variable (only when it would actually lower the cost)."""
+    out = []
+    for name, mode, target, note in tweaks:
+        cur = _cvar_str(name)
+        try:
+            curf = float(cur)
+        except (TypeError, ValueError):
+            continue
+        if (mode == "min" and curf >= target) or (mode == "max" and curf <= target):
+            continue
+
+        def fix(rec, name=name, target=target):
+            rec.cvar(name, target)
+            return "%s = %s (now + DefaultEngine.ini [SystemSettings])" % (name, target)
+
+        out.append(Issue("gpu_cvar", CAT_GPU, INFO, "%s %s -> %s" % (name, cur, target), name,
+                         detail=note, solution=note, fix=fix,
+                         fix_label="Set %s from %s to %s" % (name, cur, target), impact=LOOK, impact_note=note))
+    return out
+
+
 def gpu_profile_issues(result, scan_issues=None):
     """Turn an analysed CSV profile into issues (category 'GPU Profile (measured)')."""
     means = result["means"]
@@ -3384,13 +3478,20 @@ def gpu_profile_issues(result, scan_issues=None):
         sev = HIGH if share >= 0.25 else (MEDIUM if share >= 0.12 else LOW)
         short = name.split("/", 1)[1]
         rule = next((r for r in _GPU_PASS_RULES if any(k in short.lower() for k in r[0])), None)
-        label, cat, why, todo, spec = (rule[1], rule[2], rule[3], rule[4], rule[5]) if rule else (
-            short, None, "GPU pass '%s'." % short, "Run 'ProfileGPU' (Ctrl+Shift+,) and expand this pass to see what's inside.", [])
-        children = _related_fixes(scan_issues, spec)
+        label, cat, why, todo, spec, tweaks = rule[1:7] if rule else (
+            short, None, "GPU pass '%s'." % short, "Run 'ProfileGPU' (Ctrl+Shift+,) and expand this pass to see what's inside.",
+            [], [])
+        children = _related_fixes(scan_issues, spec) + _cvar_children(tweaks, label)
         if cat and related.get(cat):
             todo += "\n\nThe scene scan found %d open issue(s) in '%s' - start there." % (related[cat], cat)
-        if spec and not children and not any(i.category != CAT_GPU for i in (scan_issues or [])):
-            todo += "\n\nScan the level, then profile again to get a Fix button for this."
+        if not children:
+            if not any(i.category != CAT_GPU for i in (scan_issues or [])):
+                todo += "\n\nNo Fix button yet: scan the level so the related fixes can be linked."
+            elif spec or tweaks:
+                todo += ("\n\nNo Fix button: the scan found no open, auto-fixable issue behind this pass (they may "
+                         "already be fixed or need manual work - see the solution above).")
+            else:
+                todo += "\n\nNo automatic fix: this cost comes from content (see the solution above)."
         out.append(Issue(
             "gpu_pass", CAT_GPU, sev, "%s: %.2f ms" % (label, ms), "GPU pass %s" % short,
             detail="%s\n%.2f ms on average = %.0f%% of the %.1f ms frame budget (%s)." % (why, ms, share * 100, budget, src),
@@ -3432,6 +3533,9 @@ def profile_gpu(frames=None, on_done=None):
     if _PROFILE["busy"]:
         raise RuntimeError("A GPU profile is already running.")
     frames = int(frames or CONFIG["profile_frames"])
+    if not any(i.category != CAT_GPU for i in _STATE["issues"]):
+        _log("No scan yet: scanning the level first so GPU findings get Fix buttons.")
+        scan()
     world = _editor_world()
     folder = _csv_dir()
     before = _csv_files(folder)
@@ -4462,6 +4566,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
         def on_profile_gpu(self):
             if _PROFILE["busy"]:
                 return
+            if not any(i.category != CAT_GPU for i in self.issues):
+                self.on_scan()      # Fix buttons on GPU findings come from the scan
             self.btn_profile.setEnabled(False)
             self.btn_profile.setText("Profiling\u2026")
             self._set_status("Capturing %d frames\u2026 keep the level viewport visible with Realtime on (Ctrl+R) "
