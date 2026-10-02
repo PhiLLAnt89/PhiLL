@@ -1223,18 +1223,24 @@ def _check_translucent_velocity(ctx):
         yield Issue(
             "mv_translucent_velocity", CAT_MOTION, LOW, "Translucent material doesn't output velocity",
             base.get_name(),
-            detail=("'%s' is translucent and used by moving content (%s) with 'Output Velocity' off, so TSR has "
-                    "no motion vectors for it (empty in the Velocity view) and fast-moving parts can ghost.\n"
-                    "Turning Output Velocity on makes the material write to the depth buffer, so it can no longer "
-                    "read depth: soft particles using DepthFade / SceneDepth fail to compile ('Translucent "
-                    "material with Output Velocity enabled will write to depth buffer, therefore cannot read "
-                    "from depth buffer') and render as dark, hard-edged cards. That's why this has no "
-                    "automatic fix." % (base.get_name(), users)),
-            solution=("Leave it off for soft particles (anything using DepthFade, SceneDepth or soft edges: "
-                      "smoke, fog, snow drifts, cloud sheets). Only enable 'Output Velocity' (Material > "
-                      "Translucency) on materials that don't read depth, e.g. small snowflakes or sparks - on a "
-                      "duplicate first, then check it compiles and look at the Velocity view. For flakes that "
-                      "still ghost, a Masked material (no DepthFade needed) writes velocity normally."
+            detail=("'%s' is translucent and used by moving content (%s) with 'Output Depth and Velocity' "
+                    "('Output Velocity' before 5.6) off, so TSR has no motion vectors for it (empty in the "
+                    "Velocity view) and fast-moving parts can ghost.\n"
+                    "Turning it on makes the material write to the depth buffer, so it can no longer read depth: "
+                    "soft particles using DepthFade / SceneDepth fail to compile ('Translucent material with "
+                    "Output Velocity enabled will write to depth buffer, therefore cannot read from depth "
+                    "buffer') and render as dark, hard-edged cards. That's why this has no automatic fix."
+                    % (base.get_name(), users)),
+            solution=("1) Bypass the depth read: route the DepthFade through a Feature Level Switch with SM5 and "
+                      "SM6 (and ES3_1 if you ship mobile) fed a constant 1, so DepthFade is never compiled with "
+                      "velocity. CameraDepthFade is still allowed (it doesn't read the depth buffer) for "
+                      "near-camera fading.\n"
+                      "2) Material > Translucency > enable 'Output Depth and Velocity'. 'Velocity From Depth Only' "
+                      "is fine for cards that mostly stay put; for falling snow/sparks untick it so the particles' "
+                      "own motion is used, and set the Niagara renderer's Motion Vector Setting to Precise/Auto.\n"
+                      "3) Check it compiles, look at View Mode > Velocity, and watch intersections: without "
+                      "DepthFade, big fog/drift cards show hard lines where they cut geometry.\n"
+                      "Alternatives: 'Responsive AA' (keeps DepthFade, less ghosting) or a Masked material for flakes."
                       + ("" if editable else _READONLY_NOTE)),
             metric="%d user(s)" % (len(e["systems"]) or len(e["comps"])),
             cost=_score(LOW, len(e["comps"]) / 20.0), targets=e["comps"], assets=[base])
