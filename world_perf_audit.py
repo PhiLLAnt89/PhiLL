@@ -60,7 +60,7 @@ import json
 import math
 import os
 import re
-import site
+import stat
 import subprocess
 import sys
 import time
@@ -123,6 +123,7 @@ CONFIG = {
     "primitives_warn": 15000000,
 }
 
+__version__ = "1.0.0"
 WINDOW_OBJECT_NAME = "WorldPerfAuditWindow"
 TOOL_NAME = "World Performance Audit"
 
@@ -596,8 +597,15 @@ def _ini_read(path):
         with open(path, "rb") as f:
             raw = f.read()
     encoding = "utf-16" if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff") else "utf-8-sig"
-    text = raw.decode(encoding, errors="replace") if raw else ""
-    return text.splitlines(), encoding, ("\r\n" if "\r\n" in text else "\n")
+    try:
+        text = raw.decode(encoding) if raw else ""
+    except UnicodeDecodeError:
+        raise RuntimeError("%s isn't valid %s - not touching it" % (path, encoding))
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.replace("\r\n", "\n").split("\n")     # Unreal only breaks lines on \r / \n
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines, encoding, newline
 
 
 def _ini_section(lines, section):
@@ -626,6 +634,14 @@ def _get_project_ini(section, key, ini_name="DefaultEngine.ini"):
 
 def _set_project_ini(section, key, value, ini_name="DefaultEngine.ini"):
     """Write key=value into Config/<ini_name> [section]; value=None removes the key."""
+    if not re.match(r"^[A-Za-z0-9_./]{1,80}$", str(section)) or not re.match(r"^[A-Za-z0-9_.]{1,80}$", str(key)):
+        raise RuntimeError("Refusing unexpected ini section/key: %r / %r" % (section, key))
+    if value is not None and not re.match(r"^[A-Za-z0-9_.\-]{0,32}$", str(value)):
+        raise RuntimeError("Refusing unexpected ini value: %r" % (value,))
+    if ini_name != "DefaultEngine.ini":
+        raise RuntimeError("Refusing to edit %s" % ini_name)
+    if "[" in key or "]" in key:
+        raise RuntimeError("Refusing unexpected ini key: %r" % (key,))
     path = _ini_path(ini_name)
     try:
         sc = _ucls("SourceControl")
@@ -633,11 +649,8 @@ def _set_project_ini(section, key, value, ini_name="DefaultEngine.ini"):
             sc.check_out_or_add_file(path, True)
     except Exception:
         pass
-    if os.path.exists(path) and not os.access(path, os.W_OK):
-        try:
-            os.chmod(path, 0o666)
-        except Exception:
-            raise RuntimeError("%s is read-only (check it out of source control)." % path)
+    if os.path.exists(path) and (not os.access(path, os.W_OK) or not os.stat(path).st_mode & stat.S_IWUSR):
+        raise RuntimeError("%s is read-only - check it out of source control first." % path)
     lines, encoding, newline = _ini_read(path)
     start, end = _ini_section(lines, section)
     entry = "%s=%s" % (key, value)
@@ -676,6 +689,25 @@ IMPACT_SHORT = {SAFE: "Safe", LOOK: "Visual", GAMEPLAY: "Behaviour"}
 IMPACT_COLORS = {SAFE: "#4caf6a", LOOK: "#e0a03a", GAMEPLAY: "#a77bdb"}
 _REVERTABLE = ("prop", "call", "struct", "nanite", "lods", "ini", "cvar")
 
+# The journal lives on disk, so a revert treats it as untrusted input: only what this tool itself changes
+# can be replayed (property names, setters, enums, console variables, ini keys), with validated values.
+_JOURNAL_PROPS = {
+    "motion_vector_setting", "output_translucent_velocity", "translucency_lighting_mode", "attenuation_radius",
+    "max_draw_distance", "max_distance_fade_range", "cast_volumetric_shadow", "dynamic_shadow_cascades",
+    "real_time_capture", "world_position_offset_disable_distance", "contact_shadow_length", "max_texture_size",
+    "never_stream", "mip_gen_settings", "compression_settings", "power_of_two_mode", "capture_every_frame",
+    "fade_screen_size", "visibility_based_anim_tick_option", "enable_update_rate_optimizations"}
+_JOURNAL_SETTERS = {"set_cast_shadow", "set_cull_distance", "set_cull_distances", "set_mobility",
+                    "set_generate_overlap_events"}
+_JOURNAL_STRUCTS = {"settings", "cull_distance"}
+_JOURNAL_ENUMS = {"NiagaraRendererMotionVectorSetting", "TranslucencyLightingMode", "ComponentMobility",
+                  "TextureMipGenSettings", "TextureCompressionSettings", "TexturePowerOfTwoSetting",
+                  "VisibilityBasedAnimTickOption"}
+_JOURNAL_POSTS = {None, "material", "niagara", "skylight"}
+_ALLOWED_CVARS = {"r.SeparateTranslucencyScreenPercentage", "r.VolumetricFog.GridPixelSize", "r.VolumetricFog.GridSizeZ"}
+_ALLOWED_INI = {("/Script/Engine.RendererSettings", "r.Velocity.EnableVertexDeformation")}
+_NUMBER_RE = re.compile(r"^-?\d{1,9}(\.\d{1,6})?$")
+
 
 def _ser(v):
     if v is None or isinstance(v, (bool, int, float, str)):
@@ -687,12 +719,49 @@ def _ser(v):
 
 
 def _deser(d):
+    if not isinstance(d, dict):
+        raise RuntimeError("Malformed journal value")
     if d.get("t") == "enum":
+        if d.get("e") not in _JOURNAL_ENUMS or not re.match(r"^[A-Z0-9_]{1,64}$", str(d.get("v"))):
+            raise RuntimeError("Journal enum not allowed: %s.%s" % (d.get("e"), d.get("v")))
         val = _enum_member(_ucls(d["e"]), d["v"])
         if val is None:
             raise RuntimeError("Unknown enum value %s.%s" % (d["e"], d["v"]))
         return val
-    return d.get("v")
+    v = d.get("v")
+    if v is None or isinstance(v, (bool, int, float)):
+        return v
+    raise RuntimeError("Journal value not allowed: %r" % (v,))
+
+
+def _check_journal_change(ch):
+    """Reject anything this tool would never have written (tampered or corrupt journal)."""
+    k = ch.get("k")
+    if ch.get("post") not in _JOURNAL_POSTS:
+        raise RuntimeError("journal: unexpected post step %r" % ch.get("post"))
+    if k in ("prop", "call", "struct", "nanite", "lods") and not isinstance(ch.get("path"), str):
+        raise RuntimeError("journal: missing object path")
+    if k == "prop" and ch.get("prop") not in _JOURNAL_PROPS:
+        raise RuntimeError("journal: property %r not allowed" % ch.get("prop"))
+    if k == "call" and (ch.get("setter") not in _JOURNAL_SETTERS or not isinstance(ch.get("old"), list)
+                        or len(ch["old"]) > 2):
+        raise RuntimeError("journal: setter %r not allowed" % ch.get("setter"))
+    if k == "struct" and (ch.get("prop") not in _JOURNAL_STRUCTS or not re.match(
+            r"^(override_[a-z0-9_]{1,64}|min|max)$", str(ch.get("field")))):
+        raise RuntimeError("journal: struct field %r.%r not allowed" % (ch.get("prop"), ch.get("field")))
+    if k == "nanite" and not isinstance(ch.get("old"), bool):
+        raise RuntimeError("journal: bad Nanite value")
+    if k == "cvar":
+        if ch.get("name") not in _ALLOWED_CVARS:
+            raise RuntimeError("journal: console variable %r not allowed" % ch.get("name"))
+        for v in (ch.get("old"), ch.get("ini_old")):
+            if v is not None and not _NUMBER_RE.match(str(v)):
+                raise RuntimeError("journal: bad console variable value %r" % (v,))
+    if k == "ini":
+        if (ch.get("section"), ch.get("key")) not in _ALLOWED_INI or ch.get("file", "DefaultEngine.ini") != "DefaultEngine.ini":
+            raise RuntimeError("journal: ini key %r not allowed" % ch.get("key"))
+        if ch.get("old") is not None and not re.match(r"^[A-Za-z0-9_.\-]{0,32}$", str(ch["old"])):
+            raise RuntimeError("journal: bad ini value %r" % (ch["old"],))
 
 
 class ChangeRecorder(object):
@@ -743,11 +812,28 @@ def _cvar_str(name):
         return None
 
 
+# Only the commands this tool uses: render cvars ("r.Name value") and "csvprofile frames=N". Nothing else
+# (no "py ...", no "|" / ";" chaining, no quotes) can ever reach the console through it.
+_CONSOLE_RE = re.compile(r"^(r\.[A-Za-z0-9_.]{1,80} -?[0-9.]{1,12}|csvprofile frames=[0-9]{1,5})$")
+
+
 def _run_console(cmd):
+    """Run one allowlisted console command (see _CONSOLE_RE)."""
+    if not _CONSOLE_RE.match(cmd):
+        raise RuntimeError("Refusing unexpected console command: %r" % cmd)
     unreal.SystemLibrary.execute_console_command(_editor_world(), cmd)
 
 
 def _resolve(path):
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise RuntimeError("journal: bad object path %r" % (path,))
+    obj = _resolve_any(path)
+    if not _is_editable_asset(obj):      # /Game, project plugins and their levels only - never engine/plugin content
+        raise RuntimeError("journal: %s is outside the project's content" % path)
+    return obj
+
+
+def _resolve_any(path):
     for name in ("find_object", "load_object"):
         fn = getattr(unreal, name, None)
         if fn is None:
@@ -782,9 +868,13 @@ def _post_revert(obj, post):
 def _revert_changes(changes):
     """Put back every recorded value (newest first). Returns a list of error strings."""
     errors = []
-    for ch in reversed(changes):
+    for ch in reversed(changes if isinstance(changes, list) else []):
         try:
-            k = ch["k"]
+            if not isinstance(ch, dict):
+                raise RuntimeError("journal: malformed entry")
+            k = ch.get("k")
+            if k in _REVERTABLE:
+                _check_journal_change(ch)
             if k == "prop":
                 obj = _resolve(ch["path"])
                 _modify(obj)
@@ -937,6 +1027,7 @@ class ScanContext(object):
 
     def __init__(self, actors):
         self.actors = [a for a in actors if a is not None]
+        self._editable = None
         self._components = {}
         self._mesh_usage = None
         self._mat_usage = None
@@ -948,29 +1039,40 @@ class ScanContext(object):
         self.stats = OrderedDict()
 
     # --- generic -------------------------------------------------------------
-    def components(self, class_name):
+    def _actors(self, include_readonly):
+        if include_readonly:
+            return self.actors
+        if self._editable is None:
+            ro = set(_READONLY_ACTORS)
+            self._editable = [a for a in self.actors if a.get_path_name() not in ro] if ro else self.actors
+        return self._editable
+
+    def components(self, class_name, include_readonly=False):
+        """Components of the scanned actors. Actor-level checks (they change components) leave out
+        Level Instance contents / child actors / Sequencer spawnables; asset-level ones pass include_readonly."""
         cls = _ucls(class_name)
         if cls is None:
             return []
-        cached = self._components.get(class_name)
+        key = (class_name, bool(include_readonly))
+        cached = self._components.get(key)
         if cached is None:
             cached = []
-            for a in self.actors:
+            for a in self._actors(include_readonly):
                 try:
                     comps = a.get_components_by_class(cls)
                 except Exception:
                     comps = None
                 if comps:
                     cached.extend(c for c in comps if c is not None)
-            self._components[class_name] = cached
+            self._components[key] = cached
         return cached
 
-    def visible(self, class_name):
-        return [c for c in self.components(class_name) if _is_visible(c)]
+    def visible(self, class_name, include_readonly=False):
+        return [c for c in self.components(class_name, include_readonly) if _is_visible(c)]
 
-    def actors_of(self, class_name):
+    def actors_of(self, class_name, include_readonly=False):
         cls = _ucls(class_name)
-        return [a for a in self.actors if cls is not None and isinstance(a, cls)]
+        return [a for a in self._actors(include_readonly) if cls is not None and isinstance(a, cls)]
 
     @staticmethod
     def component_materials(comp):
@@ -993,7 +1095,7 @@ class ScanContext(object):
         """path -> {"mesh", "comps", "instances"} for visible static mesh components."""
         if self._mesh_usage is None:
             usage = OrderedDict()
-            for c in self.visible("StaticMeshComponent"):
+            for c in self.visible("StaticMeshComponent", include_readonly=True):
                 mesh = _prop(c, "static_mesh")
                 if mesh is None:
                     continue
@@ -1014,7 +1116,7 @@ class ScanContext(object):
         """[(system, [components])]"""
         if self._niagara is None:
             res = OrderedDict()
-            for c in self.components("NiagaraComponent"):
+            for c in self.components("NiagaraComponent", include_readonly=True):
                 try:
                     s = c.get_asset()
                 except Exception:
@@ -1066,17 +1168,17 @@ class ScanContext(object):
                     u.systems.append(system)
                 u.skeletal = u.skeletal or skeletal
 
-            for c in self.visible("StaticMeshComponent"):
+            for c in self.visible("StaticMeshComponent", include_readonly=True):
                 for m in self.component_materials(c):
                     add(m, c)
-            for c in self.visible("SkeletalMeshComponent"):
+            for c in self.visible("SkeletalMeshComponent", include_readonly=True):
                 for m in self.component_materials(c):
                     add(m, c, skeletal=True)
             for system, comps in self.niagara_systems():
                 for r in self.niagara_renderers(system):
                     for m in _renderer_materials(r):
                         add(m, comps[0] if comps else None, system=system)
-            for c in self.visible("DecalComponent"):
+            for c in self.visible("DecalComponent", include_readonly=True):
                 add(_prop(c, "decal_material"), c)
             self._mat_usage = usage
         return self._mat_usage
@@ -1406,7 +1508,8 @@ def _check_light_draw_distance(ctx):
 
 @check("light_volumetric_shadow", CAT_LIGHT, "Local lights casting volumetric fog shadows")
 def _check_volumetric_shadow(ctx):
-    fog_on = any(_prop(f, "enable_volumetric_fog", False) for f in ctx.visible("ExponentialHeightFogComponent"))
+    fog_on = any(_prop(f, "enable_volumetric_fog", False)
+                 for f in ctx.visible("ExponentialHeightFogComponent", include_readonly=True))
     if not fog_on:
         return
     lights = [c for c in _local_lights(ctx)
@@ -1565,7 +1668,7 @@ def _check_duplicates(ctx):
         ("VolumetricCloudComponent", "volumetric clouds", None),
     ]
     for cls_name, what, pred in groups:
-        comps = [c for c in ctx.visible(cls_name) if pred is None or pred(c)]
+        comps = [c for c in ctx.visible(cls_name, include_readonly=True) if pred is None or pred(c)]
         if len(comps) <= 1:
             continue
         yield Issue(
@@ -1722,7 +1825,7 @@ def _check_tiny_shadows(ctx):
 
 @check("mesh_cull_distance", CAT_MESH, "Small non-Nanite props without cull distance")
 def _check_cull_distance(ctx):
-    if ctx.actors_of("CullDistanceVolume"):
+    if ctx.actors_of("CullDistanceVolume", include_readonly=True):
         return
     r_max = CONFIG["small_mesh_radius"]
     comps = []
@@ -1766,7 +1869,7 @@ def _sync_foliage_cull(mesh, start, end, rec):
         return
     for ft in unreal.ObjectIterator(cls):
         try:
-            if ft.get_name().startswith("Default__") or _prop(ft, "mesh") != mesh:
+            if ft.get_name().startswith("Default__") or _prop(ft, "mesh") != mesh or not _is_editable_asset(ft):
                 continue
             if _prop(ft, "cull_distance") is None:
                 continue
@@ -1883,12 +1986,21 @@ def _check_stacked(ctx):
     for a in ctx.actors_of("StaticMeshActor"):
         c = _prop(a, "static_mesh_component")
         mesh = _prop(c, "static_mesh")
-        if mesh is None:
+        if mesh is None or _prop(a, "hidden", False) or not _is_visible(c):
             continue
+        try:
+            if a.is_hidden_ed():
+                continue                      # hidden in the editor: may be a deliberate variant
+        except Exception:
+            pass
+        try:
+            level = a.get_outer().get_path_name()     # only duplicates inside the SAME level
+        except Exception:
+            level = ""
         try:
             l, r, s = a.get_actor_location(), a.get_actor_rotation(), a.get_actor_scale3d()
             mats = tuple(m.get_path_name() for m in ScanContext.component_materials(c))
-            key = (mesh.get_path_name(), mats, round(l.x, 0), round(l.y, 0), round(l.z, 0),
+            key = (level, mesh.get_path_name(), mats, round(l.x, 0), round(l.y, 0), round(l.z, 0),
                    round(r.pitch, 1), round(r.yaw, 1), round(r.roll, 1),
                    round(s.x, 2), round(s.y, 2), round(s.z, 2))
         except Exception:
@@ -1914,8 +2026,9 @@ def _check_stacked(ctx):
             solution="Delete the copies, keep one.", metric="%d copies" % (len(dupes) + 1),
             cost=_score(MEDIUM, len(dupes) / 5.0), targets=actors,
             fix=fix, fix_label="Delete the %d duplicate(s), keep '%s'" % (len(dupes), _label(keep)),
-            impact=SAFE, impact_note=("The copies are identical (same mesh, materials and transform), so the "
-                                      "level looks the same. Deleting can only be undone with Ctrl+Z."))
+            impact=GAMEPLAY, impact_note=("The copies are identical (same level, mesh, materials and transform), so "
+                                          "the level looks the same - but Blueprints/Sequencer referencing a deleted "
+                                          "copy lose it, and only Ctrl+Z (not Revert) brings it back."))
 
 
 @check("mesh_instancing_candidates", CAT_MESH, "Same mesh placed as many separate actors")
@@ -2556,7 +2669,7 @@ def _check_uro(ctx):
 def _check_skel_lods(ctx):
     limit = CONFIG["skel_lod_required_verts"]
     by_mesh = OrderedDict()
-    for c in ctx.visible("SkeletalMeshComponent"):
+    for c in ctx.visible("SkeletalMeshComponent", include_readonly=True):
         skm = _skel_asset(c)
         if skm is not None:
             by_mesh.setdefault(skm.get_path_name(), [skm, []])[1].append(c)
@@ -2599,6 +2712,9 @@ def _check_skel_lods(ctx):
 _STATE = {"issues": [], "stats": OrderedDict(), "errors": [], "level": ""}
 
 
+_READONLY_ACTORS = set()   # paths of actors found only by the raw world iterator (no actor-level fixes)
+
+
 def _get_actors(selected_only=False):
     """Every actor of the editor world: persistent level + all LOADED sublevels (visible or hidden),
     Level Instance contents, child actors and currently spawned Sequencer spawnables."""
@@ -2620,12 +2736,16 @@ def _get_actors(selected_only=False):
                 actors.append(a)
 
     add(sub.get_all_level_actors())
+    editable = set(seen)
     # get_all_level_actors skips non-editable/transient actors (Level Instance contents, child actors,
-    # Sequencer spawnables). The raw world iterator catches those too.
+    # Sequencer spawnables). The raw world iterator catches those too - scanned for their assets only:
+    # actor-level fixes on them would be lost (respawn / construction script) or dirty shared levels.
     try:
         add(unreal.GameplayStatics.get_all_actors_of_class(_editor_world(), unreal.Actor))
     except Exception:
         pass
+    _READONLY_ACTORS.clear()
+    _READONLY_ACTORS.update(seen - editable)
     return actors
 
 
@@ -2703,6 +2823,9 @@ def scan(selected_only=False, check_keys=None):
         ctx.build_stats()
     except Exception:
         pass
+    world_name = _editor_world().get_name() if _editor_world() else ""
+    if _STATE.get("gpu_profile") and _STATE["gpu_profile"].get("level") != world_name:
+        _STATE["gpu_profile"] = None                        # measured on another level: drop it
     if _STATE.get("gpu_profile") and not selected_only:     # re-link measured GPU findings to the new scan
         try:
             issues += gpu_profile_issues(_STATE["gpu_profile"], issues)
@@ -2713,8 +2836,8 @@ def scan(selected_only=False, check_keys=None):
     scope = scan_scope(actors)
     _STATE.update(issues=issues, stats=ctx.stats, errors=errors, scope=scope,
                   level=world.get_name() if world else "", selected_only=selected_only)
-    _log("Scan done: %d issue(s), %d auto-fixable, %d check error(s). Scope: %s"
-         % (len(issues), sum(1 for i in issues if i.fixable), len(errors), _scope_text(scope)))
+    _log("v%s scan done: %d issue(s), %d auto-fixable, %d check error(s). Scope: %s"
+         % (__version__, len(issues), sum(1 for i in issues if i.fixable), len(errors), _scope_text(scope)))
     if scope["levels_unloaded"]:
         _warn("Not scanned - sublevels not loaded: %s" % ", ".join(scope["levels_unloaded"]))
     return issues
@@ -2758,7 +2881,24 @@ def apply_fixes(issues, title="World Perf Audit: Fix"):
                         "obj": issue.obj, "impact": issue.impact, "changes": rec.changes, "reverted": False}
                     _journal_write(issue.journal)
     _update_groups(groups)
+    _refresh_all_groups()
     return fixed, failed
+
+
+def _all_issues_flat():
+    """Every issue incl. the hidden children of GPU findings (console-variable tweaks)."""
+    out, seen = [], set()
+    for i in _STATE["issues"]:
+        for x in [i] + list(i.children):
+            if x.id not in seen:
+                seen.add(x.id)
+                out.append(x)
+    return out
+
+
+def _refresh_all_groups():
+    """Keep every GPU finding's status in sync after fixes/reverts made anywhere (UI or text mode)."""
+    _update_groups([g for g in _STATE["issues"] if g.children])
 
 
 def _update_groups(groups):
@@ -2772,7 +2912,7 @@ def _update_groups(groups):
                 len(done), sum(1 for c in g.children if c.fixable))
         elif failed:
             g.status, g.message = "failed", "; ".join(c.message for c in failed[:3])
-        elif g.status == "fixed":
+        elif g.status in ("fixed", "failed"):
             g.status, g.message = "reverted", "Reverted"
 
 
@@ -2799,13 +2939,20 @@ def _revert_entries(entries, title="World Perf Audit: Revert"):
 def revert_issues(issues):
     """Revert the last fix of each issue (group issues revert their children). Returns (reverted_count, errors)."""
     groups = [i for i in issues if i.children]
-    issues = [x for i in issues for x in (i.children if i.children else [i])]
+    flat, seen = [], set()
+    for i in issues:
+        for x in (i.children if i.children else [i]):
+            if x.id not in seen:            # a scan fix shared by several GPU findings is reverted once
+                seen.add(x.id)
+                flat.append(x)
+    issues = flat
     done, errors = _revert_entries([i.journal for i in issues if i.revertable])
     for i in issues:
         if i.journal and i.journal.get("reverted") and i.status == "fixed":
             errs = i.journal.get("revert_errors") or []
             i.status, i.message = "reverted", ("Reverted" + (" (partly): " + "; ".join(errs) if errs else ""))
     _update_groups(groups)
+    _refresh_all_groups()
     return done, errors
 
 
@@ -2819,16 +2966,18 @@ def revert_all():
     entries = journal_entries()
     done, errors = _revert_entries(entries, "World Perf Audit: Revert All")
     ids = {e["id"] for e in entries}
-    for i in _STATE["issues"]:
+    for i in _all_issues_flat():
         if i.journal and i.journal.get("id") in ids and i.status == "fixed":
             i.journal["reverted"] = True
             i.status, i.message = "reverted", "Reverted"
-    _update_groups([i for i in _STATE["issues"] if i.children])
+    _refresh_all_groups()
     return done, errors
 
 
 # --- recovery for fixes made by the first version of this tool (it had no journal) ---------------
-_OLD_FIX_RE = re.compile(r"\[PerfAudit\] Fixed #\d+ (.*?)\s*$")
+# Only lines the first version itself wrote ("[time][frame]LogPython: [PerfAudit] Fixed #N ..."), so a Print
+# String or another plugin can't forge restore instructions in the middle of its own message.
+_OLD_FIX_RE = re.compile(r"^(?:\[[^\]]*\]\[\s*\d+\])?LogPython: \[PerfAudit\] Fixed #\d+ (.*?)\s*$")
 _OLD_TITLES = [
     "Particles use 'Surface ForwardShading'", "Translucent material doesn't output velocity",
     "Particles write no motion vectors", "Texture never streams", "Texture has no mipmaps", "Uncompressed texture",
@@ -2866,7 +3015,7 @@ def _old_fixes_from_logs(max_files=30):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    m = _OLD_FIX_RE.search(line)
+                    m = _OLD_FIX_RE.match(line)
                     parsed = _parse_old_fix(m.group(1)) if m else None
                     if parsed and parsed not in seen:
                         seen.add(parsed)
@@ -2899,9 +3048,10 @@ class _AssetIndex(object):
                 obj = ad.get_asset()
             except Exception:
                 obj = None
-            if obj is not None and _isinst(obj, *class_names):
+            if obj is not None and _isinst(obj, *class_names) and _is_editable_asset(obj):
                 out.append(obj)
-        return out
+        # the old log only has names: if two assets share it we can't know which one was changed
+        return out if len(out) == 1 else []
 
 
 def _system_renderers(system):
@@ -3000,7 +3150,7 @@ def _plan_old_recovery(fixes):
             for mesh in idx.find(obj, "StaticMesh"):
                 if msg.startswith("Nanite enabled") and _nanite_enabled(mesh):
                     add(title, obj, "Disable Nanite on %s" % mesh.get_name(), lambda mesh=mesh: _set_nanite(mesh, False))
-                elif msg.startswith("Generated") and _mesh_lods(mesh) > 1:
+                elif msg.startswith("Generated") and _mesh_lods(mesh) == int(CONFIG["auto_lod_count"]):
                     add(title, obj, "Remove generated LODs from %s" % mesh.get_name(), lambda mesh=mesh: _remove_lods(mesh))
         elif title in pp:
             ppv = _find_in_level(obj)
@@ -3048,7 +3198,8 @@ def _plan_old_recovery(fixes):
                     if cls is not None and mesh is not None and hasattr(unreal, "ObjectIterator"):
                         for ft in unreal.ObjectIterator(cls):
                             iv = _prop(ft, "cull_distance")
-                            if _prop(ft, "mesh") == mesh and iv is not None and int(_prop(iv, "max", 0)) == end:
+                            if (_prop(ft, "mesh") == mesh and iv is not None and int(_prop(iv, "max", 0)) == end
+                                    and _is_editable_asset(ft)):
                                 rec = ChangeRecorder()
                                 rec.struct_field(ft, "cull_distance", "min", 0)
                                 rec.struct_field(ft, "cull_distance", "max", 0)
@@ -3117,8 +3268,9 @@ def go_to_many(issues):
     """Select the actors of several issues at once (assets: Content Browser)."""
     if len(issues) == 1:
         return go_to(issues[0])
+    expanded = [x for i in issues for x in ([i] + list(i.children))]
     merged = Issue("goto", "", INFO, "", "", "", "",
-                   targets=[t for i in issues for t in i.targets], assets=[a for i in issues for a in i.assets])
+                   targets=[t for i in expanded for t in i.targets], assets=[a for i in expanded for a in i.assets])
     Issue._counter -= 1
     return go_to(merged)
 
@@ -3166,7 +3318,7 @@ def revert(issue_id):
 
 def print_report(issues=None):
     issues = _STATE["issues"] if issues is None else issues
-    lines = ["", "=" * 100, "%s - %s  (%d issues)" % (TOOL_NAME, _STATE.get("level", ""), len(issues))]
+    lines = ["", "=" * 100, "%s %s - %s  (%d issues)" % (TOOL_NAME, __version__, _STATE.get("level", ""), len(issues))]
     if _STATE.get("scope"):
         lines.append("Scanned: " + _scope_text(_STATE["scope"]))
     lines.append("=" * 100)
@@ -3204,7 +3356,9 @@ def export_report(path=None, issues=None):
             rows = [i.as_dict() for i in issues]
             w.writerow(list(rows[0].keys()) if rows else ["empty"])
             for r in rows:
-                w.writerow(list(r.values()))
+                # asset/actor names are user content: never let Excel/Sheets read them as formulas
+                w.writerow([("'" + v) if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+                            for v in r.values()])
         return path
     esc = lambda s: html.escape(str(s)).replace("\n", "<br>")
     stats = " &middot; ".join("<b>%s</b> %s" % (esc(k), esc(v)) for k, v in _STATE.get("stats", {}).items())
@@ -3220,11 +3374,11 @@ body{background:#1b1b1b;color:#ddd;font:13px Segoe UI,Roboto,sans-serif;margin:2
 h1{font-weight:600;margin:0 0 4px}.s{color:#aaa;margin-bottom:16px}table{border-collapse:collapse;width:100%%}
 th{background:#2a2a2a;text-align:left;padding:8px;position:sticky;top:0}td{padding:8px;border-bottom:1px solid #333;vertical-align:top}
 tr:hover td{background:#232323}.o{color:#8fb8ff}</style></head><body>
-<h1>%s &ndash; %s</h1><div class=s>%s<br>%d issues &middot; generated %s</div>
+<h1>%s &ndash; %s</h1><div class=s>%s<br>%d issues &middot; generated %s &middot; v%s</div>
 <table><tr><th>Severity</th><th>Cost</th><th>Category</th><th>Issue / Object</th><th>Measured</th><th>Description</th>
 <th>Solution</th><th>Status</th></tr>%s</table></body></html>""" % (
         esc(_STATE.get("level", "")), TOOL_NAME, esc(_STATE.get("level", "")), stats, len(issues),
-        datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), "\n".join(rows))
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), __version__, "\n".join(rows))
     with open(path, "w", encoding="utf-8") as f:
         f.write(doc)
     return path
@@ -3346,16 +3500,30 @@ def _csv_files(folder):
 
 
 def analyse_csv(path):
-    """Average every numeric column of an Unreal CSV profile. Returns {'frames', 'means', 'path'}."""
+    """Average every numeric column of an Unreal CSV profile. Returns {'frames', 'means', 'path'}.
+    Unreal writes a first header, the frame rows, a '[HasHeaderRowAtEnd]...' metadata row and - because stats can
+    appear after the first frame - the complete header again at the end. The longest header wins."""
     with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
-        rows = list(csv.reader(fh))
+        rows = [r for r in csv.reader(fh) if r]
     if not rows:
         raise RuntimeError("Empty CSV profile: %s" % path)
-    header = [h.strip() for h in rows[0]]
+
+    def numeric_share(r):
+        n = 0
+        for v in r:
+            try:
+                float(v)
+                n += 1
+            except ValueError:
+                pass
+        return n / float(max(1, len(r)))
+
+    headers = [r for r in rows if not r[0].strip().startswith("[") and numeric_share(r) < 0.5]
+    header = [h.strip() for h in max(headers, key=len)] if headers else [h.strip() for h in rows[0]]
     sums, counts, frames = {}, {}, 0
-    for r in rows[1:]:
-        if not r or r[0].strip().startswith("["):     # metadata rows at the end
-            break
+    for r in rows:
+        if r[0].strip().startswith("[") or numeric_share(r) < 0.5:
+            continue                                  # metadata / header rows
         numeric = 0
         for i, v in enumerate(r[:len(header)]):
             try:
@@ -3408,10 +3576,15 @@ def _group_kwargs(children, what):
             "impact_note": "Applies (each one can be reverted):\n" + "\n".join(lines)}
 
 
-def _cvar_children(tweaks, pass_label):
-    """Hidden child issues that change a console variable (only when it would actually lower the cost)."""
+def _cvar_children(tweaks, pass_label, cache=None):
+    """Hidden child issues that change a console variable (only when it would actually lower the cost).
+    cache: one shared child per cvar for the whole profile, so two passes can't record each other's values."""
     out = []
+    cache = {} if cache is None else cache
     for name, mode, target, note in tweaks:
+        if name in cache:
+            out.append(cache[name])
+            continue
         cur = _cvar_str(name)
         try:
             curf = float(cur)
@@ -3424,9 +3597,10 @@ def _cvar_children(tweaks, pass_label):
             rec.cvar(name, target)
             return "%s = %s (now + DefaultEngine.ini [SystemSettings])" % (name, target)
 
-        out.append(Issue("gpu_cvar", CAT_GPU, INFO, "%s %s -> %s" % (name, cur, target), name,
-                         detail=note, solution=note, fix=fix,
-                         fix_label="Set %s from %s to %s" % (name, cur, target), impact=LOOK, impact_note=note))
+        cache[name] = Issue("gpu_cvar", CAT_GPU, INFO, "%s %s -> %s" % (name, cur, target), name,
+                            detail=note, solution=note, fix=fix,
+                            fix_label="Set %s from %s to %s" % (name, cur, target), impact=LOOK, impact_note=note)
+        out.append(cache[name])
     return out
 
 
@@ -3434,6 +3608,7 @@ def gpu_profile_issues(result, scan_issues=None):
     """Turn an analysed CSV profile into issues (category 'GPU Profile (measured)')."""
     means = result["means"]
     budget = 1000.0 / float(CONFIG["target_fps"])
+    cvar_cache = {}
     related = {}
     for i in scan_issues or []:
         if i.category != CAT_GPU and i.status != "fixed":
@@ -3441,7 +3616,7 @@ def gpu_profile_issues(result, scan_issues=None):
     out = []
     frame = _mean(means, "FrameTime")
     gt, rt, gpu = _mean(means, "GameThreadTime"), _mean(means, "RenderThreadTime"), _mean(means, "GPUTime", "GPU/Total")
-    src = "%d frames, %s" % (result["frames"], os.path.basename(result["path"]))
+    src = "%d frames, %s, measured %s" % (result["frames"], os.path.basename(result["path"]), result.get("time", "?"))
 
     if frame:
         bound = max([(gpu or 0, "GPU"), (gt or 0, "Game thread"), (rt or 0, "Render thread")])[1]
@@ -3481,7 +3656,7 @@ def gpu_profile_issues(result, scan_issues=None):
         label, cat, why, todo, spec, tweaks = rule[1:7] if rule else (
             short, None, "GPU pass '%s'." % short, "Run 'ProfileGPU' (Ctrl+Shift+,) and expand this pass to see what's inside.",
             [], [])
-        children = _related_fixes(scan_issues, spec) + _cvar_children(tweaks, label)
+        children = _related_fixes(scan_issues, spec) + _cvar_children(tweaks, label, cvar_cache)
         if cat and related.get(cat):
             todo += "\n\nThe scene scan found %d open issue(s) in '%s' - start there." % (related[cat], cat)
         if not children:
@@ -3527,29 +3702,44 @@ def gpu_profile_issues(result, scan_issues=None):
     return out
 
 
-def profile_gpu(frames=None, on_done=None):
+def _csv_complete(path):
+    """True once Unreal has finalised the capture: it ends the file with a '[HasHeaderRowAtEnd]...' metadata row."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 65536))
+            tail = fh.read().decode("utf-8", "replace")
+    except Exception:
+        return False
+    return any(line.lstrip().startswith("[") for line in tail.splitlines())
+
+
+def profile_gpu(frames=None, on_done=None, auto_scan=True):
     """Capture `frames` frames with the CSV profiler (GPU stats on), analyse them and add the result to the
     last scan. Asynchronous: keep the level viewport visible (Realtime on) while it runs. on_done(issues, error)."""
     if _PROFILE["busy"]:
         raise RuntimeError("A GPU profile is already running.")
-    frames = int(frames or CONFIG["profile_frames"])
-    if not any(i.category != CAT_GPU for i in _STATE["issues"]):
+    frames = max(10, min(2000, int(frames or CONFIG["profile_frames"])))
+    if auto_scan and not any(i.category != CAT_GPU for i in _STATE["issues"]):
         _log("No scan yet: scanning the level first so GPU findings get Fix buttons.")
         scan()
-    world = _editor_world()
     folder = _csv_dir()
     before = _csv_files(folder)
     old_stats = _cvar_int("r.GPUCsvStatsEnabled", 0)
-    run = lambda c: unreal.SystemLibrary.execute_console_command(world, c)
-    run("r.GPUCsvStatsEnabled 1")
-    run("csvprofile frames=%d" % frames)
+    world = _editor_world()
+    level = world.get_name() if world else ""
+    _run_console("r.GPUCsvStatsEnabled 1")
+    _run_console("csvprofile frames=%d" % frames)
     _log("GPU profile started: %d frames (keep the viewport visible)." % frames)
     start = time.time()
     timeout = 30.0 + frames / 5.0
-    state = {"candidate": None, "size": -1}
+    state = {"candidate": None, "size": -1, "since": 0.0, "next_poll": 0.0}
     _PROFILE["busy"] = True
 
     def finish(issues, error):
+        if not _PROFILE["busy"]:
+            return
         _PROFILE["busy"] = False
         if _PROFILE["handle"] is not None:
             try:
@@ -3557,7 +3747,10 @@ def profile_gpu(frames=None, on_done=None):
             except Exception:
                 pass
             _PROFILE["handle"] = None
-        run("r.GPUCsvStatsEnabled %d" % (old_stats or 0))
+        try:
+            _run_console("r.GPUCsvStatsEnabled %d" % (old_stats or 0))
+        except Exception:
+            pass
         if error:
             _warn("GPU profile: %s" % error)
         else:
@@ -3565,28 +3758,44 @@ def profile_gpu(frames=None, on_done=None):
             _STATE["issues"] = sorted(keep + issues, key=lambda i: (-i.cost, -i.severity, i.title))
             _log("GPU profile done: %d finding(s)." % len(issues))
         if on_done is not None:
-            on_done(issues, error)
+            try:
+                on_done(issues, error)
+            except Exception:
+                _warn("GPU profile callback failed:\n%s" % traceback.format_exc())
 
     def tick(_dt):
         if not _PROFILE["busy"]:
             return
+        now_t = time.time()
+        if now_t < state["next_poll"]:
+            return
+        state["next_poll"] = now_t + 0.25            # poll 4x per second, not every frame
+        if now_t - start > timeout:
+            finish([], "the capture didn't finish within %.0f s (folder %s). Is the viewport rendering "
+                       "(Realtime on)?" % (timeout, folder))
+            return
         now = _csv_files(folder)
         new = [f for f in now if f not in before or now[f] != before[f]]
-        if new:
-            newest = max(new, key=lambda f: now[f][1])
-            size = now[newest][0]
-            if newest == state["candidate"] and size == state["size"] and size > 0:
-                try:
-                    result = analyse_csv(os.path.join(folder, newest))
-                    _STATE["gpu_profile"] = result
-                    finish(gpu_profile_issues(result, _STATE["issues"]), None)
-                except Exception as e:
-                    finish([], "could not read %s: %s" % (newest, e))
-                return
-            state["candidate"], state["size"] = newest, size      # wait one more tick until the file stops growing
-        elif time.time() - start > timeout:
-            finish([], "no CSV profile appeared in %s after %.0f s. Is the viewport rendering (Realtime on)?"
-                   % (folder, timeout))
+        if not new:
+            return
+        newest = max(new, key=lambda f: now[f][1])
+        size = now[newest][0]
+        if newest != state["candidate"] or size != state["size"]:
+            state.update(candidate=newest, size=size, since=now_t)   # still being written
+            return
+        path = os.path.join(folder, newest)
+        # finished = size stable for 1 s AND Unreal wrote the closing metadata row
+        if size <= 0 or now_t - state["since"] < 1.0 or not _csv_complete(path):
+            return
+        try:
+            result = analyse_csv(path)
+            result.update(level=level, time=datetime.datetime.now().strftime("%H:%M:%S"))
+            issues = gpu_profile_issues(result, _STATE["issues"])
+        except Exception as e:
+            finish([], "could not analyse %s: %s" % (newest, e))
+            return
+        _STATE["gpu_profile"] = result
+        finish(issues, None)
 
     _PROFILE["handle"] = unreal.register_slate_post_tick_callback(tick)
 
@@ -3608,7 +3817,7 @@ def _load_qt():
         return _QT
     d = _deps_dir()
     if os.path.isdir(d) and d not in sys.path:
-        site.addsitedir(d)
+        sys.path.append(d)      # appended (never shadows engine modules); no .pth files are executed
     for binding in ("PySide6", "PyQt6", "PySide2", "PyQt5"):
         try:
             mods = [importlib.import_module("%s.%s" % (binding, m)) for m in ("QtCore", "QtGui", "QtWidgets")]
@@ -3625,8 +3834,9 @@ def install_pyside6():
     if not os.path.isdir(target):
         os.makedirs(target)
     py = unreal.get_interpreter_executable_path()
-    cmd = [py, "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "--target", target,
-           "PySide6-Essentials"]
+    cmd = [py, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade",
+           "--isolated", "--index-url", "https://pypi.org/simple",
+           "--only-binary=:all:", "--target", target, "PySide6-Essentials>=6.5,<7"]
     _log("Installing PySide6: %s" % " ".join(cmd))
     with unreal.ScopedSlowTask(1, "Installing PySide6 for %s (one-time, ~100 MB)..." % TOOL_NAME) as task:
         task.make_dialog(False)
@@ -3739,6 +3949,10 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
     COLOR_ROLE = USER + 2
     SUB_ROLE = USER + 3
     esc = lambda t: html.escape(str(t)).replace("\n", "<br>")
+
+    def _tip(text):
+        """Tooltip that always shows as plain text (Qt would render a name like '<img ...>' as HTML)."""
+        return "<p style='white-space:pre-wrap'>%s</p>" % esc(text) if text else ""
 
     class _Row(QtWidgets.QTreeWidgetItem):
         def __lt__(self, other):
@@ -3871,7 +4085,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
         def __init__(self):
             super(AuditWindow, self).__init__(None)
             self.setObjectName(WINDOW_OBJECT_NAME)
-            self.setWindowTitle(TOOL_NAME)
+            self.setWindowTitle("%s %s" % (TOOL_NAME, __version__))
             self.setWindowFlags(Qt.WindowType.Window)
             self.resize(1480, 880)
             self.setMinimumSize(1100, 640)
@@ -3922,12 +4136,13 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             titles.setSpacing(0)
             t = QtWidgets.QLabel(TOOL_NAME)
             t.setObjectName("Title")
-            st = QtWidgets.QLabel("Unreal Engine 5.6  \u00b7  level performance & TSR ghosting audit")
+            st = QtWidgets.QLabel("v%s  \u00b7  Unreal Engine 5.6  \u00b7  level performance & TSR ghosting audit" % __version__)
             st.setObjectName("Subtitle")
             titles.addWidget(t)
             titles.addWidget(st)
             self.lbl_level = QtWidgets.QLabel("No scan yet")
             self.lbl_level.setObjectName("LevelName")
+            self.lbl_level.setTextFormat(Qt.TextFormat.PlainText)
             self.lbl_scanned = QtWidgets.QLabel("")
             self.lbl_scanned.setObjectName("Muted")
             self.lbl_scanned.setTextFormat(Qt.TextFormat.RichText)
@@ -4131,7 +4346,9 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             sbl = QtWidgets.QHBoxLayout(sb)
             sbl.setContentsMargins(16, 6, 16, 6)
             self.lbl_status = QtWidgets.QLabel("Ready. Click Scan Level.")
+            self.lbl_status.setTextFormat(Qt.TextFormat.PlainText)
             self.lbl_stats = QtWidgets.QLabel("")
+            self.lbl_stats.setTextFormat(Qt.TextFormat.PlainText)
             self.lbl_stats.setObjectName("Muted")
             sbl.addWidget(self.lbl_status, 1)
             sbl.addWidget(self.lbl_stats)
@@ -4196,8 +4413,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             it.setText(self.C_TITLE, issue.title)
             it.setData(self.C_TITLE, SUB_ROLE, issue.obj)
             it.setText(self.C_METRIC, issue.metric)
-            it.setToolTip(self.C_TITLE, "%s\n%s\n\n%s" % (issue.title, issue.obj, issue.solution))
-            it.setToolTip(self.C_METRIC, issue.metric)
+            it.setToolTip(self.C_TITLE, _tip("%s\n%s\n\n%s" % (issue.title, issue.obj, issue.solution)))
+            it.setToolTip(self.C_METRIC, _tip(issue.metric))
             it.setForeground(self.C_METRIC, QtGui.QBrush(QtGui.QColor("#a1a1aa")))
             it.setSizeHint(0, QtCore.QSize(0, 42))
             self.tree.addTopLevelItem(it)
@@ -4231,13 +4448,13 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             it.setText(self.C_IMPACT, imp)
             it.setData(self.C_IMPACT, SORT_ROLE, _IMPACT_ORDER.get(issue.impact, 3) if issue.fix else 9)
             it.setData(self.C_IMPACT, COLOR_ROLE, imp_color)
-            it.setToolTip(self.C_IMPACT, (IMPACT_LABELS[issue.impact] + ": " + issue.impact_note) if issue.fix else
-                          "No automatic fix")
+            it.setToolTip(self.C_IMPACT, _tip((IMPACT_LABELS[issue.impact] + ": " + issue.impact_note) if issue.fix else
+                                              "No automatic fix"))
             status = {"fixed": "Fixed", "reverted": "Reverted", "failed": "Failed"}.get(issue.status, "")
             it.setText(self.C_STATUS, status)
             it.setData(self.C_STATUS, SORT_ROLE, status)
             it.setData(self.C_STATUS, COLOR_ROLE, _STATUS_COLORS.get(issue.status))
-            it.setToolTip(self.C_STATUS, issue.message)
+            it.setToolTip(self.C_STATUS, _tip(issue.message))
             it.setData(self.C_TITLE, COLOR_ROLE, "#8b8b93" if issue.status == "fixed" else "#f4f4f5")
             if issue.revertable and issue.status == "fixed":
                 b.setText("Revert")
@@ -4248,7 +4465,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 b.setText("Fix" if issue.fix else "Manual")
                 b.setObjectName("RowFix")
                 b.setEnabled(issue.fixable)
-                b.setToolTip(issue.fix_label if issue.fix else "No automatic fix: see the solution in the details panel")
+                b.setToolTip(_tip(issue.fix_label if issue.fix else "No automatic fix: see the solution in the details panel"))
             b.style().unpolish(b)
             b.style().polish(b)
             warn = self._warns.get(issue.id)
@@ -4567,13 +4784,13 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             if _PROFILE["busy"]:
                 return
             if not any(i.category != CAT_GPU for i in self.issues):
-                self.on_scan()      # Fix buttons on GPU findings come from the scan
+                self.on_scan()      # Fix buttons on GPU findings come from the scan (once, honours the selection)
             self.btn_profile.setEnabled(False)
             self.btn_profile.setText("Profiling\u2026")
             self._set_status("Capturing %d frames\u2026 keep the level viewport visible with Realtime on (Ctrl+R) "
                              "and don't minimise Unreal." % CONFIG["profile_frames"])
             try:
-                profile_gpu(on_done=self._on_profile_done)
+                profile_gpu(on_done=self._on_profile_done, auto_scan=False)
             except Exception as e:
                 self._on_profile_done([], str(e))
 
@@ -4625,7 +4842,15 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             pending = journal_entries()
             if not pending:
                 return
-            cards = [(e.get("obj", ""), e.get("title", ""), "", "", "") for e in pending[:20]]
+            def changes_of(e):
+                parts = []
+                for ch in e.get("changes", [])[:3]:
+                    what = ch.get("prop") or ch.get("setter") or ch.get("field") or ch.get("name") or ch.get("key") or ch.get("k")
+                    parts.append("%s: %s" % (ch.get("label", ""), what))
+                more = len(e.get("changes", [])) - 3
+                return "; ".join(parts) + (" (+%d more)" % more if more > 0 else "")
+            cards = [(e.get("obj", ""), "%s \u2013 %s" % (e.get("title", ""), changes_of(e)), "", "", "")
+                     for e in pending[:20]]
             if len(pending) > 20:
                 cards.append(("\u2026 and %d more" % (len(pending) - 20), "", "", "", ""))
             if not self._dialog("Revert all %d recorded fixes?" % len(pending),
