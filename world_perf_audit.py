@@ -32,8 +32,9 @@ Python:   world_perf_audit.fix(12), fix_all(), revert(12), revert_all(),
 FIX SAFETY
 ----------
 Every fix is labelled with its impact: "Safe" (no visual change), "Visual"
-(changes the look) or "Behaviour" (can change gameplay). "Fix Safe" only
-batch-applies Safe fixes; visual ones need a click per issue + confirmation.
+(changes the look, warning icon next to Fix) or "Behaviour" (can change
+gameplay). Fix one row, "Fix Selected" (multi-select), "Fix Safe" (only Safe
+fixes) or "Fix All Shown" (the whole filtered list). No popups.
 Every fix records the old values in Saved/PerfAudit/fix_journal.json, so
 Revert works even after saving or restarting (Revert > Revert ALL...).
 Fixes made by the first version of this tool (no journal) can be undone with
@@ -2901,6 +2902,16 @@ def go_to(issue):
             pass
 
 
+def go_to_many(issues):
+    """Select the actors of several issues at once (assets: Content Browser)."""
+    if len(issues) == 1:
+        return go_to(issues[0])
+    merged = Issue("goto", "", INFO, "", "", "", "",
+                   targets=[t for i in issues for t in i.targets], assets=[a for i in issues for a in i.assets])
+    Issue._counter -= 1
+    return go_to(merged)
+
+
 def open_assets(issue):
     if issue.assets:
         try:
@@ -3121,6 +3132,14 @@ QScrollBar::handle:horizontal { background: #3a3a40; min-width: 30px; border-rad
 QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QFrame#StatusBar { background: #111113; border-top: 1px solid #27272a; }
+QDialog, QMessageBox { background: #1f1f23; }
+QDialog#Dialog { background: #1f1f23; }
+QLabel#DialogHeading { color: #fafafa; font-size: 11pt; font-weight: 600; }
+QTextBrowser#DialogBody { background: #1f1f23; }
+QPushButton#Warn { background: #d97706; border-color: #d97706; color: #111113; font-weight: 600; }
+QPushButton#Warn:hover { background: #f59e0b; }
+QPushButton#Danger { background: #dc2626; border-color: #dc2626; color: #ffffff; font-weight: 600; }
+QPushButton#Danger:hover { background: #ef4444; }
 QToolTip { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; padding: 4px; }
 """
 
@@ -3238,6 +3257,35 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                              QtGui.QFontMetrics(f2).elidedText(index.data(SUB_ROLE) or "", Qt.TextElideMode.ElideRight, r.width()))
             painter.restore()
 
+    _icons = {}
+
+    def _warn_icon(color):
+        """Small warning triangle with '!' (painted, so it looks the same on every machine)."""
+        if color not in _icons:
+            pm = QtGui.QPixmap(32, 32)   # drawn at 2x, shown at 16 px
+            pm.fill(QtGui.QColor(0, 0, 0, 0))
+            p = QtGui.QPainter(pm)
+            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            path = QtGui.QPainterPath()
+            path.moveTo(16, 3)
+            path.lineTo(30, 28)
+            path.lineTo(2, 28)
+            path.closeSubpath()
+            pen = QtGui.QPen(QtGui.QColor(color))
+            pen.setWidthF(3.0)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(QtGui.QColor(color))
+            p.drawPath(path)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor("#18181b"))
+            p.drawRoundedRect(QtCore.QRectF(14.3, 10, 3.4, 10), 1.5, 1.5)
+            p.drawEllipse(QtCore.QRectF(14.2, 22.2, 3.6, 3.6))
+            p.end()
+            pm.setDevicePixelRatio(2.0)
+            _icons[color] = pm
+        return _icons[color]
+
     class AuditWindow(QtWidgets.QWidget):
         COLS = ["Severity", "Cost", "Issue", "Measured", "Fix impact", "Status", ""]
         C_SEV, C_COST, C_TITLE, C_METRIC, C_IMPACT, C_STATUS, C_ACTION = range(7)
@@ -3251,6 +3299,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.setMinimumSize(1100, 640)
             self.issues = []
             self._rows = {}            # issue.id -> (item, row button)
+            self._warns = {}           # issue.id -> warning icon label
             self._category = None      # sidebar filter (None = all)
             self._current = None       # issue shown in the detail panel
             root = QtWidgets.QWidget(self)
@@ -3295,7 +3344,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             titles.setSpacing(0)
             t = QtWidgets.QLabel(TOOL_NAME)
             t.setObjectName("Title")
-            st = QtWidgets.QLabel("Unreal Engine 5.6  ·  level performance & TSR ghosting audit")
+            st = QtWidgets.QLabel("Unreal Engine 5.6  \u00b7  level performance & TSR ghosting audit")
             st.setObjectName("Subtitle")
             titles.addWidget(t)
             titles.addWidget(st)
@@ -3326,24 +3375,30 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.btn_scan = self._btn("Scan Level", self.on_scan, "Primary", "Run all enabled checks on the loaded actors")
             self.chk_selected = QtWidgets.QCheckBox("Selected actors only")
             self.btn_checks = QtWidgets.QToolButton()
-            self.btn_checks.setText("Checks  ▾")
+            self.btn_checks.setText("Checks  \u25be")
             self.btn_checks.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
             self.btn_checks.setMenu(self._checks_menu())
             self.btn_fix_safe = self._btn("Fix Safe", self.on_fix_safe, "Success",
-                                          "Apply every listed fix that does NOT change the look or gameplay.\n"
-                                          "Fixes that change visuals are never batch-applied: use Fix on the row.")
+                                          "Apply every listed fix that does NOT change the look or gameplay.")
+            self.btn_fix_sel = self._btn("Fix Selected", self.on_fix_selected, "Primary",
+                                         "Fix the selected rows (Ctrl/Shift+click or Ctrl+A to select).\n"
+                                         "Nothing is saved until you click Save; Revert undoes them.")
+            self.btn_fix_all = self._btn("Fix All Shown", self.on_fix_all_shown, None,
+                                         "Apply every automatic fix in the list below, including the ones marked\n"
+                                         "with the warning icon (they might change the look).\n"
+                                         "Nothing is saved until you click Save; Revert undoes them.")
             self.btn_revert = QtWidgets.QToolButton()
-            self.btn_revert.setText("Revert  ▾")
+            self.btn_revert.setText("Revert  \u25be")
             self.btn_revert.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
             self.revert_menu = QtWidgets.QMenu(self)
             self.revert_menu.aboutToShow.connect(self._fill_revert_menu)
             self.btn_revert.setMenu(self.revert_menu)
-            self.btn_save = self._btn("Save…", save_changes, None, "Unreal's Save Content dialog")
-            self.btn_export = self._btn("Export…", self.on_export, None, "HTML or CSV report")
+            self.btn_save = self._btn("Save\u2026", save_changes, None, "Unreal's Save Content dialog")
+            self.btn_export = self._btn("Export\u2026", self.on_export, None, "HTML or CSV report")
             for w in (self.btn_scan, self.chk_selected, self.btn_checks):
                 tb.addWidget(w)
             tb.addStretch(1)
-            for w in (self.btn_fix_safe, self.btn_revert, self.btn_save, self.btn_export):
+            for w in (self.btn_fix_sel, self.btn_fix_safe, self.btn_fix_all, self.btn_revert, self.btn_save, self.btn_export):
                 tb.addWidget(w)
             bl.addLayout(tb)
 
@@ -3361,7 +3416,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 cl = QtWidgets.QVBoxLayout(card)
                 cl.setContentsMargins(14, 8, 14, 9)
                 cl.setSpacing(0)
-                v = QtWidgets.QLabel("–")
+                v = QtWidgets.QLabel("\u2013")
                 v.setObjectName("KpiValue")
                 c = QtWidgets.QLabel(caption)
                 c.setObjectName("KpiCaption")
@@ -3404,7 +3459,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             flt = QtWidgets.QHBoxLayout()
             flt.setSpacing(8)
             self.txt_filter = QtWidgets.QLineEdit()
-            self.txt_filter.setPlaceholderText("Search issues, objects, assets…")
+            self.txt_filter.setPlaceholderText("Search issues, objects, assets\u2026")
             self.txt_filter.setClearButtonEnabled(True)
             self.txt_filter.textChanged.connect(self._apply_filter)
             self.cmb_sev = QtWidgets.QComboBox()
@@ -3443,7 +3498,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             hdr = self.tree.header()
             hdr.setStretchLastSection(False)
             hdr.setHighlightSections(False)
-            for col, width in enumerate((96, 96, 360, 140, 104, 86, 86)):
+            for col, width in enumerate((96, 96, 360, 140, 104, 86, 108)):
                 self.tree.setColumnWidth(col, width)
             hdr.setSectionResizeMode(self.C_TITLE, QtWidgets.QHeaderView.ResizeMode.Stretch)
             hdr.setSectionResizeMode(self.C_ACTION, QtWidgets.QHeaderView.ResizeMode.Fixed)
@@ -3465,9 +3520,9 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             actions = QtWidgets.QGridLayout()
             actions.setHorizontalSpacing(6)
             actions.setVerticalSpacing(6)
-            self.d_fix = self._btn("Fix", lambda: self._current and self.fix_issues([self._current]), "Primary")
-            self.d_revert = self._btn("Revert", lambda: self._current and self.revert([self._current]))
-            self.d_goto = self._btn("Go To", lambda: self._current and go_to(self._current), None,
+            self.d_fix = self._btn("Fix", lambda: self.fix_issues(self._selected() or ([self._current] if self._current else [])), "Primary")
+            self.d_revert = self._btn("Revert", lambda: self.revert(self._selected() or ([self._current] if self._current else [])))
+            self.d_goto = self._btn("Go To", lambda: go_to_many(self._selected() or ([self._current] if self._current else [])), None,
                                     "Select and frame the actors, show the assets in the Content Browser")
             self.d_open = self._btn("Open Asset", lambda: self._current and open_assets(self._current))
             actions.addWidget(self.d_fix, 0, 0)
@@ -3524,11 +3579,11 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             a.setEnabled(bool(sel))
             a.triggered.connect(lambda *_: self.revert(sel))
             pending = journal_entries()
-            b = m.addAction("Revert ALL fixes made by this tool (%d)…" % len(pending))
+            b = m.addAction("Revert ALL fixes made by this tool (%d)\u2026" % len(pending))
             b.setEnabled(bool(pending))
             b.triggered.connect(lambda *_: self.on_revert_all())
             m.addSeparator()
-            m.addAction("Undo fixes made by the previous version (from logs)…").triggered.connect(
+            m.addAction("Undo fixes made by the previous version (from logs)\u2026").triggered.connect(
                 lambda *_: self.on_recover_old())
             m.addAction("Open fix journal folder").triggered.connect(
                 lambda *_: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(_journal_path()))))
@@ -3538,7 +3593,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.tree.setSortingEnabled(False)
             self.tree.setUpdatesEnabled(False)
             self.tree.clear()
-            self._rows = {}
+            self._rows, self._warns = {}, {}
             for issue in self.issues[:CONFIG["max_rows"]]:
                 self._add_row(issue)
             self.tree.setUpdatesEnabled(True)
@@ -3567,12 +3622,17 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             cell.setStyleSheet("QWidget#Cell { background: transparent; }")
             h = QtWidgets.QHBoxLayout(cell)
             h.setContentsMargins(6, 7, 8, 7)
+            h.setSpacing(6)
+            warn = QtWidgets.QLabel()
+            warn.setFixedSize(16, 16)
+            h.addWidget(warn)
             b = QtWidgets.QPushButton("Fix")
             b.setCursor(QtGui.QCursor(Qt.CursorShape.PointingHandCursor))
             b.clicked.connect(lambda *_a, i=issue: self._row_action(i))
             h.addWidget(b)
             self.tree.setItemWidget(it, self.C_ACTION, cell)
             self._rows[issue.id] = (it, b)
+            self._warns[issue.id] = warn
             self._refresh_row(issue)
 
         def _refresh_row(self, issue):
@@ -3604,10 +3664,19 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 b.setText("Fix" if issue.fix else "Manual")
                 b.setObjectName("RowFix")
                 b.setEnabled(issue.fixable)
-                b.setToolTip(("%s\n%s: %s" % (issue.fix_label, IMPACT_LABELS[issue.impact], issue.impact_note))
-                             if issue.fix else "No automatic fix: see the solution in the details panel")
+                b.setToolTip(issue.fix_label if issue.fix else "No automatic fix: see the solution in the details panel")
             b.style().unpolish(b)
             b.style().polish(b)
+            warn = self._warns.get(issue.id)
+            if warn is not None:
+                if issue.fixable and issue.impact != SAFE:
+                    warn.setPixmap(_warn_icon(IMPACT_COLORS[issue.impact]))
+                    warn.setToolTip("<b>%s</b><br>%s<br><span style='color:#a1a1aa'>Revert puts it back.</span>" % (
+                        "This might change the look" if issue.impact == LOOK else "This might change gameplay behaviour",
+                        esc(issue.impact_note)))
+                else:
+                    warn.clear()
+                    warn.setToolTip("")
 
         def _passes(self, i, ignore_category=False):
             if not ignore_category and self._category and i.category != self._category:
@@ -3665,14 +3734,18 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 "fixed": sum(1 for i in self.issues if i.status == "fixed"),
             }
             for k, v in vals.items():
-                self._kpi[k].setText(str(v) if self.issues else "–")
+                self._kpi[k].setText(str(v) if self.issues else "\u2013")
             safe_shown = len(self._safe_visible())
             self.btn_fix_safe.setText("Fix Safe (%d)" % safe_shown)
             self.btn_fix_safe.setEnabled(safe_shown > 0)
+            all_shown = sum(1 for i in self._visible() if i.fixable)
+            self.btn_fix_all.setText("Fix All Shown (%d)" % all_shown)
+            self.btn_fix_all.setEnabled(all_shown > 0)
+            self._refresh_selection_buttons()
             stats = _STATE.get("stats") or {}
-            self.lbl_stats.setText("   ·   ".join("%s %s" % (k, v) for k, v in stats.items()))
+            self.lbl_stats.setText("   \u00b7   ".join("%s %s" % (k, v) for k, v in stats.items()))
             if _STATE.get("errors"):
-                self.lbl_stats.setText(self.lbl_stats.text() + "   ·   %d check(s) errored (Output Log)" % len(_STATE["errors"]))
+                self.lbl_stats.setText(self.lbl_stats.text() + "   \u00b7   %d check(s) errored (Output Log)" % len(_STATE["errors"]))
 
         def _refresh_all(self):
             self._apply_filter()
@@ -3696,6 +3769,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             if issue is None:
                 self.detail.setHtml(self._welcome_html())
                 return
+            self.d_fix.setText("Fix")
+            self.d_revert.setText("Revert")
             self.d_fix.setEnabled(issue.fixable)
             self.d_revert.setEnabled(issue.revertable and issue.status == "fixed")
             self.d_goto.setEnabled(bool(issue.targets or issue.assets))
@@ -3747,12 +3822,14 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 "3. Select an issue to read the problem, the solution and exactly what the fix changes.</p>"
                 "<p style='margin-top:14px; color:#8e8e96; font-size:8pt; font-weight:700;'>FIX IMPACT</p>"
                 "<p style='line-height:150%%;'><span style='color:%s'><b>Safe</b></span> no visual change "
-                "(the only kind <b>Fix Safe</b> applies in bulk)<br>"
-                "<span style='color:%s'><b>Visual</b></span> changes the look: review it, then keep or Revert<br>"
-                "<span style='color:%s'><b>Behaviour</b></span> can change gameplay / runtime behaviour</p>"
+                "(<b>Fix Safe</b> applies only these)<br>"
+                "<span style='color:%s'><b>Visual</b></span> might change the look (warning icon next to Fix)<br>"
+                "<span style='color:%s'><b>Behaviour</b></span> might change gameplay / runtime behaviour<br>"
+                "Select rows (Ctrl/Shift+click, Ctrl+A) and use <b>Fix Selected</b>, or <b>Fix All Shown</b> "
+                "for the whole filtered list. No popups.</p>"
                 "<p style='color:#8e8e96; line-height:140%%;'>Every fix is journaled to Saved/PerfAudit, so "
                 "<b>Revert</b> works even after saving or restarting. Fixes made by the previous version can be "
-                "undone from <b>Revert ▾ &gt; Undo fixes made by the previous version</b>.</p>"
+                "undone from <b>Revert \u25be &gt; Undo fixes made by the previous version</b>.</p>"
                 % (n_checks, IMPACT_COLORS[SAFE], IMPACT_COLORS[LOOK], IMPACT_COLORS[GAMEPLAY]))
 
         # =============================================================== actions
@@ -3763,11 +3840,11 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             for i in issues:
                 self._refresh_row(i)
             self._apply_filter()
-            self._show_detail(self._current)
+            self._on_selection()
 
         def on_scan(self):
             self.btn_scan.setEnabled(False)
-            self._set_status("Scanning…")
+            self._set_status("Scanning\u2026")
             try:
                 Issue._counter = 0
                 self.issues = scan(selected_only=self.chk_selected.isChecked())
@@ -3778,7 +3855,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             finally:
                 self.btn_scan.setEnabled(True)
             self.lbl_level.setText(_STATE.get("level") or "Level")
-            self.lbl_scanned.setText("%sscanned %s" % ("selection · " if _STATE.get("selected_only") else "",
+            self.lbl_scanned.setText("%sscanned %s" % ("selection \u00b7 " if _STATE.get("selected_only") else "",
                                                         datetime.datetime.now().strftime("%H:%M:%S")))
             self._category = None
             self._populate()
@@ -3786,46 +3863,109 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self._refresh_all()
             self._set_status("%d issues found, sorted by estimated cost." % len(self.issues))
 
-        def _confirm(self, title, text, details, ok_text, warning=False):
-            box = QtWidgets.QMessageBox(self)
-            box.setWindowTitle(title)
-            box.setIcon(QtWidgets.QMessageBox.Icon.Warning if warning else QtWidgets.QMessageBox.Icon.Question)
-            box.setText(text)
-            if details:
-                box.setInformativeText(details)
-            ok = box.addButton(ok_text, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
-            box.setStyleSheet(_STYLE)
-            _qexec(box)
-            return box.clickedButton() is ok
+        def _dialog(self, heading, subheading="", cards=None, footer="", ok_text="OK", tone="info", cancel=True):
+            """Dark, on-brand modal (the native QMessageBox kept a light background with light text).
+            cards: list of (title, line, impact_label, impact_color, note). Returns True when OK is clicked."""
+            accent = {"warning": IMPACT_COLORS[LOOK], "danger": "#ef4444"}.get(tone, "#2563eb")
+            dlg = QtWidgets.QDialog(self)
+            dlg.setObjectName("Dialog")
+            dlg.setWindowTitle(TOOL_NAME)
+            dlg.setModal(True)
+            dlg.setMinimumWidth(620)
+            dlg.setStyleSheet(_STYLE)
+            v = QtWidgets.QVBoxLayout(dlg)
+            v.setContentsMargins(24, 22, 24, 18)
+            v.setSpacing(14)
 
-        def fix_issues(self, issues, bulk=False):
+            head = QtWidgets.QHBoxLayout()
+            head.setSpacing(14)
+            icon = QtWidgets.QLabel("!" if tone != "info" else "i")
+            icon.setFixedSize(36, 36)
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon.setStyleSheet("background:%s; color:#111113; border-radius:18px; font-weight:800; font-size:14pt;" % accent)
+            texts = QtWidgets.QVBoxLayout()
+            texts.setSpacing(3)
+            h = QtWidgets.QLabel(heading)
+            h.setObjectName("DialogHeading")
+            h.setWordWrap(True)
+            texts.addWidget(h)
+            if subheading:
+                sh = QtWidgets.QLabel(subheading)
+                sh.setWordWrap(True)
+                sh.setStyleSheet("color:%s;" % accent)
+                texts.addWidget(sh)
+            head.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+            head.addLayout(texts, 1)
+            v.addLayout(head)
+
+            if cards:
+                rows = []
+                for title, line, imp_label, imp_color, note in cards:
+                    rows.append(
+                        "<tr><td bgcolor='#27272c' style='padding:10px 12px;'>"
+                        "<span style='color:#fafafa; font-weight:600;'>%s</span>%s%s</td></tr>" % (
+                            esc(title),
+                            ("<br><span style='color:#c4c4cc;'>%s</span>" % esc(line)) if line else "",
+                            ("<br><span style='color:%s; font-weight:600;'>%s</span><span style='color:#a1a1aa;'>%s</span>"
+                             % (imp_color, esc(imp_label), (" \u2013 " + esc(note)) if note else "")) if imp_label else ""))
+                body = QtWidgets.QTextBrowser()
+                body.setObjectName("DialogBody")
+                body.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+                body.setWordWrapMode(QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+                body.setHtml("<table width='100%%' cellspacing='0' cellpadding='0' style='border-collapse:separate;'>%s</table>"
+                             % "<tr><td style='font-size:3pt;'>&nbsp;</td></tr>".join(rows))
+                body.setMinimumHeight(min(360, 86 * len(cards) + 10))
+                v.addWidget(body, 1)
+
+            if footer:
+                f = QtWidgets.QLabel(footer)
+                f.setObjectName("Muted")
+                f.setWordWrap(True)
+                v.addWidget(f)
+
+            buttons = QtWidgets.QHBoxLayout()
+            buttons.addStretch(1)
+            result = {"ok": False}
+            if cancel:
+                c = self._btn("Cancel", dlg.reject)
+                c.setMinimumWidth(96)
+                buttons.addWidget(c)
+            ok = self._btn(ok_text, None, {"warning": "Warn", "danger": "Danger"}.get(tone, "Primary"))
+            ok.setMinimumWidth(110)
+            ok.setDefault(True)
+            ok.clicked.connect(lambda *_a: (result.__setitem__("ok", True), dlg.accept()))
+            buttons.addWidget(ok)
+            v.addLayout(buttons)
+            _qexec(dlg)
+            return result["ok"]
+
+        def fix_issues(self, issues):
+            """Apply immediately - no popup. Fixes that may change the look carry a warning icon on their row;
+            everything is journaled, so Revert puts it back."""
             todo = [i for i in issues if i.fixable]
             if not todo:
                 return
-            risky = [i for i in todo if i.impact != SAFE]
-            if risky or len(todo) > 1:
-                lines = []
-                for i in todo[:8]:
-                    lines.append("• <b>%s</b> – %s<br>&nbsp;&nbsp;&nbsp;<span style='color:%s'>%s</span>%s" % (
-                        esc(i.obj), esc(i.fix_label), IMPACT_COLORS[i.impact], IMPACT_LABELS[i.impact],
-                        (": " + esc(i.impact_note)) if i.impact_note else ""))
-                if len(todo) > 8:
-                    lines.append("… and %d more" % (len(todo) - 8))
-                head = ("Apply %d fix%s?" % (len(todo), "es" if len(todo) > 1 else ""))
-                if risky:
-                    head += "<br><span style='color:%s'>%d of them change how the level looks or behaves.</span>" % (
-                        IMPACT_COLORS[LOOK], len(risky))
-                if not self._confirm(TOOL_NAME, head, "<br>".join(lines) +
-                                     "<br><br>Check the result in the viewport. Revert puts the old values back.",
-                                     "Apply", warning=bool(risky)):
-                    return
             fixed, failed = apply_fixes(todo, "World Perf Audit: Fix %d issue(s)" % len(todo))
             self._after_change(todo)
-            self._set_status("Fixed %d, failed %d. Not saved yet – review, then Save (or Revert)." % (fixed, failed))
+            visual = sum(1 for i in todo if i.impact != SAFE and i.status == "fixed")
+            self._set_status("Fixed %d%s%s. Not saved yet \u2013 check the viewport, then Save or Revert." % (
+                fixed, (" (%d may change the look)" % visual) if visual else "",
+                (", %d failed: see Output Log" % failed) if failed else ""))
 
         def on_fix_safe(self):
-            self.fix_issues(self._safe_visible(), bulk=True)
+            self.fix_issues(self._safe_visible())
+
+        def on_fix_all_shown(self):
+            self.fix_issues([i for i in self._visible() if i.fixable])
+
+        def on_fix_selected(self):
+            self.fix_issues(self._selected())
+
+        def _refresh_selection_buttons(self):
+            sel = self._selected()
+            n_fix = sum(1 for i in sel if i.fixable)
+            self.btn_fix_sel.setText("Fix Selected (%d)" % n_fix)
+            self.btn_fix_sel.setEnabled(n_fix > 0)
 
         def revert(self, issues):
             issues = [i for i in issues if i.revertable]
@@ -3845,12 +3985,13 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             pending = journal_entries()
             if not pending:
                 return
-            names = "<br>".join("• %s – %s" % (esc(e.get("title")), esc(e.get("obj"))) for e in pending[:10])
-            if len(pending) > 10:
-                names += "<br>… and %d more" % (len(pending) - 10)
-            if not self._confirm(TOOL_NAME, "Revert all %d recorded fixes?" % len(pending),
-                                 names + "<br><br>Includes fixes from earlier sessions (Saved/PerfAudit/fix_journal.json).",
-                                 "Revert All", warning=True):
+            cards = [(e.get("obj", ""), e.get("title", ""), "", "", "") for e in pending[:20]]
+            if len(pending) > 20:
+                cards.append(("\u2026 and %d more" % (len(pending) - 20), "", "", "", ""))
+            if not self._dialog("Revert all %d recorded fixes?" % len(pending),
+                                "Includes fixes from earlier sessions (Saved/PerfAudit/fix_journal.json).",
+                                cards, "The old values are put back; nothing is saved until you click Save.",
+                                "Revert all", "danger"):
                 return
             done, errors = revert_all()
             self._after_change(self.issues)
@@ -3859,21 +4000,19 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
         def on_recover_old(self):
             plan = recover_previous_fixes(apply=False)
             if not plan:
-                self._confirm(TOOL_NAME, "No fixes from the previous version were found in Saved/Logs.", "", "OK")
+                self._dialog("Nothing to restore", "No fixes from the previous version were found in Saved/Logs.",
+                             cancel=False)
                 return
             doable = [p for p in plan if p[3] is not None]
             manual = [p for p in plan if p[3] is None]
-            body = "<br>".join("• %s" % esc(p[2]) for p in doable[:14])
-            if len(doable) > 14:
-                body += "<br>… and %d more" % (len(doable) - 14)
-            if manual:
-                body += "<br><br><span style='color:#a1a1aa'>Not restorable automatically (%d): %s</span>" % (
-                    len(manual), esc(", ".join("%s (%s)" % (p[0], p[1]) for p in manual[:6])))
+            cards = [(p[1], p[2], "Will be restored", IMPACT_COLORS[SAFE], "") for p in doable]
+            cards += [(p[1], p[0], "Restore by hand / source control", "#a1a1aa", p[2].split(" - ")[0]) for p in manual]
             if not doable:
-                self._confirm(TOOL_NAME, "Nothing left to restore automatically.", body, "OK")
+                self._dialog("Nothing left to restore automatically", "", cards, cancel=False)
                 return
-            if not self._confirm(TOOL_NAME, "Restore %d value(s) changed by the previous version?" % len(doable),
-                                 body, "Restore", warning=True):
+            if not self._dialog("Restore %d value(s) changed by the previous version?" % len(doable),
+                                "Puts back the values the old Fix buttons changed (FX materials, Niagara, textures...).",
+                                cards, "Nothing is saved until you click Save.", "Restore", "warning"):
                 return
             done, errors = recover_previous_fixes(apply=True)
             self._set_status("Restored %d value(s)%s. Save to keep it." % (
@@ -3881,7 +4020,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
 
         def on_export(self):
             if not self.issues:
-                self._set_status("Nothing to export – scan first.")
+                self._set_status("Nothing to export \u2013 scan first.")
                 return
             path, _f = QtWidgets.QFileDialog.getSaveFileName(self, "Export report", default_report_path("html"),
                                                              "HTML report (*.html);;CSV (*.csv)")
@@ -3906,7 +4045,41 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
 
         def _on_selection(self):
             sel = self._selected()
-            self._show_detail(sel[0] if sel else None)
+            if len(sel) > 1:
+                self._show_multi(sel)
+            else:
+                self._show_detail(sel[0] if sel else None)
+            self._refresh_selection_buttons()
+
+        def _show_multi(self, sel):
+            """Several rows selected: summary + Fix N / Revert N buttons."""
+            self._current = sel[0]
+            n_fix = [i for i in sel if i.fixable]
+            n_rev = [i for i in sel if i.revertable and i.status == "fixed"]
+            n_vis = [i for i in n_fix if i.impact != SAFE]
+            self.d_fix.setText("Fix %d selected" % len(n_fix))
+            self.d_fix.setEnabled(bool(n_fix))
+            self.d_revert.setText("Revert %d selected" % len(n_rev))
+            self.d_revert.setEnabled(bool(n_rev))
+            self.d_goto.setEnabled(True)
+            self.d_open.setEnabled(any(i.assets for i in sel))
+            by_cat = OrderedDict()
+            for i in sel:
+                by_cat[i.category] = by_cat.get(i.category, 0) + 1
+            self.detail.setHtml(
+                "<div style='font-size:12pt; font-weight:600; color:#fafafa;'>%d issues selected</div>"
+                "<p style='margin:10px 0; line-height:150%%;'>"
+                "<span style='color:#e4e4e7'>%d can be fixed</span>%s<br>"
+                "<span style='color:#a1a1aa'>%d already fixed (%d revertable)</span><br>"
+                "<span style='color:#a1a1aa'>%d manual</span></p>"
+                "<p style='margin:14px 0 3px 0; color:#8e8e96; font-size:8pt; font-weight:700;'>CATEGORIES</p><p>%s</p>"
+                "<p style='color:#8e8e96; margin-top:14px;'>Use the buttons below or the toolbar's Fix Selected. "
+                "Nothing is saved until you click Save.</p>" % (
+                    len(sel), len(n_fix),
+                    (" \u2013 <span style='color:%s'>%d might change the look</span>" % (IMPACT_COLORS[LOOK], len(n_vis)))
+                    if n_vis else "",
+                    sum(1 for i in sel if i.status == "fixed"), len(n_rev), sum(1 for i in sel if not i.fix),
+                    "<br>".join("%s \u00b7 %d" % (esc(c), n) for c, n in by_cat.items())))
 
         def _goto_item(self, item):
             v = item.data(0, USER)
