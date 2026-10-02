@@ -1121,9 +1121,10 @@ class ScanContext(object):
                         tex = None
                     if tex is None:
                         continue
-                    e = self._textures.setdefault(tex.get_path_name(), {"tex": tex, "materials": []})
+                    e = self._textures.setdefault(tex.get_path_name(), {"tex": tex, "materials": [], "fx": False})
                     if u.material.get_name() not in e["materials"]:
                         e["materials"].append(u.material.get_name())
+                    e["fx"] = e["fx"] or bool(u.systems)
         return self._textures
 
     # --- summary -------------------------------------------------------------
@@ -1215,28 +1216,28 @@ def _check_translucent_velocity(ctx):
         base = e["base"]
         editable = _is_editable_asset(base)
         users = ", ".join(s.get_name() for s in e["systems"][:5]) or _names(e["comps"], 4)
-
-        def fix(rec, base=base):
-            _edit_material(base, rec, output_translucent_velocity=True)
-            return "Output Velocity enabled on %s" % base.get_name()
-
+        # Advice only, never an automatic fix: with Output Velocity on, a translucent material writes depth, so it
+        # can no longer READ depth. Soft particles (DepthFade / SceneDepth) then fail to compile ("[SM6] (Node
+        # DepthFade) Translucent material with 'Output Velocity' enabled will write to depth buffer...") and
+        # render with the fallback material - dark hard-edged cards. It broke real FX in production.
         yield Issue(
-            "mv_translucent_velocity", CAT_MOTION, MEDIUM, "Translucent material doesn't output velocity",
+            "mv_translucent_velocity", CAT_MOTION, LOW, "Translucent material doesn't output velocity",
             base.get_name(),
-            detail=("'%s' is translucent and used by moving content (%s) but 'Output Velocity' is off. "
-                    "Translucent surfaces skip the velocity pass by default, so TSR has no motion vectors for "
-                    "them and they ghost/smear. This is what makes particles show as empty in the Velocity view."
-                    % (base.get_name(), users)),
-            solution=("Open the material, Details > Translucency > enable 'Output Velocity' and save. Every "
-                      "instance of this material inherits it. Small extra GPU cost for the translucent pixels."
+            detail=("'%s' is translucent and used by moving content (%s) with 'Output Velocity' off, so TSR has "
+                    "no motion vectors for it (empty in the Velocity view) and fast-moving parts can ghost.\n"
+                    "Turning Output Velocity on makes the material write to the depth buffer, so it can no longer "
+                    "read depth: soft particles using DepthFade / SceneDepth fail to compile ('Translucent "
+                    "material with Output Velocity enabled will write to depth buffer, therefore cannot read "
+                    "from depth buffer') and render as dark, hard-edged cards. That's why this has no "
+                    "automatic fix." % (base.get_name(), users)),
+            solution=("Leave it off for soft particles (anything using DepthFade, SceneDepth or soft edges: "
+                      "smoke, fog, snow drifts, cloud sheets). Only enable 'Output Velocity' (Material > "
+                      "Translucency) on materials that don't read depth, e.g. small snowflakes or sparks - on a "
+                      "duplicate first, then check it compiles and look at the Velocity view. For flakes that "
+                      "still ghost, a Masked material (no DepthFade needed) writes velocity normally."
                       + ("" if editable else _READONLY_NOTE)),
             metric="%d user(s)" % (len(e["systems"]) or len(e["comps"])),
-            cost=_score(MEDIUM, len(e["comps"]) / 20.0), targets=e["comps"], assets=[base],
-            fix=fix if editable else None,
-            fix_label="Enable 'Output Velocity' on the base material and recompile it",
-            impact=LOOK, impact_note=("Every effect/mesh using this material starts writing velocity, so TSR and "
-                                      "motion blur treat it differently (soft smoke/fog cards can look sharper or "
-                                      "smear). Check your FX after fixing; Revert puts it back."))
+            cost=_score(LOW, len(e["comps"]) / 20.0), targets=e["comps"], assets=[base])
 
 
 @check("mv_vertex_deformation", CAT_MOTION, "Project: no velocity from WPO / vertex deformation")
@@ -2006,18 +2007,28 @@ def _textures2d(ctx):
             yield tex, e["materials"]
 
 
+def _fx_textures(ctx):
+    """Paths of textures sampled by materials that Niagara systems in the level use."""
+    return {p for p, e in ctx.textures().items() if e.get("fx")}
+
+
+_FX_SENSITIVE_TEX_CHECKS = ("tex_no_mips", "tex_uncompressed", "tex_npot")
+
+
 def _tex_issue(check_key, sev, title, tex, mats, detail, solution, metric, magnitude, fix=None, fix_label="",
-               impact=LOOK, impact_note=""):
+               impact=LOOK, impact_note="", fx=False):
     editable = _is_editable_asset(tex)
+    if fx and check_key in _FX_SENSITIVE_TEX_CHECKS:
+        fix = None   # flipbooks / atlases / lookup textures in FX break with these changes: advice only
+        solution += ("\n\nUsed by particle effects, so there's no automatic fix: flipbooks and atlases can "
+                     "bleed or shift. Change it by hand only if it isn't a flipbook/atlas.")
     return Issue(
         check_key, CAT_TEXTURE, sev, title, tex.get_name(),
         detail=detail + "\nUsed by: %s" % ", ".join(mats[:5]),
         solution=solution + ("" if editable else _READONLY_NOTE),
         metric=metric, cost=_score(sev, magnitude), assets=[tex],
         fix=fix if editable else None, fix_label=fix_label, impact=impact,
-        impact_note=impact_note + (" Also used by particle materials - check your FX." if any(
-            "particle" in m.lower() or m.lower().startswith(("m_fx", "mi_fx", "m_vfx", "mi_vfx", "m_p_", "mi_p_"))
-            for m in mats) else ""))
+        impact_note=impact_note + (" Also used by particle effects - check your FX." if fx else ""))
 
 
 def _tex_setter(tex, **props):
@@ -2031,6 +2042,7 @@ def _tex_setter(tex, **props):
 
 @check("tex_oversized", CAT_TEXTURE, "Oversized textures")
 def _check_tex_oversized(ctx):
+    fx_tex = _fx_textures(ctx)
     for tex, mats in _textures2d(ctx):
         w, h = _tex_size(tex)
         size = max(w, h)
@@ -2054,11 +2066,13 @@ def _check_tex_oversized(ctx):
                       "or use Virtual Texture Streaming for genuinely huge maps." % clamp),
             metric="%dx%d ~%s" % (w, h, _fmt_bytes(mb)), magnitude=_mag_log(mb, 8 << 20, 512 << 20),
             fix=_tex_setter(tex, max_texture_size=clamp), fix_label="Set Maximum Texture Size = %d" % clamp,
-            impact_note="The texture is capped at %d px: less sharp up close." % clamp)
+            impact_note="The texture is capped at %d px: less sharp up close." % clamp,
+            fx=tex.get_path_name() in fx_tex)
 
 
 @check("tex_never_stream", CAT_TEXTURE, "Large textures set to Never Stream")
 def _check_tex_never_stream(ctx):
+    fx_tex = _fx_textures(ctx)
     for tex, mats in _textures2d(ctx):
         w, h = _tex_size(tex)
         if max(w, h) < 1024 or not _prop(tex, "never_stream", False):
@@ -2072,12 +2086,14 @@ def _check_tex_never_stream(ctx):
             solution="Texture Editor > Texture > Never Stream = off (unless it's needed fully loaded at all times).",
             metric="~%s resident" % _fmt_bytes(mb), magnitude=_mag_log(mb, 4 << 20, 256 << 20),
             fix=_tex_setter(tex, never_stream=False), fix_label="Turn off Never Stream",
-            impact=SAFE, impact_note="Same pixels; the top mips are streamed in when needed instead of always loaded.")
+            impact=SAFE, impact_note="Same pixels; the top mips are streamed in when needed instead of always loaded.",
+            fx=tex.get_path_name() in fx_tex)
 
 
 @check("tex_no_mips", CAT_TEXTURE, "Textures without mipmaps")
 def _check_tex_no_mips(ctx):
     target = _enum_member(_ucls("TextureMipGenSettings"), "TMGS_FROM_TEXTURE_GROUP")
+    fx_tex = _fx_textures(ctx)
     for tex, mats in _textures2d(ctx):
         w, h = _tex_size(tex)
         if max(w, h) < CONFIG["texture_min_size"]:
@@ -2095,12 +2111,14 @@ def _check_tex_no_mips(ctx):
             fix=_tex_setter(tex, mip_gen_settings=target) if target is not None else None,
             fix_label="Set Mip Gen Settings = FromTextureGroup",
             impact_note=("Distant/small surfaces sample blurrier mips. Flipbooks, atlases and lookup textures can "
-                         "bleed between frames - leave those without mips."))
+                         "bleed between frames - leave those without mips."),
+            fx=tex.get_path_name() in fx_tex)
 
 
 @check("tex_uncompressed", CAT_TEXTURE, "Uncompressed / HDR textures")
 def _check_tex_uncompressed(ctx):
     hdr_c = _enum_member(_ucls("TextureCompressionSettings"), "TC_HDR_COMPRESSED")
+    fx_tex = _fx_textures(ctx)
     for tex, mats in _textures2d(ctx):
         w, h = _tex_size(tex)
         if max(w, h) < 1024:
@@ -2118,12 +2136,14 @@ def _check_tex_uncompressed(ctx):
             metric="%s ~%s" % (comp.replace("TC_", ""), _fmt_bytes(mb)), magnitude=_mag_log(mb, 8 << 20, 512 << 20),
             fix=_tex_setter(tex, compression_settings=hdr_c) if can_fix else None,
             fix_label="Set Compression to HDR Compressed (BC6H)",
-            impact_note="Block compression: slight banding/artifacts in smooth HDR gradients.")
+            impact_note="Block compression: slight banding/artifacts in smooth HDR gradients.",
+            fx=tex.get_path_name() in fx_tex)
 
 
 @check("tex_npot", CAT_TEXTURE, "Non power-of-two textures")
 def _check_tex_npot(ctx):
     stretch = _enum_member(_ucls("TexturePowerOfTwoSetting"), "STRETCH_TO_POWER_OF_TWO")
+    fx_tex = _fx_textures(ctx)
     for tex, mats in _textures2d(ctx):
         w, h = _tex_size(tex)
         if max(w, h) < CONFIG["texture_min_size"] or (w & (w - 1) == 0 and h & (h - 1) == 0):
@@ -2139,7 +2159,8 @@ def _check_tex_npot(ctx):
             metric="%dx%d" % (w, h), magnitude=0.3,
             fix=_tex_setter(tex, power_of_two_mode=stretch) if stretch is not None else None,
             fix_label="Set Power Of Two Mode = Stretch to Power of Two",
-            impact_note="The image is resampled to a power-of-two size (slightly softer; pixel-exact art can shift).")
+            impact_note="The image is resampled to a power-of-two size (slightly softer; pixel-exact art can shift).",
+            fx=tex.get_path_name() in fx_tex)
 
 
 # =============================================================================
