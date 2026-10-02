@@ -7,15 +7,18 @@ Scans the open level for setups that cost performance (plus the motion-vector /
 velocity problems that cause TSR ghosting on particles and WPO meshes), ranks
 every issue by estimated cost, explains it and gives you a "Fix" button.
 
-HOW TO RUN
+HOW TO RUN  (enable "Python Editor Script Plugin" + "Editor Scripting Utilities" first)
 ----------
-1. Enable the plugins "Python Editor Script Plugin" and "Editor Scripting Utilities".
-2. Run this file:
-      Tools > Execute Python Script...  ->  world_perf_audit.py
-   or in the Output Log (Cmd = Python):
-      py "C:/path/to/world_perf_audit.py"
-   or copy it to <Project>/Content/Python/ and run:
+A) Paste: Window > Output Log, set the dropdown left of the input box to "Python"
+   (not "Cmd", not "Python (REPL)"), paste this whole script, press Enter.
+B) File:  save it as world_perf_audit with the Python file extension, then
+   Tools > Execute Python Script... and pick it.
+C) Module: put that file in <Project>/Content/Python/ and run in the Output Log:
       import world_perf_audit; world_perf_audit.show()
+
+NOTE: this script never spells out the Python file extension on purpose. When
+code is pasted into the Output Log, Unreal treats any text containing it as a
+file path and fails with "Could not load Python file".
 
 QT
 --
@@ -33,8 +36,6 @@ Only actors that are loaded are scanned (World Partition: load the cells you
 want to audit first). Thresholds live in CONFIG below.
 """
 
-from __future__ import print_function
-
 import csv
 import datetime
 import html
@@ -46,6 +47,7 @@ import site
 import subprocess
 import sys
 import traceback
+import types
 from collections import OrderedDict
 
 import unreal
@@ -3057,5 +3059,11 @@ def show(reuse=True):
     return win
 
 
-if __name__ == "__main__":
+if not __name__.endswith("world_perf_audit"):
+    # Pasted into the Output Log or run as a script file (not imported): register this code as the
+    # module "world_perf_audit" so world_perf_audit.fix(12) / fix_all() work afterwards, then open the UI.
+    _module = types.ModuleType("world_perf_audit")
+    _module.__dict__.update(globals())
+    _module.__name__ = "world_perf_audit"
+    sys.modules["world_perf_audit"] = _module
     show(reuse=False)
