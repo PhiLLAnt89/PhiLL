@@ -3049,7 +3049,11 @@ def show(reuse=True):
     except Exception:
         pass
     _start_qt_tick(QtWidgets)
-    _STATE["window"] = win   # keep a reference so Python doesn't garbage-collect the window
+    # Keep the app + window alive. Unreal runs script files in a private namespace that can be
+    # garbage-collected after the run, so the references go on the sys module, which lives forever.
+    keep = sys.__dict__.setdefault("_world_perf_audit_keep", {})
+    keep["app"], keep["window"] = app, win
+    _STATE["window"] = win
     return win
 
 
