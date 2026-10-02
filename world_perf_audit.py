@@ -42,8 +42,10 @@ Revert > "Undo fixes made by the previous version", which reads Saved/Logs.
 Asset-level fixes (Nanite, LODs, textures, materials, Niagara) change the asset
 for every level that uses it - nothing is saved until you click Save.
 
-Only actors that are loaded are scanned (World Partition: load the cells you
-want to audit first). Thresholds live in CONFIG below.
+SCOPE: the persistent level + every LOADED sublevel (visible or hidden), Level
+Instance contents, child actors and spawned Sequencer spawnables. Unloaded
+sublevels / World Partition regions and runtime-spawned actors are not scanned;
+the header lists any sublevel that isn't loaded. Thresholds live in CONFIG below.
 """
 
 import csv
@@ -2529,9 +2531,84 @@ _STATE = {"issues": [], "stats": OrderedDict(), "errors": [], "level": ""}
 
 
 def _get_actors(selected_only=False):
+    """Every actor of the editor world: persistent level + all LOADED sublevels (visible or hidden),
+    Level Instance contents, child actors and currently spawned Sequencer spawnables."""
     sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-    actors = sub.get_selected_level_actors() if selected_only else sub.get_all_level_actors()
-    return [a for a in (actors or []) if a is not None]
+    if selected_only:
+        return [a for a in (sub.get_selected_level_actors() or []) if a is not None]
+    actors, seen = [], set()
+
+    def add(items):
+        for a in items or []:
+            if a is None or _isinst(a, "WorldSettings"):
+                continue
+            try:
+                key = a.get_path_name()
+            except Exception:
+                continue
+            if key not in seen:
+                seen.add(key)
+                actors.append(a)
+
+    add(sub.get_all_level_actors())
+    # get_all_level_actors skips non-editable/transient actors (Level Instance contents, child actors,
+    # Sequencer spawnables). The raw world iterator catches those too.
+    try:
+        add(unreal.GameplayStatics.get_all_actors_of_class(_editor_world(), unreal.Actor))
+    except Exception:
+        pass
+    return actors
+
+
+def _short_level_name(path):
+    path = str(path or "")
+    return path.rsplit("/", 1)[-1].split(".")[0] or path
+
+
+def scan_scope(actors=None):
+    """What a scan covers: loaded levels, sublevels that are NOT loaded, World Partition actor counts."""
+    world = _editor_world()
+    scope = OrderedDict([("actors", len(actors) if actors is not None else len(_get_actors())),
+                         ("levels_loaded", []), ("levels_unloaded", []), ("wp_total", None)])
+    try:
+        scope["levels_loaded"] = [_short_level_name(l.get_outermost().get_name())
+                                  for l in (unreal.EditorLevelUtils.get_levels(world) or [])]
+    except Exception:
+        pass
+    cls = _ucls("LevelStreaming")
+    if cls is not None and world is not None and hasattr(unreal, "ObjectIterator"):
+        for ls in unreal.ObjectIterator(cls):
+            try:
+                if ls.get_outer() != world or ls.get_loaded_level() is not None:
+                    continue
+                if _isinst(ls, "LevelStreamingLevelInstance", "LevelStreamingLevelInstanceEditor"):
+                    continue
+                name = _call_first(lambda: ls.get_world_asset_package_name(),
+                                   lambda: _prop(ls, "world_asset"), lambda: ls.get_name())
+                scope["levels_unloaded"].append(_short_level_name(name))
+            except Exception:
+                pass
+    wpl = _ucls("WorldPartitionBlueprintLibrary")
+    if wpl is not None:
+        try:
+            res = wpl.get_actor_descs()
+            descs = res[-1] if isinstance(res, tuple) else res
+            if descs:
+                scope["wp_total"] = len(descs)
+        except Exception:
+            pass
+    return scope
+
+
+def _scope_text(scope):
+    parts = ["%d actors" % scope["actors"], "%d level(s) loaded" % max(1, len(scope["levels_loaded"]))]
+    if scope["levels_unloaded"]:
+        parts.append("%d sublevel(s) NOT loaded (not scanned): %s" % (
+            len(scope["levels_unloaded"]), ", ".join(scope["levels_unloaded"][:8])
+            + (" ..." if len(scope["levels_unloaded"]) > 8 else "")))
+    if scope["wp_total"]:
+        parts.append("World Partition: %d actors exist, only loaded regions are scanned" % scope["wp_total"])
+    return " \u00b7 ".join(parts)
 
 
 def scan(selected_only=False, check_keys=None):
@@ -2559,10 +2636,13 @@ def scan(selected_only=False, check_keys=None):
         pass
     issues.sort(key=lambda i: (-i.cost, -i.severity, i.title))
     world = _editor_world()
-    _STATE.update(issues=issues, stats=ctx.stats, errors=errors,
+    scope = scan_scope(actors)
+    _STATE.update(issues=issues, stats=ctx.stats, errors=errors, scope=scope,
                   level=world.get_name() if world else "", selected_only=selected_only)
-    _log("Scan done: %d issue(s), %d auto-fixable, %d check error(s)."
-         % (len(issues), sum(1 for i in issues if i.fixable), len(errors)))
+    _log("Scan done: %d issue(s), %d auto-fixable, %d check error(s). Scope: %s"
+         % (len(issues), sum(1 for i in issues if i.fixable), len(errors), _scope_text(scope)))
+    if scope["levels_unloaded"]:
+        _warn("Not scanned - sublevels not loaded: %s" % ", ".join(scope["levels_unloaded"]))
     return issues
 
 
@@ -2979,7 +3059,10 @@ def revert(issue_id):
 
 def print_report(issues=None):
     issues = _STATE["issues"] if issues is None else issues
-    lines = ["", "=" * 100, "%s - %s  (%d issues)" % (TOOL_NAME, _STATE.get("level", ""), len(issues)), "=" * 100]
+    lines = ["", "=" * 100, "%s - %s  (%d issues)" % (TOOL_NAME, _STATE.get("level", ""), len(issues))]
+    if _STATE.get("scope"):
+        lines.append("Scanned: " + _scope_text(_STATE["scope"]))
+    lines.append("=" * 100)
     for cat in CATEGORIES:
         items = [i for i in issues if i.category == cat]
         if not items:
@@ -3379,6 +3462,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.lbl_level.setObjectName("LevelName")
             self.lbl_scanned = QtWidgets.QLabel("")
             self.lbl_scanned.setObjectName("Muted")
+            self.lbl_scanned.setTextFormat(Qt.TextFormat.RichText)
             lvl = QtWidgets.QVBoxLayout()
             lvl.setSpacing(0)
             lvl.addWidget(self.lbl_level, 0, Qt.AlignmentFlag.AlignRight)
@@ -3882,13 +3966,27 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             finally:
                 self.btn_scan.setEnabled(True)
             self.lbl_level.setText(_STATE.get("level") or "Level")
-            self.lbl_scanned.setText("%sscanned %s" % ("selection \u00b7 " if _STATE.get("selected_only") else "",
-                                                        datetime.datetime.now().strftime("%H:%M:%S")))
+            scope = _STATE.get("scope") or {}
+            unloaded = scope.get("levels_unloaded") or []
+            self.lbl_scanned.setText("%s%d actors \u00b7 %d level(s) loaded%s \u00b7 scanned %s" % (
+                "selection \u00b7 " if _STATE.get("selected_only") else "", scope.get("actors", 0),
+                max(1, len(scope.get("levels_loaded") or [])),
+                (" \u00b7 <span style='color:%s'>%d NOT loaded</span>" % (IMPACT_COLORS[LOOK], len(unloaded))) if unloaded else "",
+                datetime.datetime.now().strftime("%H:%M:%S")))
+            self.lbl_scanned.setToolTip(
+                ("Not scanned (load them in the Levels panel and scan again):\n  " + "\n  ".join(unloaded)) if unloaded
+                else "Scanned: persistent level + every loaded sublevel (visible or hidden), Level Instances, child "
+                     "actors and spawned Sequencer spawnables.\nNot scanned: unloaded sublevels / World Partition "
+                     "regions, actors spawned at runtime." + (
+                         "\nWorld Partition: %d actors exist in total." % scope["wp_total"] if scope.get("wp_total") else ""))
             self._category = None
             self._populate()
             self._current = None
             self._refresh_all()
-            self._set_status("%d issues found, sorted by estimated cost." % len(self.issues))
+            unloaded = (_STATE.get("scope") or {}).get("levels_unloaded") or []
+            self._set_status("%d issues found, sorted by estimated cost.%s" % (
+                len(self.issues), (" %d sublevel(s) are not loaded and were not scanned (hover the header)." % len(unloaded))
+                if unloaded else ""))
 
         def _dialog(self, heading, subheading="", cards=None, footer="", ok_text="OK", tone="info", cancel=True):
             """Dark, on-brand modal (the native QMessageBox kept a light background with light text).
