@@ -42,6 +42,10 @@ Revert > "Undo fixes made by the previous version", which reads Saved/Logs.
 Asset-level fixes (Nanite, LODs, textures, materials, Niagara) change the asset
 for every level that uses it - nothing is saved until you click Save.
 
+GPU PROFILE: "Profile GPU" (or world_perf_audit.profile_gpu()) captures frames
+with the CSV profiler, reports GPU/game/render-thread bound and the expensive
+GPU passes (shadows, Lumen, translucency...), linked to the scan findings.
+
 SCOPE: the persistent level + every LOADED sublevel (visible or hidden), Level
 Instance contents, child actors and spawned Sequencer spawnables. Unloaded
 sublevels / World Partition regions and runtime-spawned actors are not scanned;
@@ -59,6 +63,7 @@ import re
 import site
 import subprocess
 import sys
+import time
 import traceback
 import types
 import uuid
@@ -110,6 +115,12 @@ CONFIG = {
     "niagara_max_emitters": 8,
     # --- UI -----------------------------------------------------------------
     "max_rows": 4000,
+    # --- GPU profile (Profile GPU button) -------------------------------------
+    "target_fps": 60,                 # frame budget used to judge the measured passes
+    "profile_frames": 120,            # frames captured and averaged
+    "gpu_pass_min_share": 0.06,       # report GPU passes using >= 6% of the frame budget
+    "draw_calls_warn": 3000,
+    "primitives_warn": 15000000,
 }
 
 WINDOW_OBJECT_NAME = "WorldPerfAuditWindow"
@@ -132,7 +143,8 @@ CAT_VFX = "Niagara / VFX"
 CAT_POST = "Post Process & Rendering"
 CAT_ANIM = "Animation"
 CAT_SCENE = "Scene Setup"
-CATEGORIES = [CAT_MOTION, CAT_LIGHT, CAT_MESH, CAT_MATERIAL, CAT_TEXTURE, CAT_VFX, CAT_POST, CAT_ANIM, CAT_SCENE]
+CAT_GPU = "GPU Profile (measured)"
+CATEGORIES = [CAT_GPU, CAT_MOTION, CAT_LIGHT, CAT_MESH, CAT_MATERIAL, CAT_TEXTURE, CAT_VFX, CAT_POST, CAT_ANIM, CAT_SCENE]
 
 
 # =============================================================================
@@ -3124,6 +3136,257 @@ tr:hover td{background:#232323}.o{color:#8fb8ff}</style></head><body>
 
 
 # =============================================================================
+# GPU profile (measured): capture N frames with Unreal's CSV profiler (per-pass
+# GPU stats on), average them and turn expensive passes into issues.
+# =============================================================================
+_PROFILE = {"handle": None, "busy": False}
+
+# (keywords in the GPU stat name, label, related scan category, why it costs, what to do)
+_GPU_PASS_RULES = [
+    (("shadowdepth", "virtualshadow", "shadowprojection", "vsm", "shadow"), "Shadows", CAT_LIGHT,
+     "Shadow map / Virtual Shadow Map rendering. Usual causes: many shadow-casting movable lights, big light "
+     "radii, WPO or moving meshes invalidating VSM pages every frame, dense non-Nanite shadow casters.",
+     "Look at the Lighting & Shadows and Meshes findings (shadowed lights, WPO Disable Distance, tiny shadow "
+     "casters). Debug with 'r.Shadow.Virtual.Visualize' / 'stat shadowrendering'."),
+    (("lumen", "diffuseindirect", "radiancecache", "screenprobe"), "Lumen GI & reflections", CAT_POST,
+     "Lumen cost scales with resolution and the Lumen quality settings in post-process volumes / scalability.",
+     "Check the Post Process findings (Final Gather / Reflection quality overrides), lower 'Lumen Scene Detail', "
+     "use 'r.Lumen.Visualize' and 'stat lumen' to see which part is heavy."),
+    (("translucen", "distortion"), "Translucency / FX overdraw", CAT_VFX,
+     "Every overlapping translucent pixel is shaded again: big particle cards, many layers, lit or expensive "
+     "particle materials.",
+     "Look at the Niagara / VFX and Materials findings. View Mode > Optimization > Quad Overdraw / Shader "
+     "Complexity on your FX; fewer/smaller cards, cheaper unlit materials, particle LOD by distance."),
+    (("basepass", "prepass", "nanite", "visbuffer", "depthpass"), "Geometry & materials (base pass)", CAT_MESH,
+     "Rasterising and shading the opaque scene: dense non-Nanite meshes, many draw calls, expensive materials.",
+     "Look at the Meshes & Geometry and Materials findings (Nanite, LODs, cull distances, instruction counts). "
+     "Use 'stat nanite' and View Mode > Shader Complexity."),
+    (("volumetricfog", "heightfog", "fog"), "Fog / volumetric fog", CAT_LIGHT,
+     "Volumetric fog grid plus every light that injects into it (shadowed point/spot lights are the expensive ones).",
+     "Disable 'Cast Volumetric Shadow' on secondary lights (Lighting findings), keep r.VolumetricFog.GridPixelSize "
+     "at 8+ and GridSizeZ at 64."),
+    (("cloud", "skyatmosphere"), "Sky & clouds", CAT_SCENE,
+     "Volumetric clouds / sky atmosphere ray marching.",
+     "Lower cloud 'View Sample Count Scale' / shadow samples, or use r.VolumetricCloud.* scalability."),
+    (("lights", "directlighting", "lightcomposition", "clustered", "deferredlight", "lighting"), "Direct lighting",
+     CAT_LIGHT, "Deferred lighting of every pixel touched by each light's radius.",
+     "Fewer/smaller local lights, Max Draw Distance on lights (Lighting findings), consider MegaLights for "
+     "light-heavy scenes."),
+    (("postprocess", "bloom", "depthoffield", "dof", "motionblur", "tonemap", "tsr", "temporal", "upscal"),
+     "Post processing / TSR", CAT_POST,
+     "Full-screen passes at output resolution: TSR, DOF, motion blur, bloom (FFT is expensive), post materials.",
+     "Check the Post Process findings (FFT bloom, post materials); lower screen percentage or TSR quality "
+     "('r.TSR.*'), cinematic DOF only where needed."),
+    (("niagara", "particle", "fxsystem", "gpusim"), "Niagara GPU simulation", CAT_VFX,
+     "GPU particle simulation and sorting.",
+     "Cap particle counts, use Effect Types with distance culling (VFX findings), avoid sorting when not needed."),
+    (("scenecapture", "planar", "reflectioncapture"), "Scene captures / planar reflections", CAT_POST,
+     "The scene is rendered again for a capture or mirror.",
+     "Turn off Capture Every Frame, lower capture resolution, prefer Lumen/SSR over planar reflections."),
+    (("ssr", "screenspacereflection", "ssao", "ambientocclusion", "hzb"), "Screen-space effects", CAT_POST,
+     "SSR / SSAO / HZB passes.", "Lower their quality in the post-process volume or scalability settings."),
+    (("raytrac", "rtgi", "rtao"), "Ray tracing", CAT_POST,
+     "Hardware ray-traced effects.", "Disable RT effects you don't need (post-process / project settings)."),
+    (("hair", "groom"), "Hair / grooms", CAT_ANIM, "Strand-based hair rendering.",
+     "Use hair cards / LODs at distance."),
+    (("skincache", "skin"), "Skinning", CAT_ANIM, "GPU skinning of skeletal meshes.",
+     "Skeletal mesh LODs, fewer bones on lower LODs (Animation findings)."),
+]
+
+
+def _csv_dir():
+    return os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), "Profiling", "CSV")
+
+
+def _csv_files(folder):
+    """{file: (size, mtime)} of the CSV profiles in folder."""
+    out = {}
+    try:
+        for f in os.listdir(folder):
+            if f.lower().endswith(".csv"):
+                st = os.stat(os.path.join(folder, f))
+                out[f] = (st.st_size, st.st_mtime)
+    except Exception:
+        pass
+    return out
+
+
+def analyse_csv(path):
+    """Average every numeric column of an Unreal CSV profile. Returns {'frames', 'means', 'path'}."""
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        rows = list(csv.reader(fh))
+    if not rows:
+        raise RuntimeError("Empty CSV profile: %s" % path)
+    header = [h.strip() for h in rows[0]]
+    sums, counts, frames = {}, {}, 0
+    for r in rows[1:]:
+        if not r or r[0].strip().startswith("["):     # metadata rows at the end
+            break
+        numeric = 0
+        for i, v in enumerate(r[:len(header)]):
+            try:
+                f = float(v)
+            except ValueError:
+                continue
+            numeric += 1
+            sums[header[i]] = sums.get(header[i], 0.0) + f
+            counts[header[i]] = counts.get(header[i], 0) + 1
+        if numeric:
+            frames += 1
+    means = OrderedDict((k, sums[k] / counts[k]) for k in header if counts.get(k))
+    return {"frames": frames, "means": means, "path": path}
+
+
+def _mean(means, *names):
+    low = {k.lower(): v for k, v in means.items()}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
+
+
+def gpu_profile_issues(result, scan_issues=None):
+    """Turn an analysed CSV profile into issues (category 'GPU Profile (measured)')."""
+    means = result["means"]
+    budget = 1000.0 / float(CONFIG["target_fps"])
+    related = {}
+    for i in scan_issues or []:
+        if i.category != CAT_GPU and i.status != "fixed":
+            related[i.category] = related.get(i.category, 0) + 1
+    out = []
+    frame = _mean(means, "FrameTime")
+    gt, rt, gpu = _mean(means, "GameThreadTime"), _mean(means, "RenderThreadTime"), _mean(means, "GPUTime", "GPU/Total")
+    src = "%d frames, %s" % (result["frames"], os.path.basename(result["path"]))
+
+    if frame:
+        bound = max([(gpu or 0, "GPU"), (gt or 0, "Game thread"), (rt or 0, "Render thread")])[1]
+        ratio = frame / budget
+        sev = HIGH if ratio >= 1.5 else (MEDIUM if ratio >= 1.1 else INFO)
+        advice = {
+            "GPU": "The GPU is the limit: the passes below show where its time goes.",
+            "Game thread": ("The game thread is the limit: Blueprint/actor Tick, physics, animation, CPU Niagara. "
+                            "Use 'stat game', 'stat anim' or Unreal Insights to find it; check the Animation findings."),
+            "Render thread": ("The render thread is the limit: too many draw calls / primitives / dynamic shadow "
+                              "casters. Instancing, Nanite, cull distances and fewer shadowed lights help "
+                              "(Meshes & Lighting findings)."),
+        }[bound]
+        out.append(Issue(
+            "gpu_frame", CAT_GPU, sev, "%s-bound: %.1f ms per frame" % (bound, frame),
+            "Frame (%.0f fps, target %d)" % (1000.0 / frame, CONFIG["target_fps"]),
+            detail=("Average over %s. Frame %.2f ms - game thread %s, render thread %s, GPU %s (budget %.1f ms "
+                    "for %d fps). Measured in the editor, so it includes some editor overhead: profile PIE or a "
+                    "Standalone game for final numbers." % (
+                        src, frame, ("%.2f ms" % gt) if gt else "n/a", ("%.2f ms" % rt) if rt else "n/a",
+                        ("%.2f ms" % gpu) if gpu else "n/a", budget, CONFIG["target_fps"])),
+            solution=advice, metric="%.1f ms" % frame, cost=_score(sev, min(1.0, ratio - 1.0))))
+
+    passes = [(k, v) for k, v in means.items() if k.lower().startswith("gpu/") and
+              k.lower() not in ("gpu/total", "gpu/unaccounted") and v > 0]
+    passes.sort(key=lambda kv: -kv[1])
+    for name, ms in passes:
+        share = ms / budget
+        if share < CONFIG["gpu_pass_min_share"]:
+            continue
+        sev = HIGH if share >= 0.25 else (MEDIUM if share >= 0.12 else LOW)
+        short = name.split("/", 1)[1]
+        rule = next((r for r in _GPU_PASS_RULES if any(k in short.lower() for k in r[0])), None)
+        label, cat, why, todo = (rule[1], rule[2], rule[3], rule[4]) if rule else (
+            short, None, "GPU pass '%s'." % short, "Run 'ProfileGPU' (Ctrl+Shift+,) and expand this pass to see what's inside.")
+        if cat and related.get(cat):
+            todo += "\n\nThe scene scan found %d open issue(s) in '%s' - start there." % (related[cat], cat)
+        out.append(Issue(
+            "gpu_pass", CAT_GPU, sev, "%s: %.2f ms" % (label, ms), "GPU pass %s" % short,
+            detail="%s\n%.2f ms on average = %.0f%% of the %.1f ms frame budget (%s)." % (why, ms, share * 100, budget, src),
+            solution=todo, metric="%.2f ms" % ms, cost=_score(sev, min(1.0, share))))
+
+    draws = _mean(means, "RHI/DrawCalls")
+    if draws and draws > CONFIG["draw_calls_warn"]:
+        sev = HIGH if draws > CONFIG["draw_calls_warn"] * 2 else MEDIUM
+        out.append(Issue(
+            "gpu_drawcalls", CAT_GPU, sev, "%s draw calls per frame" % _fmt_count(draws), "RHI",
+            detail="%d draw calls on average (%s). Each one costs render-thread time; it's the usual cause of a "
+                   "render-thread bottleneck." % (draws, src),
+            solution=("Merge/instance repeated props (Meshes findings: instancing candidates), enable Nanite, add cull "
+                      "distances, reduce dynamic shadow casters and material slots per mesh."),
+            metric="%s draws" % _fmt_count(draws), cost=_score(sev, min(1.0, draws / (CONFIG["draw_calls_warn"] * 4.0)))))
+    prims = _mean(means, "RHI/PrimitivesDrawn")
+    if prims and prims > CONFIG["primitives_warn"]:
+        out.append(Issue(
+            "gpu_prims", CAT_GPU, MEDIUM, "%s triangles drawn per frame (non-Nanite)" % _fmt_count(prims), "RHI",
+            detail="%s primitives rasterised per frame by the classic (non-Nanite) path (%s)." % (_fmt_count(prims), src),
+            solution="Enable Nanite or add LODs on the dense meshes (Meshes findings: high-poly without Nanite).",
+            metric=_fmt_count(prims), cost=_score(MEDIUM, 0.5)))
+    if not passes:
+        out.append(Issue(
+            "gpu_nopasses", CAT_GPU, INFO, "No per-pass GPU timings in the capture", os.path.basename(result["path"]),
+            detail="The CSV had no GPU/* columns (r.GPUCsvStatsEnabled may be unsupported here), so only the frame "
+                   "times were analysed.",
+            solution="Use 'ProfileGPU' (Ctrl+Shift+,) for the per-pass breakdown, or Unreal Insights with the GPU channel."))
+    return out
+
+
+def profile_gpu(frames=None, on_done=None):
+    """Capture `frames` frames with the CSV profiler (GPU stats on), analyse them and add the result to the
+    last scan. Asynchronous: keep the level viewport visible (Realtime on) while it runs. on_done(issues, error)."""
+    if _PROFILE["busy"]:
+        raise RuntimeError("A GPU profile is already running.")
+    frames = int(frames or CONFIG["profile_frames"])
+    world = _editor_world()
+    folder = _csv_dir()
+    before = _csv_files(folder)
+    old_stats = _cvar_int("r.GPUCsvStatsEnabled", 0)
+    run = lambda c: unreal.SystemLibrary.execute_console_command(world, c)
+    run("r.GPUCsvStatsEnabled 1")
+    run("csvprofile frames=%d" % frames)
+    _log("GPU profile started: %d frames (keep the viewport visible)." % frames)
+    start = time.time()
+    timeout = 30.0 + frames / 5.0
+    state = {"candidate": None, "size": -1}
+    _PROFILE["busy"] = True
+
+    def finish(issues, error):
+        _PROFILE["busy"] = False
+        if _PROFILE["handle"] is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(_PROFILE["handle"])
+            except Exception:
+                pass
+            _PROFILE["handle"] = None
+        run("r.GPUCsvStatsEnabled %d" % (old_stats or 0))
+        if error:
+            _warn("GPU profile: %s" % error)
+        else:
+            keep = [i for i in _STATE["issues"] if i.category != CAT_GPU]
+            _STATE["issues"] = sorted(keep + issues, key=lambda i: (-i.cost, -i.severity, i.title))
+            _log("GPU profile done: %d finding(s)." % len(issues))
+        if on_done is not None:
+            on_done(issues, error)
+
+    def tick(_dt):
+        if not _PROFILE["busy"]:
+            return
+        now = _csv_files(folder)
+        new = [f for f in now if f not in before or now[f] != before[f]]
+        if new:
+            newest = max(new, key=lambda f: now[f][1])
+            size = now[newest][0]
+            if newest == state["candidate"] and size == state["size"] and size > 0:
+                try:
+                    result = analyse_csv(os.path.join(folder, newest))
+                    _STATE["gpu_profile"] = result
+                    finish(gpu_profile_issues(result, _STATE["issues"]), None)
+                except Exception as e:
+                    finish([], "could not read %s: %s" % (newest, e))
+                return
+            state["candidate"], state["size"] = newest, size      # wait one more tick until the file stops growing
+        elif time.time() - start > timeout:
+            finish([], "no CSV profile appeared in %s after %.0f s. Is the viewport rendering (Realtime on)?"
+                   % (folder, timeout))
+
+    _PROFILE["handle"] = unreal.register_slate_post_tick_callback(tick)
+
+
+# =============================================================================
 # Qt loading (PySide6 / PyQt6 / PySide2 / PyQt5) + one-time installer
 # =============================================================================
 _QT = None
@@ -3506,7 +3769,12 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.btn_revert.setMenu(self.revert_menu)
             self.btn_save = self._btn("Save\u2026", save_changes, None, "Unreal's Save Content dialog")
             self.btn_export = self._btn("Export\u2026", self.on_export, None, "HTML or CSV report")
-            for w in (self.btn_scan, self.chk_selected, self.btn_checks):
+            self.btn_profile = self._btn("Profile GPU", self.on_profile_gpu, None,
+                                         "Measure the real frame: captures %d frames with Unreal's CSV profiler\n"
+                                         "(per-pass GPU stats) and lists the expensive passes + the bottleneck.\n"
+                                         "Keep the level viewport visible with Realtime on. Scan first so the\n"
+                                         "results can point at the related scene issues." % CONFIG["profile_frames"])
+            for w in (self.btn_scan, self.btn_profile, self.chk_selected, self.btn_checks):
                 tb.addWidget(w)
             tb.addStretch(1)
             for w in (self.btn_fix_sel, self.btn_fix_safe, self.btn_fix_all, self.btn_revert, self.btn_save, self.btn_export):
@@ -3938,6 +4206,10 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 "<span style='color:%s'><b>Behaviour</b></span> might change gameplay / runtime behaviour<br>"
                 "Select rows (Ctrl/Shift+click, Ctrl+A) and use <b>Fix Selected</b>, or <b>Fix All Shown</b> "
                 "for the whole filtered list. No popups.</p>"
+                "<p style='margin-top:14px; color:#8e8e96; font-size:8pt; font-weight:700;'>MEASURED COST</p>"
+                "<p style='line-height:140%%;'><b>Profile GPU</b> captures real frames (Unreal's CSV profiler with "
+                "per-pass GPU stats), tells you if you're GPU, game-thread or render-thread bound and lists the "
+                "expensive passes, pointing at the related scan findings. Scan first, then profile.</p>"
                 "<p style='color:#8e8e96; line-height:140%%;'>Every fix is journaled to Saved/PerfAudit, so "
                 "<b>Revert</b> works even after saving or restarting. Fixes made by the previous version can be "
                 "undone from <b>Revert \u25be &gt; Undo fixes made by the previous version</b>.</p>"
@@ -4076,6 +4348,33 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self._set_status("Fixed %d%s%s. Not saved yet \u2013 check the viewport, then Save or Revert." % (
                 fixed, (" (%d may change the look)" % visual) if visual else "",
                 (", %d failed: see Output Log" % failed) if failed else ""))
+
+        def on_profile_gpu(self):
+            if _PROFILE["busy"]:
+                return
+            self.btn_profile.setEnabled(False)
+            self.btn_profile.setText("Profiling\u2026")
+            self._set_status("Capturing %d frames\u2026 keep the level viewport visible with Realtime on (Ctrl+R) "
+                             "and don't minimise Unreal." % CONFIG["profile_frames"])
+            try:
+                profile_gpu(on_done=self._on_profile_done)
+            except Exception as e:
+                self._on_profile_done([], str(e))
+
+        def _on_profile_done(self, issues, error):
+            self.btn_profile.setEnabled(True)
+            self.btn_profile.setText("Profile GPU")
+            if error:
+                self._set_status("GPU profile failed: %s" % error)
+                return
+            self.issues = list(_STATE["issues"])
+            self._category = CAT_GPU
+            self._current = None
+            self._populate()
+            self._refresh_all()
+            frame = next((i for i in issues if i.check == "gpu_frame"), None)
+            self._set_status("GPU profile: %s \u2013 %d finding(s) in '%s'." % (
+                frame.title if frame else "done", len(issues), CAT_GPU))
 
         def on_fix_safe(self):
             self.fix_issues(self._safe_visible())
