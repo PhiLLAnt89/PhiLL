@@ -26,11 +26,20 @@ The UI uses PySide6 (PyQt6 / PySide2 / PyQt5 also work). Unreal's Python does
 not ship Qt: if none is found the script offers to pip-install PySide6 once into
 a per-user folder (outside your project). If you say no, it runs in text mode:
 the report is printed to the Output Log / exported as HTML and you can fix from
-Python:   world_perf_audit.fix(12)   or   world_perf_audit.fix_all()
+Python:   world_perf_audit.fix(12), fix_all(), revert(12), revert_all(),
+          recover_previous_fixes(apply=True)
 
-Every fix is wrapped in an editor transaction: Ctrl+Z undoes it until you save.
+FIX SAFETY
+----------
+Every fix is labelled with its impact: "Safe" (no visual change), "Visual"
+(changes the look) or "Behaviour" (can change gameplay). "Fix Safe" only
+batch-applies Safe fixes; visual ones need a click per issue + confirmation.
+Every fix records the old values in Saved/PerfAudit/fix_journal.json, so
+Revert works even after saving or restarting (Revert > Revert ALL...).
+Fixes made by the first version of this tool (no journal) can be undone with
+Revert > "Undo fixes made by the previous version", which reads Saved/Logs.
 Asset-level fixes (Nanite, LODs, textures, materials, Niagara) change the asset
-for every level that uses it. Use "Save Changes..." when you're happy.
+for every level that uses it - nothing is saved until you click Save.
 
 Only actors that are loaded are scanned (World Partition: load the cells you
 want to audit first). Thresholds live in CONFIG below.
@@ -40,6 +49,7 @@ import csv
 import datetime
 import html
 import importlib
+import json
 import math
 import os
 import re
@@ -48,6 +58,7 @@ import subprocess
 import sys
 import traceback
 import types
+import uuid
 from collections import OrderedDict
 
 import unreal
@@ -377,11 +388,10 @@ def _is_translucent(mi):
     return bool(n) and n not in _OPAQUE_LIKE
 
 
-def _edit_material(base, **props):
-    """Set flags on a base material quietly, then do a single recompile."""
-    _modify(base)
+def _edit_material(base, rec, **props):
+    """Set flags on a base material quietly (old values recorded), then do a single recompile."""
     for k, v in props.items():
-        _set(base, k, v, notify=False)
+        rec.set(base, k, v, post="material", notify=False)
     unreal.MaterialEditingLibrary.recompile_material(base)
 
 
@@ -419,19 +429,32 @@ def _mesh_lods(mesh):
             return 1
 
 
-def _enable_nanite(mesh):
+def _set_nanite(mesh, enabled):
     _modify(mesh)
     ns = mesh.get_editor_property("nanite_settings")
-    ns.set_editor_property("enabled", True)
+    ns.set_editor_property("enabled", bool(enabled))
     sub = _sm_subsystem()
     if sub is not None and hasattr(sub, "set_nanite_settings"):
         sub.set_nanite_settings(mesh, ns, True)
     else:
         mesh.set_editor_property("nanite_settings", ns)  # PostEditChange rebuilds the mesh
+
+
+def _enable_nanite(mesh, rec):
+    rec.note("nanite", path=mesh.get_path_name(), old=_nanite_enabled(mesh), label=mesh.get_name())
+    _set_nanite(mesh, True)
     return "Nanite enabled on %s" % mesh.get_name()
 
 
-def _generate_lods(mesh, count):
+def _remove_lods(mesh):
+    _modify(mesh)
+    sub = _sm_subsystem()
+    ok = _call_first(lambda: sub.remove_lods(mesh), lambda: unreal.EditorStaticMeshLibrary.remove_lods(mesh))
+    if ok is False:
+        raise RuntimeError("Could not remove the generated LODs from %s" % mesh.get_name())
+
+
+def _generate_lods(mesh, count, rec):
     opts_cls = _ucls("StaticMeshReductionOptions") or _ucls("EditorScriptingMeshReductionOptions")
     set_cls = _ucls("StaticMeshReductionSettings") or _ucls("EditorScriptingMeshReductionSettings")
     if opts_cls is None or set_cls is None:
@@ -448,6 +471,7 @@ def _generate_lods(mesh, count):
     opts = opts_cls()
     opts.set_editor_property("auto_compute_lod_screen_size", True)
     opts.set_editor_property("reduction_settings", settings)
+    rec.note("lods", path=mesh.get_path_name(), label=mesh.get_name())
     _modify(mesh)
     sub = _sm_subsystem()
     if sub is not None and hasattr(sub, "set_lods_with_notification"):
@@ -516,6 +540,21 @@ def _renderer_materials(r):
     return [m for m in mats if m is not None]
 
 
+def _niagara_components_using(system):
+    out = []
+    cls = _ucls("NiagaraComponent")
+    if cls is None or system is None:
+        return out
+    for a in _get_actors():
+        try:
+            for c in a.get_components_by_class(cls) or []:
+                if c.get_asset() == system:
+                    out.append(c)
+        except Exception:
+            pass
+    return out
+
+
 def _after_niagara_edit(system, comps):
     _modify(system)
     fn = getattr(system, "request_compile", None)
@@ -532,55 +571,243 @@ def _after_niagara_edit(system, comps):
 
 
 # --- project ini -------------------------------------------------------------
+def _ini_path(ini_name="DefaultEngine.ini"):
+    return os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_config_dir()), ini_name)
+
+
+def _ini_read(path):
+    raw = b""
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            raw = f.read()
+    encoding = "utf-16" if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff") else "utf-8-sig"
+    text = raw.decode(encoding, errors="replace") if raw else ""
+    return text.splitlines(), encoding, ("\r\n" if "\r\n" in text else "\n")
+
+
+def _ini_section(lines, section):
+    header = "[%s]" % section
+    for i, l in enumerate(lines):
+        if l.strip().lower() == header.lower():
+            end = i + 1
+            while end < len(lines) and not lines[end].strip().startswith("["):
+                end += 1
+            return i, end
+    return None, None
+
+
+def _get_project_ini(section, key, ini_name="DefaultEngine.ini"):
+    """Current value of key in Config/<ini_name> [section], or None when it isn't set."""
+    lines, _enc, _nl = _ini_read(_ini_path(ini_name))
+    start, end = _ini_section(lines, section)
+    if start is None:
+        return None
+    for i in range(start + 1, end):
+        k, sep, v = lines[i].partition("=")
+        if sep and k.strip().lower() == key.lower():
+            return v.strip()
+    return None
+
+
 def _set_project_ini(section, key, value, ini_name="DefaultEngine.ini"):
-    """Write key=value into Config/<ini_name> [section] (creates entries as needed)."""
-    cfg_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_config_dir())
-    path = os.path.join(cfg_dir, ini_name)
+    """Write key=value into Config/<ini_name> [section]; value=None removes the key."""
+    path = _ini_path(ini_name)
     try:
         sc = _ucls("SourceControl")
         if sc is not None:
             sc.check_out_or_add_file(path, True)
     except Exception:
         pass
-    raw = b""
-    if os.path.exists(path):
-        if not os.access(path, os.W_OK):
-            try:
-                os.chmod(path, 0o666)
-            except Exception:
-                raise RuntimeError("%s is read-only (check it out of source control)." % path)
-        with open(path, "rb") as f:
-            raw = f.read()
-    encoding = "utf-16" if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff") else "utf-8-sig"
-    text = raw.decode(encoding, errors="replace") if raw else ""
-    newline = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines()
-    header = "[%s]" % section
-    try:
-        start = next(i for i, l in enumerate(lines) if l.strip().lower() == header.lower())
-    except StopIteration:
-        start = None
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        try:
+            os.chmod(path, 0o666)
+        except Exception:
+            raise RuntimeError("%s is read-only (check it out of source control)." % path)
+    lines, encoding, newline = _ini_read(path)
+    start, end = _ini_section(lines, section)
     entry = "%s=%s" % (key, value)
-    if start is None:
+    found = None
+    if start is not None:
+        for i in range(start + 1, end):
+            if lines[i].partition("=")[0].strip().lower() == key.lower():
+                found = i
+                break
+    if value is None:
+        if found is not None:
+            del lines[found]
+    elif found is not None:
+        lines[found] = entry
+    elif start is None:
         if lines and lines[-1].strip():
             lines.append("")
-        lines += [header, entry]
+        lines += ["[%s]" % section, entry]
     else:
-        end = start + 1
-        while end < len(lines) and not lines[end].strip().startswith("["):
-            end += 1
-        for i in range(start + 1, end):
-            if lines[i].split("=", 1)[0].strip().lower() == key.lower():
-                lines[i] = entry
-                break
-        else:
-            insert = end
-            while insert > start + 1 and not lines[insert - 1].strip():
-                insert -= 1
-            lines.insert(insert, entry)
+        insert = end
+        while insert > start + 1 and not lines[insert - 1].strip():
+            insert -= 1
+        lines.insert(insert, entry)
     with open(path, "wb") as f:
         f.write((newline.join(lines) + newline).encode("utf-16" if encoding == "utf-16" else "utf-8"))
     return path
+
+
+# =============================================================================
+# Fix safety: impact labels + change journal (every fix can be reverted, even
+# after saving or restarting - see Saved/PerfAudit/fix_journal.json)
+# =============================================================================
+SAFE, LOOK, GAMEPLAY = "safe", "look", "gameplay"
+IMPACT_LABELS = {SAFE: "No visual change", LOOK: "Changes the look", GAMEPLAY: "Can change behaviour"}
+IMPACT_SHORT = {SAFE: "Safe", LOOK: "Visual", GAMEPLAY: "Behaviour"}
+IMPACT_COLORS = {SAFE: "#4caf6a", LOOK: "#e0a03a", GAMEPLAY: "#a77bdb"}
+_REVERTABLE = ("prop", "call", "struct", "nanite", "lods", "ini")
+
+
+def _ser(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return {"t": "py", "v": v}
+    etype, name = type(v).__name__, _enum_name(v)
+    if _enum_member(_ucls(etype), name) is not None:
+        return {"t": "enum", "e": etype, "v": name}
+    raise TypeError("Can't record %r for revert" % (v,))
+
+
+def _deser(d):
+    if d.get("t") == "enum":
+        val = _enum_member(_ucls(d["e"]), d["v"])
+        if val is None:
+            raise RuntimeError("Unknown enum value %s.%s" % (d["e"], d["v"]))
+        return val
+    return d.get("v")
+
+
+class ChangeRecorder(object):
+    """Handed to every fix. Records the old value *before* anything is changed."""
+
+    def __init__(self):
+        self.changes = []
+
+    def set(self, obj, prop, value, post=None, notify=True):
+        self.changes.append({"k": "prop", "path": obj.get_path_name(), "prop": prop, "label": _label(obj),
+                             "old": _ser(obj.get_editor_property(prop)), "post": post})
+        _modify(obj)
+        _set(obj, prop, value, notify)
+
+    def call(self, obj, setter, new_args, old_args, post=None):
+        self.changes.append({"k": "call", "path": obj.get_path_name(), "setter": setter, "label": _label(obj),
+                             "old": [_ser(a) for a in old_args], "post": post})
+        _modify(obj)
+        getattr(obj, setter)(*new_args)
+
+    def struct_field(self, owner, struct_prop, field, value):
+        st = owner.get_editor_property(struct_prop)
+        self.changes.append({"k": "struct", "path": owner.get_path_name(), "prop": struct_prop, "field": field,
+                             "label": _label(owner), "old": _ser(st.get_editor_property(field))})
+        _modify(owner)
+        st.set_editor_property(field, value)
+        owner.set_editor_property(struct_prop, st)
+
+    def note(self, kind, **data):
+        d = {"k": kind}
+        d.update(data)
+        self.changes.append(d)
+
+
+def _resolve(path):
+    for name in ("find_object", "load_object"):
+        fn = getattr(unreal, name, None)
+        if fn is None:
+            continue
+        try:
+            obj = fn(None, path)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+    raise RuntimeError("Not found (is that level/asset loaded?): %s" % path)
+
+
+def _post_revert(obj, post):
+    if post == "material":
+        unreal.MaterialEditingLibrary.recompile_material(obj)
+    elif post == "niagara":
+        system = None
+        try:
+            system = obj.get_typed_outer(unreal.NiagaraSystem)
+        except Exception:
+            pass
+        if system is not None:
+            _after_niagara_edit(system, _niagara_components_using(system))
+    elif post == "skylight":
+        try:
+            obj.recapture_sky()
+        except Exception:
+            pass
+
+
+def _revert_changes(changes):
+    """Put back every recorded value (newest first). Returns a list of error strings."""
+    errors = []
+    for ch in reversed(changes):
+        try:
+            k = ch["k"]
+            if k == "prop":
+                obj = _resolve(ch["path"])
+                _modify(obj)
+                _set(obj, ch["prop"], _deser(ch["old"]), notify=ch.get("post") != "material")
+                _post_revert(obj, ch.get("post"))
+            elif k == "call":
+                obj = _resolve(ch["path"])
+                _modify(obj)
+                getattr(obj, ch["setter"])(*[_deser(a) for a in ch["old"]])
+                _post_revert(obj, ch.get("post"))
+            elif k == "struct":
+                obj = _resolve(ch["path"])
+                _modify(obj)
+                st = obj.get_editor_property(ch["prop"])
+                st.set_editor_property(ch["field"], _deser(ch["old"]))
+                obj.set_editor_property(ch["prop"], st)
+            elif k == "nanite":
+                _set_nanite(_resolve(ch["path"]), ch["old"])
+            elif k == "lods":
+                _remove_lods(_resolve(ch["path"]))
+            elif k == "ini":
+                _set_project_ini(ch["section"], ch["key"], ch["old"], ch.get("file", "DefaultEngine.ini"))
+            else:
+                raise RuntimeError("%s: %s" % (ch.get("label", k), ch.get("why", "only Ctrl+Z / source control can undo this")))
+        except Exception as e:
+            errors.append(str(e))
+    return errors
+
+
+def _journal_path():
+    folder = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), "PerfAudit")
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+    return os.path.join(folder, "fix_journal.json")
+
+
+def _journal_load():
+    try:
+        with open(_journal_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _journal_write(entry):
+    """Insert or update one entry (matched by id)."""
+    entries = [e for e in _journal_load() if e.get("id") != entry["id"]]
+    entries.append(entry)
+    try:
+        with open(_journal_path(), "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=1)
+    except Exception as e:
+        _warn("Could not write the fix journal: %s" % e)
+
+
+def _revertable(entry):
+    return bool(entry) and not entry.get("reverted") and any(c["k"] in _REVERTABLE for c in entry.get("changes", []))
 
 
 # =============================================================================
@@ -590,7 +817,8 @@ class Issue(object):
     _counter = 0
 
     def __init__(self, check, category, severity, title, obj, detail, solution,
-                 metric="", cost=None, targets=None, assets=None, fix=None, fix_label=""):
+                 metric="", cost=None, targets=None, assets=None, fix=None, fix_label="",
+                 impact=LOOK, impact_note=""):
         Issue._counter += 1
         self.id = Issue._counter
         self.check = check
@@ -604,14 +832,21 @@ class Issue(object):
         self.cost = float(cost if cost is not None else _score(severity))
         self.targets = [t for t in (targets or []) if t is not None]   # actors / components -> select
         self.assets = [a for a in (assets or []) if a is not None]     # assets -> content browser
-        self.fix = fix
+        self.fix = fix                  # fix(rec: ChangeRecorder) -> message
         self.fix_label = fix_label
-        self.status = "open"      # open | fixed | failed
+        self.impact = impact            # SAFE | LOOK | GAMEPLAY
+        self.impact_note = impact_note  # what will look/behave differently
+        self.status = "open"            # open | fixed | failed | reverted
         self.message = ""
+        self.journal = None             # journal entry of the last fix (for Revert)
 
     @property
     def fixable(self):
         return self.fix is not None and self.status != "fixed"
+
+    @property
+    def revertable(self):
+        return _revertable(self.journal)
 
     @property
     def severity_name(self):
@@ -622,7 +857,9 @@ class Issue(object):
             ("id", self.id), ("severity", self.severity_name), ("cost", self.cost),
             ("category", self.category), ("issue", self.title), ("object", self.obj),
             ("measured", self.metric), ("description", self.detail), ("solution", self.solution),
-            ("fix", self.fix_label if self.fix else "Manual"), ("status", self.status), ("message", self.message),
+            ("fix", self.fix_label if self.fix else "Manual"),
+            ("fix impact", IMPACT_LABELS[self.impact] if self.fix else ""),
+            ("status", self.status), ("message", self.message),
         ])
 
 
@@ -937,8 +1174,8 @@ def _check_niagara_motion_vectors(ctx):
             except Exception:
                 emitter = "?"
 
-            def fix(r=r, system=system, comps=comps):
-                _set(r, "motion_vector_setting", target)
+            def fix(rec, r=r, system=system, comps=comps):
+                rec.set(r, "motion_vector_setting", target, post="niagara")
                 _after_niagara_edit(system, comps)
                 return "Motion Vector Setting -> Auto Detect"
 
@@ -956,7 +1193,9 @@ def _check_niagara_motion_vectors(ctx):
                 metric="%d component(s)" % len(comps), cost=_score(MEDIUM, len(comps) / 10.0),
                 targets=comps, assets=[system],
                 fix=fix if (editable and target is not None) else None,
-                fix_label="Set Motion Vector Setting to Auto Detect on this renderer")
+                fix_label="Set Motion Vector Setting to Auto Detect on this renderer",
+                impact=LOOK, impact_note=("These particles start writing motion vectors: TSR stops smearing them, "
+                                          "but motion blur now also applies to them. Revert if the look changes."))
 
 
 @check("mv_translucent_velocity", CAT_MOTION, "Translucent moving materials without Output Velocity")
@@ -976,8 +1215,8 @@ def _check_translucent_velocity(ctx):
         editable = _is_editable_asset(base)
         users = ", ".join(s.get_name() for s in e["systems"][:5]) or _names(e["comps"], 4)
 
-        def fix(base=base):
-            _edit_material(base, output_translucent_velocity=True)
+        def fix(rec, base=base):
+            _edit_material(base, rec, output_translucent_velocity=True)
             return "Output Velocity enabled on %s" % base.get_name()
 
         yield Issue(
@@ -993,7 +1232,10 @@ def _check_translucent_velocity(ctx):
             metric="%d user(s)" % (len(e["systems"]) or len(e["comps"])),
             cost=_score(MEDIUM, len(e["comps"]) / 20.0), targets=e["comps"], assets=[base],
             fix=fix if editable else None,
-            fix_label="Enable 'Output Velocity' on the base material and recompile it")
+            fix_label="Enable 'Output Velocity' on the base material and recompile it",
+            impact=LOOK, impact_note=("Every effect/mesh using this material starts writing velocity, so TSR and "
+                                      "motion blur treat it differently (soft smoke/fog cards can look sharper or "
+                                      "smear). Check your FX after fixing; Revert puts it back."))
 
 
 @check("mv_vertex_deformation", CAT_MOTION, "Project: no velocity from WPO / vertex deformation")
@@ -1007,8 +1249,10 @@ def _check_vertex_deformation(ctx):
     wpo = ctx.wpo_components()
     sev = MEDIUM if wpo else LOW
 
-    def fix():
-        path = _set_project_ini("/Script/Engine.RendererSettings", "r.Velocity.EnableVertexDeformation", "1")
+    def fix(rec):
+        section, key = "/Script/Engine.RendererSettings", "r.Velocity.EnableVertexDeformation"
+        rec.note("ini", section=section, key=key, old=_get_project_ini(section, key), label="DefaultEngine.ini")
+        path = _set_project_ini(section, key, "1")
         return "Written to %s - restart the editor to apply" % os.path.basename(path)
 
     yield Issue(
@@ -1021,7 +1265,9 @@ def _check_vertex_deformation(ctx):
                   "deformation' to On (or Auto with the velocity pass not after the base pass). Needs an editor "
                   "restart. Small extra cost for WPO meshes in the velocity pass."),
         metric="%d WPO component(s)" % len(wpo), cost=_score(sev, len(wpo) / 50.0), targets=wpo[:200],
-        fix=fix, fix_label="Write r.Velocity.EnableVertexDeformation=1 to DefaultEngine.ini (restart needed)")
+        fix=fix, fix_label="Write r.Velocity.EnableVertexDeformation=1 to DefaultEngine.ini (restart needed)",
+        impact=LOOK, impact_note=("After the restart, swaying foliage/WPO meshes write velocity: less TSR ghosting, "
+                                  "and they get motion blur."))
 
 
 # =============================================================================
@@ -1042,9 +1288,8 @@ def _check_light_radius(ctx):
             continue
         sev = HIGH if r > max_r * 4 else MEDIUM
 
-        def fix(c=c):
-            _modify(c)
-            c.set_attenuation_radius(max_r)
+        def fix(rec, c=c):
+            rec.set(c, "attenuation_radius", max_r)
             return "Attenuation radius -> %d" % max_r
 
         yield Issue(
@@ -1055,7 +1300,8 @@ def _check_light_radius(ctx):
             solution=("Reduce Attenuation Radius to what the light actually needs (use Inverse Square Falloff "
                       "and adjust Intensity), or disable Cast Shadows if the shadows aren't noticeable."),
             metric="%s uu" % _fmt_count(r), cost=_score(sev, _mag_log(r, max_r, max_r * 8)),
-            targets=[c], fix=fix, fix_label="Clamp Attenuation Radius to %d" % max_r)
+            targets=[c], fix=fix, fix_label="Clamp Attenuation Radius to %d" % max_r,
+            impact=LOOK, impact_note="The light reaches less far: areas beyond %d uu get darker." % max_r)
 
 
 @check("light_too_many_shadowed", CAT_LIGHT, "Too many shadow-casting dynamic lights")
@@ -1084,12 +1330,11 @@ def _check_light_draw_distance(ctx):
         return
     sev = MEDIUM if len(lights) > 20 else LOW
 
-    def fix(lights=lights):
+    def fix(rec, lights=lights):
         for c in lights:
             d = max(CONFIG["light_max_draw_distance"], float(_prop(c, "attenuation_radius", 0.0) or 0.0) * 3.0)
-            _modify(c)
-            _set(c, "max_draw_distance", d)
-            _set(c, "max_distance_fade_range", d * 0.2)
+            rec.set(c, "max_draw_distance", d)
+            rec.set(c, "max_distance_fade_range", d * 0.2)
         return "Max Draw Distance set on %d lights" % len(lights)
 
     yield Issue(
@@ -1099,7 +1344,8 @@ def _check_light_draw_distance(ctx):
         solution=("Set Light > Max Draw Distance (and Max Distance Fade Range for a smooth fade). The fix uses "
                   "max(%d, 3 x attenuation radius) with a 20%% fade." % CONFIG["light_max_draw_distance"]),
         metric="%d lights" % len(lights), cost=_score(sev, len(lights) / 100.0), targets=lights,
-        fix=fix, fix_label="Set Max Draw Distance + fade range on all of them")
+        fix=fix, fix_label="Set Max Draw Distance + fade range on all of them",
+        impact=LOOK, impact_note="These lights fade out when the camera is far away from them.")
 
 
 @check("light_volumetric_shadow", CAT_LIGHT, "Local lights casting volumetric fog shadows")
@@ -1114,10 +1360,9 @@ def _check_volumetric_shadow(ctx):
         return
     sev = MEDIUM if len(lights) > 3 else LOW
 
-    def fix(lights=lights):
+    def fix(rec, lights=lights):
         for c in lights:
-            _modify(c)
-            _set(c, "cast_volumetric_shadow", False)
+            rec.set(c, "cast_volumetric_shadow", False)
         return "Cast Volumetric Shadow disabled on %d lights" % len(lights)
 
     yield Issue(
@@ -1127,7 +1372,8 @@ def _check_volumetric_shadow(ctx):
                 % (len(lights), _names(lights))),
         solution="Light > Cast Volumetric Shadow = off (keep it on the directional light and 1-2 hero lights).",
         metric="%d lights" % len(lights), cost=_score(sev, len(lights) / 12.0), targets=lights,
-        fix=fix, fix_label="Disable Cast Volumetric Shadow on these lights")
+        fix=fix, fix_label="Disable Cast Volumetric Shadow on these lights",
+        impact=LOOK, impact_note="Volumetric fog is no longer shadowed by these lights (light shafts from them disappear).")
 
 
 @check("light_function", CAT_LIGHT, "Lights using light functions")
@@ -1190,9 +1436,8 @@ def _check_cascades(ctx):
         if n <= limit or not _prop(c, "cast_shadows", False):
             continue
 
-        def fix(c=c):
-            _modify(c)
-            _set(c, "dynamic_shadow_cascades", limit)
+        def fix(rec, c=c):
+            rec.set(c, "dynamic_shadow_cascades", limit)
             return "Cascades -> %d" % limit
 
         yield Issue(
@@ -1202,7 +1447,8 @@ def _check_cascades(ctx):
             solution=("Cascaded Shadow Maps > Dynamic Shadow Cascades = %d and reduce Dynamic Shadow Distance; "
                       "or enable Virtual Shadow Maps." % limit),
             metric="%d cascades" % n, cost=_score(MEDIUM, (n - limit) / 4.0), targets=[c],
-            fix=fix, fix_label="Set Dynamic Shadow Cascades to %d" % limit)
+            fix=fix, fix_label="Set Dynamic Shadow Cascades to %d" % limit,
+            impact=LOOK, impact_note="Fewer cascades = lower shadow resolution in the distance.")
 
 
 @check("skylight_realtime", CAT_LIGHT, "Sky light real-time capture")
@@ -1211,9 +1457,8 @@ def _check_skylight_realtime(ctx):
         if not _prop(c, "real_time_capture", False):
             continue
 
-        def fix(c=c):
-            _modify(c)
-            _set(c, "real_time_capture", False)
+        def fix(rec, c=c):
+            rec.set(c, "real_time_capture", False, post="skylight")
             try:
                 c.recapture_sky()
             except Exception:
@@ -1227,7 +1472,8 @@ def _check_skylight_realtime(ctx):
             solution=("If the sky doesn't change at runtime, disable Real Time Capture and recapture once. Keep it "
                       "for dynamic time-of-day setups."),
             metric="every frame", cost=_score(LOW, 0.7), targets=[c],
-            fix=fix, fix_label="Disable Real Time Capture and recapture once")
+            fix=fix, fix_label="Disable Real Time Capture and recapture once",
+            impact=LOOK, impact_note="Sky lighting stops following sky/time-of-day changes at runtime.")
 
 
 @check("scene_duplicates", CAT_SCENE, "Duplicate sky / fog / sun actors")
@@ -1272,15 +1518,18 @@ def _check_high_poly(ctx):
         sev = HIGH if (tris >= hi or total >= hi * 10) else MEDIUM
         editable = _is_editable_asset(mesh)
         translucent = [m for c in u["comps"] for m in ctx.component_materials(c) if _is_translucent(m)]
-        fix, fix_label = None, ""
+        fix, fix_label, note = None, "", ""
         if nanite_project and not translucent:
-            fix, fix_label = (lambda mesh=mesh: _enable_nanite(mesh)), "Enable Nanite on the asset (rebuilds it)"
+            fix, fix_label = (lambda rec, mesh=mesh: _enable_nanite(mesh, rec)), "Enable Nanite on the asset (rebuilds it)"
+            note = ("Usually looks identical. Masked/WPO foliage, two-sided or vertex-colour tricks can render "
+                    "differently with Nanite - check the mesh after the rebuild.")
             sol = ("Enable Nanite: Static Mesh Editor > Details > Nanite Settings > Enable Nanite Support "
                    "(or right-click the asset > Nanite > Enable). Nanite streams/culls clusters so cost follows "
                    "screen pixels, not source triangles.")
         elif lods <= 1:
             cnt = CONFIG["auto_lod_count"]
-            fix, fix_label = (lambda mesh=mesh, cnt=cnt: _generate_lods(mesh, cnt)), "Auto-generate %d LODs" % cnt
+            fix, fix_label = (lambda rec, mesh=mesh, cnt=cnt: _generate_lods(mesh, cnt, rec)), "Auto-generate %d LODs" % cnt
+            note = "Distant copies switch to simplified LODs (possible LOD popping / silhouette changes)."
             sol = ("%s Generate LODs: Static Mesh Editor > LOD Settings > Number of LODs, Auto Compute LOD "
                    "Distances." % ("Uses a translucent material so Nanite isn't an option." if translucent
                                    else "Nanite is disabled for the project."))
@@ -1297,7 +1546,7 @@ def _check_high_poly(ctx):
                     % (_fmt_count(tris), lods, n, _fmt_count(total))),
             solution=sol, metric="%s tris x%d" % (_fmt_count(tris), n),
             cost=_score(sev, _mag_log(total, lo, hi * 50)), targets=u["comps"], assets=[mesh],
-            fix=fix, fix_label=fix_label)
+            fix=fix, fix_label=fix_label, impact=LOOK, impact_note=note)
 
 
 @check("mesh_missing_lods", CAT_MESH, "Mid-poly non-Nanite meshes without LODs")
@@ -1322,8 +1571,9 @@ def _check_missing_lods(ctx):
                       "or enable Nanite if the materials are opaque/masked." % cnt + ("" if editable else _READONLY_NOTE)),
             metric="%s tris x%d" % (_fmt_count(tris), n), cost=_score(sev, _mag_log(tris * n, lo, lo * 200)),
             targets=u["comps"], assets=[mesh],
-            fix=(lambda mesh=mesh: _generate_lods(mesh, cnt)) if editable else None,
-            fix_label="Auto-generate %d LODs (rebuilds the mesh)" % cnt)
+            fix=(lambda rec, mesh=mesh: _generate_lods(mesh, cnt, rec)) if editable else None,
+            fix_label="Auto-generate %d LODs (rebuilds the mesh)" % cnt,
+            impact=LOOK, impact_note="Distant copies switch to simplified LODs (possible LOD popping).")
 
 
 @check("mesh_wpo_distance", CAT_MESH, "WPO meshes without WPO Disable Distance")
@@ -1346,13 +1596,9 @@ def _check_wpo_distance(ctx):
         nanite = mesh is not None and _nanite_enabled(mesh)
         sev = MEDIUM if nanite else LOW
 
-        def fix(comps=comps):
+        def fix(rec, comps=comps):
             for c in comps:
-                _modify(c)
-                try:
-                    c.set_world_position_offset_disable_distance(dist)
-                except Exception:
-                    _set(c, "world_position_offset_disable_distance", dist)
+                rec.set(c, "world_position_offset_disable_distance", dist)
             return "WPO Disable Distance = %d on %d component(s)" % (dist, len(comps))
 
         yield Issue(
@@ -1366,7 +1612,8 @@ def _check_wpo_distance(ctx):
                       "e.g. %d. Also consider Shadow Cache Invalidation Behavior = Rigid for subtle sway." % dist),
             metric="%d comp(s)" % len(comps), cost=_score(sev, _mag_log(len(comps), 1, 500)),
             targets=comps, assets=[mesh] if mesh else [],
-            fix=fix, fix_label="Set WPO Disable Distance = %d on these components" % dist)
+            fix=fix, fix_label="Set WPO Disable Distance = %d on these components" % dist,
+            impact=LOOK, impact_note="These meshes stop swaying/animating beyond %d uu from the camera." % dist)
 
 
 @check("mesh_tiny_shadows", CAT_MESH, "Tiny meshes casting shadows")
@@ -1378,10 +1625,9 @@ def _check_tiny_shadows(ctx):
     if len(comps) < 10:
         return
 
-    def fix(comps=comps):
+    def fix(rec, comps=comps):
         for c in comps:
-            _modify(c)
-            c.set_cast_shadow(False)
+            rec.call(c, "set_cast_shadow", [False], [bool(_prop(c, "cast_shadow", True))])
         return "Cast Shadow off on %d tiny meshes" % len(comps)
 
     yield Issue(
@@ -1391,7 +1637,8 @@ def _check_tiny_shadows(ctx):
                 % (len(comps), r_max, _names(comps))),
         solution="Lighting > Cast Shadow = off on small clutter (pebbles, screws, debris), or use contact shadows.",
         metric="%d comps" % len(comps), cost=_score(LOW, len(comps) / 500.0), targets=comps,
-        fix=fix, fix_label="Disable Cast Shadow on all of them")
+        fix=fix, fix_label="Disable Cast Shadow on all of them",
+        impact=LOOK, impact_note="These small meshes no longer cast shadows.")
 
 
 @check("mesh_cull_distance", CAT_MESH, "Small non-Nanite props without cull distance")
@@ -1415,12 +1662,11 @@ def _check_cull_distance(ctx):
         return
     sev = MEDIUM if len(comps) > 300 else LOW
 
-    def fix(comps=comps):
+    def fix(rec, comps=comps):
         for c in comps:
             d = min(CONFIG["cull_distance_max"], max(CONFIG["cull_distance_min"],
                                                      _bounds_radius(c) * CONFIG["cull_distance_scale"]))
-            _modify(c)
-            c.set_cull_distance(d)
+            rec.call(c, "set_cull_distance", [d], [float(_prop(c, "ld_max_draw_distance", 0.0) or 0.0)])
         return "Cull distance set on %d components" % len(comps)
 
     yield Issue(
@@ -1431,10 +1677,11 @@ def _check_cull_distance(ctx):
                   "component. The fix uses bounds radius x %d, clamped to %d-%d."
                   % (CONFIG["cull_distance_scale"], CONFIG["cull_distance_min"], CONFIG["cull_distance_max"])),
         metric="%d comps" % len(comps), cost=_score(sev, len(comps) / 2000.0), targets=comps,
-        fix=fix, fix_label="Set a size-based Max Draw Distance on each of them")
+        fix=fix, fix_label="Set a size-based Max Draw Distance on each of them",
+        impact=LOOK, impact_note="These props disappear when they are far from the camera.")
 
 
-def _sync_foliage_cull(mesh, start, end):
+def _sync_foliage_cull(mesh, start, end, rec):
     cls = _ucls("FoliageType_InstancedStaticMesh")
     if cls is None or mesh is None or not hasattr(unreal, "ObjectIterator"):
         return
@@ -1442,13 +1689,10 @@ def _sync_foliage_cull(mesh, start, end):
         try:
             if ft.get_name().startswith("Default__") or _prop(ft, "mesh") != mesh:
                 continue
-            iv = _prop(ft, "cull_distance")
-            if iv is None:
+            if _prop(ft, "cull_distance") is None:
                 continue
-            _modify(ft)
-            iv.set_editor_property("min", int(start))
-            iv.set_editor_property("max", int(end))
-            ft.set_editor_property("cull_distance", iv)
+            rec.struct_field(ft, "cull_distance", "min", int(start))
+            rec.struct_field(ft, "cull_distance", "max", int(end))
         except Exception:
             pass
 
@@ -1468,11 +1712,11 @@ def _check_ism_cull(ctx):
         sev = MEDIUM if n > min_n * 10 else LOW
         foliage = _isinst(c, "FoliageInstancedStaticMeshComponent")
 
-        def fix(c=c, mesh=mesh, foliage=foliage):
-            _modify(c)
-            c.set_cull_distances(int(end * 0.8), end)
+        def fix(rec, c=c, mesh=mesh, foliage=foliage):
+            old = [int(_prop(c, "instance_start_cull_distance", 0) or 0), int(_prop(c, "instance_end_cull_distance", 0) or 0)]
+            rec.call(c, "set_cull_distances", [int(end * 0.8), end], old)
             if foliage:
-                _sync_foliage_cull(mesh, end * 0.8, end)
+                _sync_foliage_cull(mesh, end * 0.8, end, rec)
             return "Instance cull distance %d-%d" % (int(end * 0.8), end)
 
         yield Issue(
@@ -1485,7 +1729,8 @@ def _check_ism_cull(ctx):
                          if foliage else "Details > Instance Start/End Cull Distance.", int(end * 0.8), end)),
             metric="%s instances" % _fmt_count(n), cost=_score(sev, _mag_log(n, min_n, min_n * 100)),
             targets=[c], assets=[mesh] if mesh else [],
-            fix=fix, fix_label="Set instance cull distance %d-%d" % (int(end * 0.8), end))
+            fix=fix, fix_label="Set instance cull distance %d-%d" % (int(end * 0.8), end),
+            impact=LOOK, impact_note="Instances fade out and disappear beyond %d uu - visible on open landscapes." % end)
 
 
 @check("mesh_movable_static", CAT_MESH, "Static mesh actors set to Movable")
@@ -1505,10 +1750,9 @@ def _check_movable_static(ctx):
         return
     static = _enum_member(_ucls("ComponentMobility"), "STATIC")
 
-    def fix(comps=comps):
+    def fix(rec, comps=comps):
         for c in comps:
-            _modify(c)
-            c.set_mobility(static)
+            rec.call(c, "set_mobility", [static], [_prop(c, "mobility")])
         return "Mobility -> Static on %d actors" % len(comps)
 
     yield Issue(
@@ -1519,7 +1763,9 @@ def _check_movable_static(ctx):
         solution=("Set Mobility = Static on props that never move. Leave Movable anything moved by Blueprint, "
                   "Sequencer or gameplay."),
         metric="%d actors" % len(comps), cost=_score(LOW, len(comps) / 300.0), targets=comps,
-        fix=fix, fix_label="Set Mobility to Static (only for props that never move!)")
+        fix=fix, fix_label="Set Mobility to Static (only for props that never move!)",
+        impact=GAMEPLAY, impact_note=("Anything that moves these props at runtime (Blueprint, Sequencer, physics) "
+                                      "will stop working. Static lighting/shadow caching may change their look."))
 
 
 @check("mesh_overlap_events", CAT_MESH, "Static props generating overlap events")
@@ -1537,10 +1783,9 @@ def _check_overlap_events(ctx):
     if len(comps) < 20:
         return
 
-    def fix(comps=comps):
+    def fix(rec, comps=comps):
         for c in comps:
-            _modify(c)
-            c.set_generate_overlap_events(False)
+            rec.call(c, "set_generate_overlap_events", [False], [True])
         return "Generate Overlap Events off on %d components" % len(comps)
 
     yield Issue(
@@ -1549,7 +1794,8 @@ def _check_overlap_events(ctx):
                 "overlap tests against them." % len(comps)),
         solution="Collision > Generate Overlap Events = off for scenery (keep it on triggers/pickups).",
         metric="%d comps" % len(comps), cost=_score(LOW, len(comps) / 1000.0), targets=comps,
-        fix=fix, fix_label="Disable Generate Overlap Events on all of them")
+        fix=fix, fix_label="Disable Generate Overlap Events on all of them",
+        impact=GAMEPLAY, impact_note="Triggers/Blueprints relying on overlaps with these props stop firing.")
 
 
 @check("mesh_stacked_duplicates", CAT_MESH, "Duplicate meshes stacked on top of each other")
@@ -1562,7 +1808,8 @@ def _check_stacked(ctx):
             continue
         try:
             l, r, s = a.get_actor_location(), a.get_actor_rotation(), a.get_actor_scale3d()
-            key = (mesh.get_path_name(), round(l.x, 0), round(l.y, 0), round(l.z, 0),
+            mats = tuple(m.get_path_name() for m in ScanContext.component_materials(c))
+            key = (mesh.get_path_name(), mats, round(l.x, 0), round(l.y, 0), round(l.z, 0),
                    round(r.pitch, 1), round(r.yaw, 1), round(r.roll, 1),
                    round(s.x, 2), round(s.y, 2), round(s.z, 2))
         except Exception:
@@ -1573,7 +1820,9 @@ def _check_stacked(ctx):
             continue
         keep, dupes = actors[0], actors[1:]
 
-        def fix(dupes=dupes):
+        def fix(rec, dupes=dupes):
+            rec.note("destroyed", label=", ".join(_label(d) for d in dupes),
+                     why="deleted actors can only come back with Ctrl+Z or source control")
             unreal.get_editor_subsystem(unreal.EditorActorSubsystem).destroy_actors(dupes)
             return "Deleted %d duplicate(s)" % len(dupes)
 
@@ -1585,7 +1834,9 @@ def _check_stacked(ctx):
                     % (len(dupes), _label(keep))),
             solution="Delete the copies, keep one.", metric="%d copies" % (len(dupes) + 1),
             cost=_score(MEDIUM, len(dupes) / 5.0), targets=actors,
-            fix=fix, fix_label="Delete the %d duplicate(s), keep '%s'" % (len(dupes), _label(keep)))
+            fix=fix, fix_label="Delete the %d duplicate(s), keep '%s'" % (len(dupes), _label(keep)),
+            impact=SAFE, impact_note=("The copies are identical (same mesh, materials and transform), so the "
+                                      "level looks the same. Deleting can only be undone with Ctrl+Z."))
 
 
 @check("mesh_instancing_candidates", CAT_MESH, "Same mesh placed as many separate actors")
@@ -1700,7 +1951,6 @@ def _check_material_complexity(ctx):
 @check("material_particle_forward_shading", CAT_MATERIAL, "Lit particle materials using forward shading")
 def _check_particle_forward(ctx):
     seen = set()
-    target = _enum_member(_ucls("TranslucencyLightingMode"), "TLM_VOLUMETRIC_PER_VERTEX_DIRECTIONAL")
     for u in ctx.material_usage().values():
         if not u.systems or not _is_translucent(u.material):
             continue
@@ -1712,24 +1962,17 @@ def _check_particle_forward(ctx):
         if _enum_name(_prop(base, "shading_model")) == "MSM_UNLIT":
             continue
         seen.add(base.get_path_name())
-        editable = _is_editable_asset(base)
-
-        def fix(base=base):
-            _edit_material(base, translucency_lighting_mode=target)
-            return "Lighting Mode -> Volumetric PerVertex Directional"
-
         yield Issue(
-            "material_particle_forward_shading", CAT_MATERIAL, MEDIUM, "Particles use 'Surface ForwardShading'",
+            "material_particle_forward_shading", CAT_MATERIAL, LOW, "Particles use 'Surface ForwardShading'",
             base.get_name(),
             detail=("Lit translucent particle material uses Lighting Mode 'Surface ForwardShading': full per-pixel "
                     "lighting of every light for every overlapping sprite (used by %s)."
                     % ", ".join(s.get_name() for s in u.systems[:4])),
-            solution=("Material > Translucency > Lighting Mode = 'Volumetric PerVertex Directional' (or "
-                      "NonDirectional) for smoke/dust/snow. Keep ForwardShading for glass-like hero surfaces."
-                      + ("" if editable else _READONLY_NOTE)),
-            metric="per-pixel lit", cost=_score(MEDIUM, 0.6), targets=u.comps, assets=[base],
-            fix=fix if (editable and target is not None) else None,
-            fix_label="Set Lighting Mode to Volumetric PerVertex Directional and recompile")
+            solution=("Only worth changing for small, dense effects (dust, sparks). Test 'Volumetric PerVertex "
+                      "NonDirectional' on a COPY of the material first. Large fog/snow cards must keep "
+                      "ForwardShading: volumetric modes light them from the translucency lighting volume at the "
+                      "vertices, which turns big cards dark or flat. That's why there is no automatic fix."),
+            metric="per-pixel lit", cost=_score(LOW, 0.6), targets=u.comps, assets=[base])
 
 
 # =============================================================================
@@ -1762,21 +2005,24 @@ def _textures2d(ctx):
             yield tex, e["materials"]
 
 
-def _tex_issue(check_key, sev, title, tex, mats, detail, solution, metric, magnitude, fix=None, fix_label=""):
+def _tex_issue(check_key, sev, title, tex, mats, detail, solution, metric, magnitude, fix=None, fix_label="",
+               impact=LOOK, impact_note=""):
     editable = _is_editable_asset(tex)
     return Issue(
         check_key, CAT_TEXTURE, sev, title, tex.get_name(),
         detail=detail + "\nUsed by: %s" % ", ".join(mats[:5]),
         solution=solution + ("" if editable else _READONLY_NOTE),
         metric=metric, cost=_score(sev, magnitude), assets=[tex],
-        fix=fix if editable else None, fix_label=fix_label)
+        fix=fix if editable else None, fix_label=fix_label, impact=impact,
+        impact_note=impact_note + (" Also used by particle materials - check your FX." if any(
+            "particle" in m.lower() or m.lower().startswith(("m_fx", "mi_fx", "m_vfx", "mi_vfx", "m_p_", "mi_p_"))
+            for m in mats) else ""))
 
 
 def _tex_setter(tex, **props):
-    def fix():
-        _modify(tex)
+    def fix(rec):
         for k, v in props.items():
-            _set(tex, k, v)   # PostEditChange recompresses the texture
+            rec.set(tex, k, v)   # PostEditChange recompresses the texture
         return ", ".join("%s=%s" % (k, _enum_name(v) if not isinstance(v, (int, float, bool)) else v)
                          for k, v in props.items())
     return fix
@@ -1806,7 +2052,8 @@ def _check_tex_oversized(ctx):
             solution=("Texture Editor > Compression > Maximum Texture Size = %d (non-destructive, source stays), "
                       "or use Virtual Texture Streaming for genuinely huge maps." % clamp),
             metric="%dx%d ~%s" % (w, h, _fmt_bytes(mb)), magnitude=_mag_log(mb, 8 << 20, 512 << 20),
-            fix=_tex_setter(tex, max_texture_size=clamp), fix_label="Set Maximum Texture Size = %d" % clamp)
+            fix=_tex_setter(tex, max_texture_size=clamp), fix_label="Set Maximum Texture Size = %d" % clamp,
+            impact_note="The texture is capped at %d px: less sharp up close." % clamp)
 
 
 @check("tex_never_stream", CAT_TEXTURE, "Large textures set to Never Stream")
@@ -1823,7 +2070,8 @@ def _check_tex_never_stream(ctx):
             detail="%dx%d is always fully resident (~%s) because Never Stream is on." % (w, h, _fmt_bytes(mb)),
             solution="Texture Editor > Texture > Never Stream = off (unless it's needed fully loaded at all times).",
             metric="~%s resident" % _fmt_bytes(mb), magnitude=_mag_log(mb, 4 << 20, 256 << 20),
-            fix=_tex_setter(tex, never_stream=False), fix_label="Turn off Never Stream")
+            fix=_tex_setter(tex, never_stream=False), fix_label="Turn off Never Stream",
+            impact=SAFE, impact_note="Same pixels; the top mips are streamed in when needed instead of always loaded.")
 
 
 @check("tex_no_mips", CAT_TEXTURE, "Textures without mipmaps")
@@ -1844,7 +2092,9 @@ def _check_tex_no_mips(ctx):
             solution="Texture Editor > Level Of Detail > Mip Gen Settings = FromTextureGroup.",
             metric="%dx%d" % (w, h), magnitude=_mag_log(w * h, 512 * 512, 8192 * 8192),
             fix=_tex_setter(tex, mip_gen_settings=target) if target is not None else None,
-            fix_label="Set Mip Gen Settings = FromTextureGroup")
+            fix_label="Set Mip Gen Settings = FromTextureGroup",
+            impact_note=("Distant/small surfaces sample blurrier mips. Flipbooks, atlases and lookup textures can "
+                         "bleed between frames - leave those without mips."))
 
 
 @check("tex_uncompressed", CAT_TEXTURE, "Uncompressed / HDR textures")
@@ -1866,7 +2116,8 @@ def _check_tex_uncompressed(ctx):
                       "RGBA8: only use it for real vector data that can't tolerate BC artifacts."),
             metric="%s ~%s" % (comp.replace("TC_", ""), _fmt_bytes(mb)), magnitude=_mag_log(mb, 8 << 20, 512 << 20),
             fix=_tex_setter(tex, compression_settings=hdr_c) if can_fix else None,
-            fix_label="Set Compression to HDR Compressed (BC6H)")
+            fix_label="Set Compression to HDR Compressed (BC6H)",
+            impact_note="Block compression: slight banding/artifacts in smooth HDR gradients.")
 
 
 @check("tex_npot", CAT_TEXTURE, "Non power-of-two textures")
@@ -1886,7 +2137,8 @@ def _check_tex_npot(ctx):
             solution="Resize the source to POT, or set Texture > Power Of Two Mode = Stretch to Power of Two.",
             metric="%dx%d" % (w, h), magnitude=0.3,
             fix=_tex_setter(tex, power_of_two_mode=stretch) if stretch is not None else None,
-            fix_label="Set Power Of Two Mode = Stretch to Power of Two")
+            fix_label="Set Power Of Two Mode = Stretch to Power of Two",
+            impact_note="The image is resampled to a power-of-two size (slightly softer; pixel-exact art can shift).")
 
 
 # =============================================================================
@@ -2042,11 +2294,8 @@ def _check_pp(ctx):
             if not hit:
                 continue
 
-            def fix(ppv=ppv, ov=ov):
-                _modify(ppv)
-                s = ppv.get_editor_property("settings")
-                s.set_editor_property(ov, False)
-                ppv.set_editor_property("settings", s)
+            def fix(rec, ppv=ppv, ov=ov):
+                rec.struct_field(ppv, "settings", ov, False)
                 return "Override removed (back to project default)"
 
             shown = value if isinstance(value, (int, float, bool)) else _enum_name(value)
@@ -2056,7 +2305,8 @@ def _check_pp(ctx):
                 solution=("Post Process Volume > untick the override (default 1.0 / off) unless this shot really "
                           "needs it. For cinematics, raise it only in the cine camera / sequence."),
                 metric=str(shown), cost=_score(sev, 0.5), targets=[ppv],
-                fix=fix, fix_label="Untick the '%s' override on this volume" % label)
+                fix=fix, fix_label="Untick the '%s' override on this volume" % label,
+                impact=LOOK, impact_note="Goes back to the project default for %s: the image changes." % label)
 
 
 @check("pp_materials", CAT_POST, "Post-process materials")
@@ -2095,9 +2345,8 @@ def _check_scene_capture(ctx):
         if not _prop(c, "capture_every_frame", False):
             continue
 
-        def fix(c=c):
-            _modify(c)
-            _set(c, "capture_every_frame", False)
+        def fix(rec, c=c):
+            rec.set(c, "capture_every_frame", False)
             return "Capture Every Frame off (call CaptureScene when needed)"
 
         yield Issue(
@@ -2107,7 +2356,8 @@ def _check_scene_capture(ctx):
             solution=("Turn off Capture Every Frame and call 'Capture Scene' from Blueprint when it changes, lower "
                       "the target resolution, and use Show Flags / ShowOnly lists to skip expensive features."),
             metric="every frame", cost=_score(HIGH, 0.7), targets=[c],
-            fix=fix, fix_label="Disable Capture Every Frame")
+            fix=fix, fix_label="Disable Capture Every Frame",
+            impact=GAMEPLAY, impact_note="The render target stops updating unless a Blueprint calls Capture Scene.")
 
 
 @check("decal_fade", CAT_SCENE, "Decals that never fade out")
@@ -2116,10 +2366,9 @@ def _check_decals(ctx):
     if len(decals) < 5:
         return
 
-    def fix(decals=decals):
+    def fix(rec, decals=decals):
         for c in decals:
-            _modify(c)
-            _set(c, "fade_screen_size", 0.01)
+            rec.set(c, "fade_screen_size", 0.01)
         return "Fade Screen Size = 0.01 on %d decals" % len(decals)
 
     yield Issue(
@@ -2127,7 +2376,8 @@ def _check_decals(ctx):
         detail="%d decals have Fade Screen Size = 0, so they render at any distance: %s" % (len(decals), _names(decals)),
         solution="Decal > Fade Screen Size = 0.01 (default) or larger for small decals.",
         metric="%d decals" % len(decals), cost=_score(LOW, len(decals) / 200.0), targets=decals,
-        fix=fix, fix_label="Set Fade Screen Size = 0.01")
+        fix=fix, fix_label="Set Fade Screen Size = 0.01",
+        impact=LOOK, impact_note="These decals fade out when they get small on screen.")
 
 
 # =============================================================================
@@ -2152,9 +2402,8 @@ def _check_anim_offscreen(ctx):
     for c, pawn in refresh:
         target = tick_pose if pawn else when_rendered
 
-        def fix(c=c, target=target):
-            _modify(c)
-            _set(c, "visibility_based_anim_tick_option", target)
+        def fix(rec, c=c, target=target):
+            rec.set(c, "visibility_based_anim_tick_option", target)
             return "Visibility Based Anim Tick Option -> %s" % _enum_name(target)
 
         yield Issue(
@@ -2165,12 +2414,12 @@ def _check_anim_offscreen(ctx):
                       "for gameplay characters that need root motion or sockets off-screen."),
             metric="every frame", cost=_score(MEDIUM, 0.5), targets=[c],
             fix=fix if target is not None else None,
-            fix_label="Set to %s" % ("Always Tick Pose" if pawn else "Only Tick Pose when Rendered"))
+            fix_label="Set to %s" % ("Always Tick Pose" if pawn else "Only Tick Pose when Rendered"),
+            impact=GAMEPLAY, impact_note="Off-screen animation (notifies, sockets, root motion) stops updating.")
     if len(ambient) >= 3 and when_rendered is not None:
-        def fix(ambient=ambient):
+        def fix(rec, ambient=ambient):
             for c in ambient:
-                _modify(c)
-                _set(c, "visibility_based_anim_tick_option", when_rendered)
+                rec.set(c, "visibility_based_anim_tick_option", when_rendered)
             return "Only Tick Pose when Rendered on %d components" % len(ambient)
 
         yield Issue(
@@ -2180,7 +2429,8 @@ def _check_anim_offscreen(ctx):
                     % (len(ambient), _names(ambient))),
             solution="Set Visibility Based Anim Tick Option = Only Tick Pose when Rendered on props/ambient meshes.",
             metric="%d comps" % len(ambient), cost=_score(LOW, len(ambient) / 50.0), targets=ambient,
-            fix=fix, fix_label="Set Only Tick Pose when Rendered on all of them")
+            fix=fix, fix_label="Set Only Tick Pose when Rendered on all of them",
+            impact=GAMEPLAY, impact_note="Off-screen animation (notifies, sockets) stops updating.")
 
 
 @check("anim_uro", CAT_ANIM, "Update Rate Optimizations disabled")
@@ -2189,10 +2439,9 @@ def _check_uro(ctx):
     if len(comps) < 3:
         return
 
-    def fix(comps=comps):
+    def fix(rec, comps=comps):
         for c in comps:
-            _modify(c)
-            _set(c, "enable_update_rate_optimizations", True)
+            rec.set(c, "enable_update_rate_optimizations", True)
         return "URO enabled on %d components" % len(comps)
 
     yield Issue(
@@ -2200,7 +2449,8 @@ def _check_uro(ctx):
         detail="%d skeletal meshes animate at full rate regardless of screen size: %s" % (len(comps), _names(comps)),
         solution="Optimization > Enable Update Rate Optimizations = on (distant meshes animate at lower rates).",
         metric="%d comps" % len(comps), cost=_score(LOW, len(comps) / 50.0), targets=comps,
-        fix=fix, fix_label="Enable Update Rate Optimizations")
+        fix=fix, fix_label="Enable Update Rate Optimizations",
+        impact=LOOK, impact_note="Distant characters animate at a lower rate (can look choppy far away).")
 
 
 @check("anim_skel_lods", CAT_ANIM, "Dense skeletal meshes without LODs")
@@ -2220,7 +2470,9 @@ def _check_skel_lods(ctx):
             continue
         editable = _is_editable_asset(skm)
 
-        def fix(skm=skm):
+        def fix(rec, skm=skm):
+            rec.note("skel_lods", label=skm.get_name(),
+                     why="generated skeletal LODs can only be removed with Ctrl+Z or source control")
             sub = _subsystem("SkeletalMeshEditorSubsystem")
             lib = _ucls("EditorSkeletalMeshLibrary")
             ok = _call_first(lambda: sub.regenerate_lod(skm, cnt, False, False),
@@ -2238,7 +2490,8 @@ def _check_skel_lods(ctx):
             metric="%s verts x%d" % (_fmt_count(verts), len(comps)),
             cost=_score(MEDIUM, _mag_log(verts * len(comps), limit, limit * 100)),
             targets=comps, assets=[skm], fix=fix if editable else None,
-            fix_label="Auto-generate %d LODs (Skeletal Mesh Reduction)" % cnt)
+            fix_label="Auto-generate %d LODs (Skeletal Mesh Reduction)" % cnt,
+            impact=LOOK, impact_note="Distant characters use reduced LODs (possible popping). Only Ctrl+Z undoes it.")
 
 
 # =============================================================================
@@ -2286,7 +2539,8 @@ def scan(selected_only=False, check_keys=None):
 
 
 def apply_fixes(issues, title="World Perf Audit: Fix"):
-    """Apply fixes inside one undo transaction. Returns (fixed, failed)."""
+    """Apply fixes inside one undo transaction. Every changed value is journaled so the fix can be
+    reverted later (even after saving). Returns (fixed, failed)."""
     todo = [i for i in issues if i.fixable]
     fixed = failed = 0
     if not todo:
@@ -2298,17 +2552,330 @@ def apply_fixes(issues, title="World Perf Audit: Fix"):
                 if task.should_cancel():
                     break
                 task.enter_progress_frame(1, "Fixing: %s - %s" % (issue.title, issue.obj))
+                rec = ChangeRecorder()
                 try:
-                    msg = issue.fix()
+                    msg = issue.fix(rec)
                     issue.status, issue.message = "fixed", (msg or issue.fix_label)
                     fixed += 1
-                    _log("Fixed #%d %s (%s): %s" % (issue.id, issue.title, issue.obj, issue.message))
+                    _log("Fix applied #%d %s (%s): %s" % (issue.id, issue.title, issue.obj, issue.message))
                 except Exception as e:
                     issue.status, issue.message = "failed", str(e)
                     failed += 1
                     _warn("Fix failed #%d %s (%s): %s\n%s" % (issue.id, issue.title, issue.obj, e,
                                                               traceback.format_exc()))
+                if rec.changes:   # journal even partial fixes, so they can be reverted too
+                    issue.journal = {
+                        "id": uuid.uuid4().hex, "time": datetime.datetime.now().isoformat(),
+                        "level": _STATE.get("level", ""), "check": issue.check, "title": issue.title,
+                        "obj": issue.obj, "impact": issue.impact, "changes": rec.changes, "reverted": False}
+                    _journal_write(issue.journal)
     return fixed, failed
+
+
+def _revert_entries(entries, title="World Perf Audit: Revert"):
+    """Revert journal entries, newest first. Returns (reverted_count, [error strings])."""
+    entries = [e for e in entries if _revertable(e)]
+    done, errors = 0, []
+    if not entries:
+        return 0, []
+    with unreal.ScopedEditorTransaction(title):
+        with unreal.ScopedSlowTask(len(entries), "Reverting fixes...") as task:
+            task.make_dialog(True)
+            for e in sorted(entries, key=lambda x: x.get("time", ""), reverse=True):
+                task.enter_progress_frame(1, "Reverting: %s - %s" % (e.get("title"), e.get("obj")))
+                errs = _revert_changes(e.get("changes", []))
+                e["reverted"], e["revert_errors"] = True, errs
+                _journal_write(e)
+                done += 1
+                errors += ["%s (%s): %s" % (e.get("title"), e.get("obj"), x) for x in errs]
+                _log("Reverted %s (%s)%s" % (e.get("title"), e.get("obj"), " with problems: %s" % errs if errs else ""))
+    return done, errors
+
+
+def revert_issues(issues):
+    """Revert the last fix of each issue. Returns (reverted_count, errors)."""
+    done, errors = _revert_entries([i.journal for i in issues if i.revertable])
+    for i in issues:
+        if i.journal and i.journal.get("reverted") and i.status == "fixed":
+            errs = i.journal.get("revert_errors") or []
+            i.status, i.message = "reverted", ("Reverted" + (" (partly): " + "; ".join(errs) if errs else ""))
+    return done, errors
+
+
+def journal_entries(pending_only=True):
+    """Fixes recorded in Saved/PerfAudit/fix_journal.json (all sessions)."""
+    return [e for e in _journal_load() if (_revertable(e) if pending_only else True)]
+
+
+def revert_all():
+    """Revert every fix still recorded in the journal - including fixes from earlier sessions."""
+    entries = journal_entries()
+    done, errors = _revert_entries(entries, "World Perf Audit: Revert All")
+    ids = {e["id"] for e in entries}
+    for i in _STATE["issues"]:
+        if i.journal and i.journal.get("id") in ids and i.status == "fixed":
+            i.journal["reverted"] = True
+            i.status, i.message = "reverted", "Reverted"
+    return done, errors
+
+
+# --- recovery for fixes made by the first version of this tool (it had no journal) ---------------
+_OLD_FIX_RE = re.compile(r"\[PerfAudit\] Fixed #\d+ (.*?)\s*$")
+_OLD_TITLES = [
+    "Particles use 'Surface ForwardShading'", "Translucent material doesn't output velocity",
+    "Particles write no motion vectors", "Texture never streams", "Texture has no mipmaps", "Uncompressed texture",
+    "Non power-of-two texture", "High-poly mesh without Nanite", "Mesh has no LODs", "Sky light captures every frame",
+    "Scene capture renders every frame", "Animates + refreshes bones off-screen", "Lights never distance-cull",
+    "WPO animates at any distance", "Foliage never culls", "Instanced mesh never culls",
+    "WPO animation doesn't write velocity"]
+
+
+def _parse_old_fix(rest):
+    """'<title> (<object>): <message>' -> (title, object, message). Titles may contain brackets."""
+    titles = _OLD_TITLES + [label for _p, _f, _s, label, _w in _PP_RULES]
+    m = re.match(r"^(\d+K texture) \(", rest)
+    if m:
+        titles = [m.group(1)] + titles
+    for t in sorted(titles, key=len, reverse=True):
+        if rest.startswith(t + " ("):
+            obj, sep, msg = rest[len(t) + 2:].partition("): ")
+            if sep:
+                return t, obj, msg.strip()
+    m = re.match(r"^(.+?) \((.*)\): (.*)$", rest)
+    return m.groups() if m else None
+
+
+def _old_fixes_from_logs(max_files=30):
+    """'[PerfAudit] Fixed ...' lines written by the first version, from Saved/Logs (newest first)."""
+    try:
+        log_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_log_dir())
+        files = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.lower().endswith(".log")]
+    except Exception:
+        return []
+    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    out, seen = [], set()
+    for path in files[:max_files]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = _OLD_FIX_RE.search(line)
+                    parsed = _parse_old_fix(m.group(1)) if m else None
+                    if parsed and parsed not in seen:
+                        seen.add(parsed)
+                        out.append(parsed)
+        except Exception:
+            continue
+    return out
+
+
+class _AssetIndex(object):
+    """Name -> assets in /Game and project plugins (built once)."""
+
+    def __init__(self):
+        self._by_name = None
+
+    def find(self, name, *class_names):
+        if self._by_name is None:
+            self._by_name = {}
+            ar = unreal.AssetRegistryHelpers.get_asset_registry()
+            for mount in sorted(_project_mounts()):
+                try:
+                    ads = ar.get_assets_by_path("/" + mount, recursive=True) or []
+                except Exception:
+                    ads = []
+                for ad in ads:
+                    self._by_name.setdefault(str(ad.asset_name), []).append(ad)
+        out = []
+        for ad in self._by_name.get(name, []):
+            try:
+                obj = ad.get_asset()
+            except Exception:
+                obj = None
+            if obj is not None and _isinst(obj, *class_names):
+                out.append(obj)
+        return out
+
+
+def _system_renderers(system):
+    cls = _ucls("NiagaraRendererProperties")
+    if cls is None or not hasattr(unreal, "ObjectIterator"):
+        return []
+    pkg = system.get_outermost().get_name()
+    out = []
+    for r in unreal.ObjectIterator(cls):
+        try:
+            if r.get_outermost().get_name() == pkg and not r.get_name().startswith("Default__"):
+                out.append(r)
+        except Exception:
+            pass
+    return out
+
+
+def _find_in_level(obj_label):
+    """'Actor > Component' (or just 'Actor') -> object in the open level."""
+    actor_label, _sep, comp_name = obj_label.partition(" > ")
+    for a in _get_actors():
+        try:
+            if a.get_actor_label() != actor_label:
+                continue
+            if not comp_name:
+                return a
+            for c in a.get_components_by_class(unreal.ActorComponent) or []:
+                if c.get_name() == comp_name:
+                    return c
+        except Exception:
+            pass
+    return None
+
+
+def _plan_old_recovery(fixes):
+    """[(title, obj, what, action-or-None)] - only restores values the old version is known to have set."""
+    E = lambda enum, name: _enum_member(_ucls(enum), name)
+    idx = _AssetIndex()
+    pp = {label: prop for prop, _p, _s, label, _w in _PP_RULES}
+    plan = []
+
+    def add(title, obj, what, action):
+        plan.append((title, obj, what, action))
+
+    def restore_mat(m, **props):
+        _edit_material(m, ChangeRecorder(), **props)
+
+    def tex_restore(title, obj, prop, now_name, old_value, label):
+        for t in idx.find(obj, "Texture2D"):
+            cur = _prop(t, prop)
+            if (_enum_name(cur) if now_name.isupper() else str(cur)) == now_name:
+                add(title, obj, "%s on %s" % (label, t.get_name()),
+                    lambda t=t: (_modify(t), _set(t, prop, old_value)))
+
+    for title, obj, msg in fixes:
+        n0 = len(plan)
+        if title == "Particles use 'Surface ForwardShading'":
+            for m in idx.find(obj, "Material"):
+                if _enum_name(_prop(m, "translucency_lighting_mode")) == "TLM_VOLUMETRIC_PER_VERTEX_DIRECTIONAL":
+                    add(title, obj, "Lighting Mode back to 'Surface ForwardShading' on %s" % m.get_name(),
+                        lambda m=m: restore_mat(m, translucency_lighting_mode=E(
+                            "TranslucencyLightingMode", "TLM_SURFACE_PER_PIXEL_LIGHTING")))
+        elif title == "Translucent material doesn't output velocity":
+            for m in idx.find(obj, "Material"):
+                if _prop(m, "output_translucent_velocity", False):
+                    add(title, obj, "Output Velocity off again on %s" % m.get_name(),
+                        lambda m=m: restore_mat(m, output_translucent_velocity=False))
+        elif title == "Particles write no motion vectors":
+            parts = [x.strip() for x in obj.split(" / ")]
+            if len(parts) == 3:
+                for system in idx.find(parts[0], "NiagaraSystem"):
+                    for r in _system_renderers(system):
+                        rtype = r.get_class().get_name().replace("Niagara", "").replace("Properties", "")
+                        if (r.get_outer().get_name() == parts[1] and rtype == parts[2]
+                                and _enum_name(_prop(r, "motion_vector_setting")) == "AUTO_DETECT"):
+                            add(title, obj, "Motion Vector Setting back to Disable on %s / %s" % (parts[0], parts[1]),
+                                lambda r=r, system=system: (
+                                    _modify(r), _set(r, "motion_vector_setting", E("NiagaraRendererMotionVectorSetting", "DISABLE")),
+                                    _after_niagara_edit(system, _niagara_components_using(system))))
+        elif re.match(r"^\d+K texture$", title):
+            m = re.search(r"max_texture_size=(\d+)", msg)
+            if m:
+                tex_restore(title, obj, "max_texture_size", m.group(1), 0, "Maximum Texture Size back to 0 (no limit)")
+        elif title == "Texture never streams":
+            tex_restore(title, obj, "never_stream", "False", True, "Never Stream back on")
+        elif title == "Texture has no mipmaps":
+            tex_restore(title, obj, "mip_gen_settings", "TMGS_FROM_TEXTURE_GROUP",
+                        E("TextureMipGenSettings", "TMGS_NO_MIPMAPS"), "Mip Gen Settings back to NoMipmaps")
+        elif title == "Uncompressed texture":
+            tex_restore(title, obj, "compression_settings", "TC_HDR_COMPRESSED",
+                        E("TextureCompressionSettings", "TC_HDR"), "Compression back to HDR")
+        elif title == "Non power-of-two texture":
+            tex_restore(title, obj, "power_of_two_mode", "STRETCH_TO_POWER_OF_TWO",
+                        E("TexturePowerOfTwoSetting", "NONE"), "Power Of Two Mode back to None")
+        elif title in ("High-poly mesh without Nanite", "Mesh has no LODs"):
+            for mesh in idx.find(obj, "StaticMesh"):
+                if msg.startswith("Nanite enabled") and _nanite_enabled(mesh):
+                    add(title, obj, "Disable Nanite on %s" % mesh.get_name(), lambda mesh=mesh: _set_nanite(mesh, False))
+                elif msg.startswith("Generated") and _mesh_lods(mesh) > 1:
+                    add(title, obj, "Remove generated LODs from %s" % mesh.get_name(), lambda mesh=mesh: _remove_lods(mesh))
+        elif title in pp:
+            ppv = _find_in_level(obj)
+            ov = "override_" + pp[title]
+            if ppv is not None and not _prop(_prop(ppv, "settings"), ov, True):
+                add(title, obj, "Re-tick the '%s' override on %s (its value was kept)" % (title, obj),
+                    lambda ppv=ppv, ov=ov: ChangeRecorder().struct_field(ppv, "settings", ov, True))
+        elif title in ("Sky light captures every frame", "Scene capture renders every frame",
+                       "Animates + refreshes bones off-screen"):
+            prop, value = {
+                "Sky light captures every frame": ("real_time_capture", True),
+                "Scene capture renders every frame": ("capture_every_frame", True),
+                "Animates + refreshes bones off-screen": ("visibility_based_anim_tick_option", E(
+                    "VisibilityBasedAnimTickOption", "ALWAYS_TICK_POSE_AND_REFRESH_BONES"))}[title]
+            c = _find_in_level(obj)
+            if c is not None and _prop(c, prop) != value:
+                add(title, obj, "%s back to %s on %s" % (prop, _enum_name(value) if not isinstance(value, bool) else value, obj),
+                    lambda c=c, prop=prop, value=value: (_modify(c), _set(c, prop, value)))
+        elif title == "Lights never distance-cull":
+            for c in [x for a in _get_actors() for x in (a.get_components_by_class(unreal.LocalLightComponent) or [])]:
+                d = float(_prop(c, "max_draw_distance", 0.0) or 0.0)
+                expect = max(CONFIG["light_max_draw_distance"], float(_prop(c, "attenuation_radius", 0.0) or 0.0) * 3.0)
+                if d > 0 and abs(d - expect) < 1.0 and abs(float(_prop(c, "max_distance_fade_range", 0.0) or 0.0) - d * 0.2) < 1.0:
+                    add(title, _label(c), "Max Draw Distance back to 0 on %s" % _label(c),
+                        lambda c=c: (_modify(c), _set(c, "max_draw_distance", 0.0), _set(c, "max_distance_fade_range", 0.0)))
+        elif title == "WPO animates at any distance":
+            mesh_name = obj.rsplit(" (", 1)[0]
+            for a in _get_actors():
+                for c in a.get_components_by_class(unreal.StaticMeshComponent) or []:
+                    mesh = _prop(c, "static_mesh")
+                    if (mesh is not None and mesh.get_name() == mesh_name
+                            and int(_prop(c, "world_position_offset_disable_distance", 0) or 0) == int(CONFIG["wpo_disable_distance"])):
+                        add(title, _label(c), "WPO Disable Distance back to 0 on %s" % _label(c),
+                            lambda c=c: (_modify(c), _set(c, "world_position_offset_disable_distance", 0)))
+        elif title in ("Foliage never culls", "Instanced mesh never culls"):
+            c = _find_in_level(obj.rsplit(" (", 1)[0])
+            end = int(CONFIG["ism_cull_distance"])
+            if c is not None and int(_prop(c, "instance_end_cull_distance", 0) or 0) == end:
+                mesh = _prop(c, "static_mesh")
+
+                def undo_ism(c=c, mesh=mesh):
+                    _modify(c)
+                    c.set_cull_distances(0, 0)
+                    cls = _ucls("FoliageType_InstancedStaticMesh")
+                    if cls is not None and mesh is not None and hasattr(unreal, "ObjectIterator"):
+                        for ft in unreal.ObjectIterator(cls):
+                            iv = _prop(ft, "cull_distance")
+                            if _prop(ft, "mesh") == mesh and iv is not None and int(_prop(iv, "max", 0)) == end:
+                                rec = ChangeRecorder()
+                                rec.struct_field(ft, "cull_distance", "min", 0)
+                                rec.struct_field(ft, "cull_distance", "max", 0)
+                add(title, obj, "Instance cull distance back to 0 (never cull) on %s" % obj, undo_ism)
+        elif title == "WPO animation doesn't write velocity":
+            if _get_project_ini("/Script/Engine.RendererSettings", "r.Velocity.EnableVertexDeformation") == "1":
+                add(title, obj, "Remove r.Velocity.EnableVertexDeformation from DefaultEngine.ini (restart)",
+                    lambda: _set_project_ini("/Script/Engine.RendererSettings", "r.Velocity.EnableVertexDeformation", None))
+        if len(plan) == n0:
+            add(title, obj, "Can't be restored automatically (already restored, not loaded, or the old value "
+                "wasn't logged) - use source control or set it by hand", None)
+    return plan
+
+
+def recover_previous_fixes(apply=False):
+    """Undo fixes made by the FIRST version of this tool (it kept no journal), using the
+    '[PerfAudit] Fixed ...' lines in Saved/Logs. apply=False only returns the plan."""
+    plan = _plan_old_recovery(_old_fixes_from_logs())
+    if not apply:
+        return plan
+    done, errors = 0, []
+    actions = [p for p in plan if p[3] is not None]
+    with unreal.ScopedEditorTransaction("World Perf Audit: Restore old fixes"):
+        with unreal.ScopedSlowTask(max(1, len(actions)), "Restoring values changed by the old version...") as task:
+            task.make_dialog(True)
+            for title, obj, what, action in actions:
+                task.enter_progress_frame(1, what)
+                try:
+                    action()
+                    done += 1
+                    _log("Restored: %s" % what)
+                except Exception as e:
+                    errors.append("%s: %s" % (what, e))
+                    _warn("Restore failed: %s: %s" % (what, e))
+    return done, errors
 
 
 def go_to(issue):
@@ -2359,11 +2926,17 @@ def fix(issue_id):
     return apply_fixes([_issue_by_id(issue_id)])
 
 
-def fix_all(category=None, min_severity=LOW):
-    """Text-mode: fix every auto-fixable issue (optionally one category / min severity)."""
+def fix_all(category=None, min_severity=LOW, include_visual=False):
+    """Text-mode: fix every auto-fixable issue. By default only fixes that don't change the look
+    (impact 'safe'); include_visual=True also applies visual/behaviour fixes."""
     todo = [i for i in _STATE["issues"] if i.fixable and i.severity >= min_severity
-            and (category is None or i.category == category)]
+            and (category is None or i.category == category) and (include_visual or i.impact == SAFE)]
     return apply_fixes(todo, "World Perf Audit: Fix All")
+
+
+def revert(issue_id):
+    """Text-mode: revert the fix of one issue."""
+    return revert_issues([_issue_by_id(issue_id)])
 
 
 def print_report(issues=None):
@@ -2379,8 +2952,9 @@ def print_report(issues=None):
                 i.id, i.severity_name, i.cost, i.title[:42], i.obj[:38], i.metric))
             lines.append("         -> %s" % i.solution.split("\n")[0][:160])
             if i.fixable:
-                lines.append("         FIX: world_perf_audit.fix(%d)   (%s)" % (i.id, i.fix_label))
-    lines.append("\nworld_perf_audit.fix_all() applies every automatic fix (undoable with Ctrl+Z).")
+                lines.append("         FIX [%s]: world_perf_audit.fix(%d)   (%s)" % (IMPACT_LABELS[i.impact], i.id, i.fix_label))
+    lines.append("\nworld_perf_audit.fix_all() applies only fixes with no visual change; fix_all(include_visual=True) "
+                 "applies all. world_perf_audit.revert(id) / revert_all() put things back (even after saving).")
     unreal.log("\n".join(lines))
 
 
@@ -2487,429 +3061,827 @@ def install_pyside6():
 # Qt UI
 # =============================================================================
 _STYLE = """
-QWidget { background:#1f1f1f; color:#d8d8d8; font-family:"Segoe UI","Roboto",sans-serif; font-size:9pt; }
-QLabel#Title { font-size:15pt; font-weight:600; color:#ffffff; }
-QLabel#Sub { color:#9a9a9a; }
-QLabel#Stats { color:#a8a8a8; background:#181818; border:1px solid #2c2c2c; border-radius:4px; padding:6px 8px; }
-QPushButton, QToolButton { background:#2d2d2d; border:1px solid #3c3c3c; border-radius:4px; padding:5px 12px; }
-QPushButton:hover, QToolButton:hover { background:#383838; border-color:#5a5a5a; }
-QPushButton:pressed { background:#252525; }
-QPushButton:disabled { color:#5f5f5f; background:#242424; border-color:#2c2c2c; }
-QPushButton#Primary { background:#0e639c; border-color:#1177bb; color:#ffffff; font-weight:600; padding:6px 18px; }
-QPushButton#Primary:hover { background:#1177bb; }
-QPushButton#Fix { background:#2f6b33; border-color:#3e8a43; color:#ffffff; font-weight:600; padding:2px 10px; }
-QPushButton#Fix:hover { background:#3e8a43; }
-QPushButton#Fix:disabled { background:#242424; border-color:#2c2c2c; color:#5f5f5f; font-weight:normal; }
-QPushButton#Small { padding:2px 10px; }
-QTreeWidget { background:#161616; alternate-background-color:#1b1b1b; border:1px solid #2c2c2c; outline:0; }
-QTreeWidget::item { padding:2px 0px; }
-QTreeWidget::item:selected { background:#264f78; color:#ffffff; }
-QHeaderView::section { background:#262626; color:#b8b8b8; padding:5px; border:none; border-right:1px solid #333; }
-QLineEdit, QComboBox { background:#2a2a2a; border:1px solid #3c3c3c; border-radius:3px; padding:4px 6px; }
-QComboBox QAbstractItemView { background:#2a2a2a; selection-background-color:#264f78; }
-QTextBrowser { background:#161616; border:1px solid #2c2c2c; border-radius:4px; padding:6px; }
-QSplitter::handle { background:#2a2a2a; }
-QMenu { background:#262626; border:1px solid #3c3c3c; } QMenu::item:selected { background:#264f78; }
-QScrollBar:vertical { background:#1a1a1a; width:12px; } QScrollBar::handle:vertical { background:#3a3a3a; min-height:24px; border-radius:5px; }
-QCheckBox { spacing:6px; }
+* { font-family: "Segoe UI", "Inter", "Roboto", sans-serif; font-size: 9pt; }
+QWidget#AuditRoot { background: #18181b; }
+QWidget { color: #e4e4e7; }
+QFrame#Header { background: #111113; border-bottom: 1px solid #27272a; }
+QLabel#Logo { background: #2563eb; color: #ffffff; border-radius: 6px; font-weight: 700; font-size: 10pt; }
+QLabel#Title { font-size: 13pt; font-weight: 600; color: #fafafa; }
+QLabel#Subtitle, QLabel#Muted { color: #8e8e96; }
+QLabel#LevelName { color: #d4d4d8; font-weight: 600; }
+QFrame#Toolbar { background: #18181b; }
+QFrame#Panel { background: #1f1f23; border: 1px solid #2a2a2e; border-radius: 6px; }
+QFrame#Kpi { background: #1f1f23; border: 1px solid #2a2a2e; border-radius: 6px; }
+QLabel#KpiValue { font-size: 17pt; font-weight: 600; color: #fafafa; }
+QLabel#KpiCaption { color: #8e8e96; font-size: 8pt; }
+QLabel#SectionTitle { color: #8e8e96; font-size: 8pt; font-weight: 700; }
+QPushButton, QToolButton { background: #27272a; color: #e4e4e7; border: 1px solid #34343a; border-radius: 5px; padding: 6px 14px; }
+QPushButton:hover, QToolButton:hover { background: #303036; border-color: #45454d; }
+QPushButton:pressed, QToolButton:pressed { background: #232327; }
+QPushButton:disabled { color: #5c5c63; background: #1f1f23; border-color: #2a2a2e; }
+QToolButton::menu-indicator { image: none; width: 0px; }
+QPushButton#Primary { background: #2563eb; border-color: #2563eb; color: #ffffff; font-weight: 600; }
+QPushButton#Primary:hover { background: #3b74f0; }
+QPushButton#Primary:disabled { background: #1e3a6e; border-color: #1e3a6e; color: #9fb3d9; }
+QPushButton#Success { background: #15803d; border-color: #15803d; color: #ffffff; font-weight: 600; }
+QPushButton#Success:hover { background: #1a9a4a; }
+QPushButton#Success:disabled { background: #1f1f23; border-color: #2a2a2e; color: #5c5c63; font-weight: normal; }
+QPushButton#RowFix { background: #1d4ed8; border: none; color: #ffffff; padding: 3px 0px; font-weight: 600; border-radius: 4px; }
+QPushButton#RowFix:hover { background: #2563eb; }
+QPushButton#RowRevert { background: #3f3f46; border: none; color: #f4f4f5; padding: 3px 0px; border-radius: 4px; }
+QPushButton#RowRevert:hover { background: #52525b; }
+QPushButton#RowFix:disabled, QPushButton#RowRevert:disabled { background: transparent; color: #5c5c63; font-weight: normal; }
+QLineEdit, QComboBox { background: #111113; border: 1px solid #34343a; border-radius: 5px; padding: 5px 8px; selection-background-color: #2563eb; }
+QLineEdit:focus, QComboBox:focus { border-color: #2563eb; }
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox QAbstractItemView { background: #1f1f23; border: 1px solid #34343a; selection-background-color: #2563eb; outline: 0; }
+QTreeWidget { background: #1f1f23; alternate-background-color: #222226; border: 1px solid #2a2a2e; border-radius: 6px; outline: 0; }
+QTreeWidget::item { border: none; padding: 0px 2px; }
+QTreeWidget::item:selected { background: #1e3a6e; color: #ffffff; }
+QTreeWidget::item:hover:!selected { background: #2a2a2f; }
+QTreeWidget#Sidebar { background: #1f1f23; }
+QTreeWidget#Sidebar::item { padding: 6px 4px; }
+QHeaderView::section { background: #1f1f23; color: #8e8e96; border: none; border-bottom: 1px solid #2a2a2e; padding: 7px 6px; font-weight: 600; font-size: 8pt; }
+QTextBrowser { background: #1f1f23; border: none; }
+QSplitter::handle { background: #18181b; }
+QSplitter::handle:horizontal { width: 6px; }
+QMenu { background: #1f1f23; border: 1px solid #34343a; padding: 4px; }
+QMenu::item { padding: 6px 22px 6px 14px; border-radius: 4px; }
+QMenu::item:selected { background: #2563eb; }
+QMenu::item:disabled { color: #5c5c63; }
+QMenu::separator { height: 1px; background: #2f2f34; margin: 4px 6px; }
+QCheckBox { spacing: 6px; color: #c4c4cc; }
+QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #45454d; border-radius: 3px; background: #111113; }
+QCheckBox::indicator:checked { background: #2563eb; border-color: #2563eb; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: #3a3a40; min-height: 30px; border-radius: 4px; }
+QScrollBar::handle:vertical:hover { background: #4a4a52; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal { background: #3a3a40; min-width: 30px; border-radius: 4px; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+QFrame#StatusBar { background: #111113; border-top: 1px solid #27272a; }
+QToolTip { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; padding: 4px; }
 """
+
+_SEV_PILL = {CRITICAL: "#ef4444", HIGH: "#f97316", MEDIUM: "#eab308", LOW: "#3b82f6", INFO: "#a1a1aa"}
+_STATUS_COLORS = {"fixed": "#22c55e", "reverted": "#a1a1aa", "failed": "#ef4444"}
+_IMPACT_ORDER = {SAFE: 0, LOOK: 1, GAMEPLAY: 2}
+
+
+def _qexec(obj, *args):
+    """exec() on Qt6 / exec_() on older bindings."""
+    fn = getattr(obj, "exec", None) or getattr(obj, "exec_")
+    return fn(*args)
 
 
 def _make_window_class(QtCore, QtGui, QtWidgets):
     Qt = QtCore.Qt
-    USER_ROLE = Qt.ItemDataRole.UserRole
+    USER = Qt.ItemDataRole.UserRole
+    SORT_ROLE = USER + 1
+    COLOR_ROLE = USER + 2
+    SUB_ROLE = USER + 3
+    esc = lambda t: html.escape(str(t)).replace("\n", "<br>")
+
+    class _Row(QtWidgets.QTreeWidgetItem):
+        def __lt__(self, other):
+            tree = self.treeWidget()
+            col = tree.sortColumn() if tree is not None else 0
+            a, b = self.data(col, SORT_ROLE), other.data(col, SORT_ROLE)
+            if a is None or b is None:
+                return self.text(col).lower() < other.text(col).lower()
+            return a < b
+
+    class _PillDelegate(QtWidgets.QStyledItemDelegate):
+        """Rounded, tinted badge (severity / fix impact / status)."""
+
+        def paint(self, painter, option, index):
+            opt = QtWidgets.QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            text, opt.text = opt.text, ""
+            style = opt.widget.style() if opt.widget is not None else QtWidgets.QApplication.style()
+            style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+            color = index.data(COLOR_ROLE)
+            if not text or not color:
+                return
+            painter.save()
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            fm = option.fontMetrics
+            h = fm.height() + 4
+            w = fm.horizontalAdvance(text) + 18
+            rect = QtCore.QRectF(option.rect.x() + 8, option.rect.center().y() - h / 2.0 + 1, w, h)
+            fill = QtGui.QColor(color)
+            fill.setAlpha(42)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, h / 2.0, h / 2.0)
+            painter.setPen(QtGui.QColor(color).lighter(125))
+            f = QtGui.QFont(option.font)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), text)
+            painter.restore()
+
+    class _CostDelegate(QtWidgets.QStyledItemDelegate):
+        """Score + small horizontal bar coloured by severity."""
+
+        def paint(self, painter, option, index):
+            opt = QtWidgets.QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            text, opt.text = opt.text, ""
+            style = opt.widget.style() if opt.widget is not None else QtWidgets.QApplication.style()
+            style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+            try:
+                value = float(index.data(SORT_ROLE) or 0.0)
+            except Exception:
+                value = 0.0
+            painter.save()
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            r = option.rect
+            painter.setPen(QtGui.QColor("#e4e4e7"))
+            painter.drawText(QtCore.QRect(r.x() + 8, r.y(), 26, r.height()),
+                             int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), text)
+            track = QtCore.QRectF(r.x() + 40, r.center().y() - 2, max(10, r.width() - 52), 5)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QtGui.QColor("#34343a"))
+            painter.drawRoundedRect(track, 2.5, 2.5)
+            fill = QtCore.QRectF(track.x(), track.y(), track.width() * max(0.04, min(1.0, value / 100.0)), track.height())
+            painter.setBrush(QtGui.QColor(index.data(COLOR_ROLE) or "#3b82f6"))
+            painter.drawRoundedRect(fill, 2.5, 2.5)
+            painter.restore()
+
+    class _TitleDelegate(QtWidgets.QStyledItemDelegate):
+        """Two lines: issue title (bold) + affected object (muted blue)."""
+
+        def paint(self, painter, option, index):
+            opt = QtWidgets.QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            title, opt.text = opt.text, ""
+            style = opt.widget.style() if opt.widget is not None else QtWidgets.QApplication.style()
+            style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+            r = option.rect.adjusted(8, 3, -8, -3)
+            half = r.height() // 2
+            left = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            painter.save()
+            f1 = QtGui.QFont(option.font)
+            f1.setBold(True)
+            painter.setFont(f1)
+            painter.setPen(QtGui.QColor(index.data(COLOR_ROLE) or "#f4f4f5"))
+            painter.drawText(QtCore.QRect(r.x(), r.y() + 1, r.width(), half), int(left),
+                             QtGui.QFontMetrics(f1).elidedText(title, Qt.TextElideMode.ElideRight, r.width()))
+            f2 = QtGui.QFont(option.font)
+            if option.font.pointSizeF() > 0:
+                f2.setPointSizeF(max(7.0, option.font.pointSizeF() - 0.5))
+            painter.setFont(f2)
+            painter.setPen(QtGui.QColor("#93a4f5"))
+            painter.drawText(QtCore.QRect(r.x(), r.y() + half, r.width(), r.height() - half), int(left),
+                             QtGui.QFontMetrics(f2).elidedText(index.data(SUB_ROLE) or "", Qt.TextElideMode.ElideRight, r.width()))
+            painter.restore()
 
     class AuditWindow(QtWidgets.QWidget):
-        COLS = ["Severity", "Cost", "Issue", "Object", "Measured", "Status", ""]
+        COLS = ["Severity", "Cost", "Issue", "Measured", "Fix impact", "Status", ""]
+        C_SEV, C_COST, C_TITLE, C_METRIC, C_IMPACT, C_STATUS, C_ACTION = range(7)
 
         def __init__(self):
             super(AuditWindow, self).__init__(None)
             self.setObjectName(WINDOW_OBJECT_NAME)
-            self.setWindowTitle(TOOL_NAME + "  -  UE 5.6")
+            self.setWindowTitle(TOOL_NAME)
             self.setWindowFlags(Qt.WindowType.Window)
-            self.resize(1320, 820)
+            self.resize(1480, 880)
+            self.setMinimumSize(1100, 640)
             self.issues = []
-            self._rows = {}       # issue.id -> (item, fix_button)
-            self._cat_items = {}
-            self._build()
+            self._rows = {}            # issue.id -> (item, row button)
+            self._category = None      # sidebar filter (None = all)
+            self._current = None       # issue shown in the detail panel
+            root = QtWidgets.QWidget(self)
+            root.setObjectName("AuditRoot")
+            outer = QtWidgets.QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.addWidget(root)
+            self._build(root)
             self.setStyleSheet(_STYLE)
             if _STATE["issues"]:
                 self.issues = _STATE["issues"]
-                self._rebuild()
+                self._populate()
+            self._refresh_all()
 
-        # ------------------------------------------------------------------ UI
-        def _button(self, text, slot, name=None, tip=None):
+        # ================================================================= layout
+        def _btn(self, text, slot=None, name=None, tip=None):
             b = QtWidgets.QPushButton(text)
             if name:
                 b.setObjectName(name)
             if tip:
                 b.setToolTip(tip)
-            b.clicked.connect(slot)
+            if slot is not None:
+                b.clicked.connect(lambda *_a: slot())
+            b.setCursor(QtGui.QCursor(Qt.CursorShape.PointingHandCursor))
             return b
 
-        def _build(self):
-            root = QtWidgets.QVBoxLayout(self)
-            root.setContentsMargins(12, 12, 12, 10)
-            root.setSpacing(8)
+        def _build(self, root):
+            lay = QtWidgets.QVBoxLayout(root)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(0)
 
-            head = QtWidgets.QHBoxLayout()
-            title = QtWidgets.QLabel(TOOL_NAME)
-            title.setObjectName("Title")
-            self.lbl_level = QtWidgets.QLabel("Scan the open level for costly setups.")
-            self.lbl_level.setObjectName("Sub")
-            head.addWidget(title)
-            head.addSpacing(14)
-            head.addWidget(self.lbl_level, 1)
-            root.addLayout(head)
+            # --- header -------------------------------------------------------
+            header = QtWidgets.QFrame()
+            header.setObjectName("Header")
+            hl = QtWidgets.QHBoxLayout(header)
+            hl.setContentsMargins(18, 12, 18, 12)
+            logo = QtWidgets.QLabel("PA")
+            logo.setObjectName("Logo")
+            logo.setFixedSize(34, 34)
+            logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            titles = QtWidgets.QVBoxLayout()
+            titles.setSpacing(0)
+            t = QtWidgets.QLabel(TOOL_NAME)
+            t.setObjectName("Title")
+            st = QtWidgets.QLabel("Unreal Engine 5.6  ·  level performance & TSR ghosting audit")
+            st.setObjectName("Subtitle")
+            titles.addWidget(t)
+            titles.addWidget(st)
+            self.lbl_level = QtWidgets.QLabel("No scan yet")
+            self.lbl_level.setObjectName("LevelName")
+            self.lbl_scanned = QtWidgets.QLabel("")
+            self.lbl_scanned.setObjectName("Muted")
+            lvl = QtWidgets.QVBoxLayout()
+            lvl.setSpacing(0)
+            lvl.addWidget(self.lbl_level, 0, Qt.AlignmentFlag.AlignRight)
+            lvl.addWidget(self.lbl_scanned, 0, Qt.AlignmentFlag.AlignRight)
+            hl.addWidget(logo)
+            hl.addSpacing(10)
+            hl.addLayout(titles)
+            hl.addStretch(1)
+            hl.addLayout(lvl)
+            lay.addWidget(header)
 
-            bar = QtWidgets.QHBoxLayout()
-            self.btn_scan = self._button("Scan Level", self.on_scan, "Primary", "Run all enabled checks")
+            body = QtWidgets.QWidget()
+            bl = QtWidgets.QVBoxLayout(body)
+            bl.setContentsMargins(16, 12, 16, 10)
+            bl.setSpacing(10)
+            lay.addWidget(body, 1)
+
+            # --- toolbar ------------------------------------------------------
+            tb = QtWidgets.QHBoxLayout()
+            tb.setSpacing(8)
+            self.btn_scan = self._btn("Scan Level", self.on_scan, "Primary", "Run all enabled checks on the loaded actors")
             self.chk_selected = QtWidgets.QCheckBox("Selected actors only")
             self.btn_checks = QtWidgets.QToolButton()
-            self.btn_checks.setText("Checks")
+            self.btn_checks.setText("Checks  ▾")
             self.btn_checks.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
             self.btn_checks.setMenu(self._checks_menu())
-            self.btn_fix_all = self._button("Fix All Shown", self.on_fix_all, None,
-                                            "Apply every automatic fix currently visible in the list")
-            self.btn_save = self._button("Save Changes...", self.on_save, None, "Save modified levels/assets")
-            self.btn_export = self._button("Export Report", self.on_export, None, "HTML or CSV report")
+            self.btn_fix_safe = self._btn("Fix Safe", self.on_fix_safe, "Success",
+                                          "Apply every listed fix that does NOT change the look or gameplay.\n"
+                                          "Fixes that change visuals are never batch-applied: use Fix on the row.")
+            self.btn_revert = QtWidgets.QToolButton()
+            self.btn_revert.setText("Revert  ▾")
+            self.btn_revert.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+            self.revert_menu = QtWidgets.QMenu(self)
+            self.revert_menu.aboutToShow.connect(self._fill_revert_menu)
+            self.btn_revert.setMenu(self.revert_menu)
+            self.btn_save = self._btn("Save…", save_changes, None, "Unreal's Save Content dialog")
+            self.btn_export = self._btn("Export…", self.on_export, None, "HTML or CSV report")
             for w in (self.btn_scan, self.chk_selected, self.btn_checks):
-                bar.addWidget(w)
-            bar.addStretch(1)
-            for w in (self.btn_fix_all, self.btn_save, self.btn_export):
-                bar.addWidget(w)
-            root.addLayout(bar)
+                tb.addWidget(w)
+            tb.addStretch(1)
+            for w in (self.btn_fix_safe, self.btn_revert, self.btn_save, self.btn_export):
+                tb.addWidget(w)
+            bl.addLayout(tb)
 
+            # --- KPI cards ----------------------------------------------------
+            kpis = QtWidgets.QHBoxLayout()
+            kpis.setSpacing(8)
+            self._kpi = {}
+            for key, caption, color in (("critical", "CRITICAL", _SEV_PILL[CRITICAL]), ("high", "HIGH", _SEV_PILL[HIGH]),
+                                        ("medium", "MEDIUM", _SEV_PILL[MEDIUM]), ("low", "LOW / INFO", _SEV_PILL[LOW]),
+                                        ("safe", "SAFE FIXES", IMPACT_COLORS[SAFE]), ("visual", "VISUAL FIXES", IMPACT_COLORS[LOOK]),
+                                        ("fixed", "FIXED", "#22c55e")):
+                card = QtWidgets.QFrame()
+                card.setObjectName("Kpi")
+                card.setStyleSheet("QFrame#Kpi { border-top: 2px solid %s; }" % color)
+                cl = QtWidgets.QVBoxLayout(card)
+                cl.setContentsMargins(14, 8, 14, 9)
+                cl.setSpacing(0)
+                v = QtWidgets.QLabel("–")
+                v.setObjectName("KpiValue")
+                c = QtWidgets.QLabel(caption)
+                c.setObjectName("KpiCaption")
+                cl.addWidget(v)
+                cl.addWidget(c)
+                kpis.addWidget(card, 1)
+                self._kpi[key] = v
+            bl.addLayout(kpis)
+
+            # --- main splitter: sidebar | table | detail ----------------------
+            split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
+            split.setChildrenCollapsible(False)
+
+            side = QtWidgets.QFrame()
+            side.setObjectName("Panel")
+            sl = QtWidgets.QVBoxLayout(side)
+            sl.setContentsMargins(10, 10, 10, 10)
+            sl.setSpacing(6)
+            cap = QtWidgets.QLabel("CATEGORIES")
+            cap.setObjectName("SectionTitle")
+            sl.addWidget(cap)
+            self.sidebar = QtWidgets.QTreeWidget()
+            self.sidebar.setObjectName("Sidebar")
+            self.sidebar.setColumnCount(2)
+            self.sidebar.setHeaderHidden(True)
+            self.sidebar.setRootIsDecorated(False)
+            self.sidebar.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self.sidebar.header().setStretchLastSection(False)
+            self.sidebar.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            self.sidebar.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            self.sidebar.itemSelectionChanged.connect(self._on_category)
+            sl.addWidget(self.sidebar, 1)
+            side.setMinimumWidth(236)
+            side.setMaximumWidth(320)
+
+            center = QtWidgets.QFrame()
+            cl = QtWidgets.QVBoxLayout(center)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setSpacing(8)
             flt = QtWidgets.QHBoxLayout()
-            self.cmb_sev = QtWidgets.QComboBox()
-            self.cmb_sev.addItems(["All severities", "Low and up", "Medium and up", "High and up", "Critical"])
-            self.cmb_cat = QtWidgets.QComboBox()
-            self.cmb_cat.addItems(["All categories"] + CATEGORIES)
+            flt.setSpacing(8)
             self.txt_filter = QtWidgets.QLineEdit()
-            self.txt_filter.setPlaceholderText("Filter by name, object, metric...")
-            self.chk_fixable = QtWidgets.QCheckBox("Auto-fixable only")
-            self.chk_hide_fixed = QtWidgets.QCheckBox("Hide fixed")
-            self.chk_group = QtWidgets.QCheckBox("Group by category")
-            self.chk_group.setChecked(True)
-            for w in (self.cmb_sev, self.cmb_cat):
-                w.currentIndexChanged.connect(self._apply_filter)
+            self.txt_filter.setPlaceholderText("Search issues, objects, assets…")
+            self.txt_filter.setClearButtonEnabled(True)
             self.txt_filter.textChanged.connect(self._apply_filter)
-            for w in (self.chk_fixable, self.chk_hide_fixed):
-                w.toggled.connect(self._apply_filter)
-            self.chk_group.toggled.connect(self._rebuild)
-            flt.addWidget(self.cmb_sev)
-            flt.addWidget(self.cmb_cat)
+            self.cmb_sev = QtWidgets.QComboBox()
+            self.cmb_sev.addItems(["All severities", "Low and above", "Medium and above", "High and above", "Critical only"])
+            self.cmb_fix = QtWidgets.QComboBox()
+            self.cmb_fix.addItems(["All issues", "Auto-fixable", "Safe fixes only", "Visual fixes", "Manual only"])
+            self.chk_show_fixed = QtWidgets.QCheckBox("Show fixed")
+            self.chk_show_fixed.setChecked(True)
+            for w in (self.cmb_sev, self.cmb_fix):
+                w.currentIndexChanged.connect(self._apply_filter)
+            self.chk_show_fixed.toggled.connect(self._apply_filter)
             flt.addWidget(self.txt_filter, 1)
-            for w in (self.chk_fixable, self.chk_hide_fixed, self.chk_group):
-                flt.addWidget(w)
-            root.addLayout(flt)
-
-            self.lbl_stats = QtWidgets.QLabel("No scan yet.")
-            self.lbl_stats.setObjectName("Stats")
-            self.lbl_stats.setTextFormat(Qt.TextFormat.RichText)
-            self.lbl_stats.setWordWrap(True)
-            root.addWidget(self.lbl_stats)
+            flt.addWidget(self.cmb_sev)
+            flt.addWidget(self.cmb_fix)
+            flt.addWidget(self.chk_show_fixed)
+            cl.addLayout(flt)
 
             self.tree = QtWidgets.QTreeWidget()
             self.tree.setColumnCount(len(self.COLS))
             self.tree.setHeaderLabels(self.COLS)
+            self.tree.setRootIsDecorated(False)
             self.tree.setAlternatingRowColors(True)
             self.tree.setUniformRowHeights(True)
+            self.tree.setSortingEnabled(True)
             self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            self.tree.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
             self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.tree.customContextMenuRequested.connect(self._context_menu)
             self.tree.itemSelectionChanged.connect(self._on_selection)
-            self.tree.itemDoubleClicked.connect(self._on_double_click)
+            self.tree.itemDoubleClicked.connect(lambda item, col: self._goto_item(item))
+            pill = _PillDelegate(self.tree)
+            for col in (self.C_SEV, self.C_IMPACT, self.C_STATUS):
+                self.tree.setItemDelegateForColumn(col, pill)
+            self.tree.setItemDelegateForColumn(self.C_COST, _CostDelegate(self.tree))
+            self.tree.setItemDelegateForColumn(self.C_TITLE, _TitleDelegate(self.tree))
             hdr = self.tree.header()
             hdr.setStretchLastSection(False)
-            for col, width in enumerate((104, 48, 290, 280, 140, 70, 150)):
+            hdr.setHighlightSections(False)
+            for col, width in enumerate((96, 96, 360, 140, 104, 86, 86)):
                 self.tree.setColumnWidth(col, width)
-            hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
-            hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            hdr.setSectionResizeMode(self.C_TITLE, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            hdr.setSectionResizeMode(self.C_ACTION, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.tree.sortByColumn(self.C_COST, Qt.SortOrder.DescendingOrder)
+            cl.addWidget(self.tree, 1)
 
+            detail = QtWidgets.QFrame()
+            detail.setObjectName("Panel")
+            dl = QtWidgets.QVBoxLayout(detail)
+            dl.setContentsMargins(14, 12, 14, 12)
+            dl.setSpacing(10)
+            dcap = QtWidgets.QLabel("DETAILS")
+            dcap.setObjectName("SectionTitle")
+            dl.addWidget(dcap)
             self.detail = QtWidgets.QTextBrowser()
             self.detail.setOpenLinks(False)
-            self.detail.setHtml(self._welcome_html())
+            self.detail.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            dl.addWidget(self.detail, 1)
+            actions = QtWidgets.QGridLayout()
+            actions.setHorizontalSpacing(6)
+            actions.setVerticalSpacing(6)
+            self.d_fix = self._btn("Fix", lambda: self._current and self.fix_issues([self._current]), "Primary")
+            self.d_revert = self._btn("Revert", lambda: self._current and self.revert([self._current]))
+            self.d_goto = self._btn("Go To", lambda: self._current and go_to(self._current), None,
+                                    "Select and frame the actors, show the assets in the Content Browser")
+            self.d_open = self._btn("Open Asset", lambda: self._current and open_assets(self._current))
+            actions.addWidget(self.d_fix, 0, 0)
+            actions.addWidget(self.d_revert, 0, 1)
+            actions.addWidget(self.d_goto, 1, 0)
+            actions.addWidget(self.d_open, 1, 1)
+            dl.addLayout(actions)
+            detail.setMinimumWidth(320)
 
-            split = QtWidgets.QSplitter(Qt.Orientation.Vertical)
-            split.addWidget(self.tree)
-            split.addWidget(self.detail)
-            split.setStretchFactor(0, 3)
+            split.addWidget(side)
+            split.addWidget(center)
+            split.addWidget(detail)
+            split.setStretchFactor(0, 0)
             split.setStretchFactor(1, 1)
-            split.setSizes([560, 220])
-            root.addWidget(split, 1)
+            split.setStretchFactor(2, 0)
+            split.setSizes([250, 900, 400])
+            bl.addWidget(split, 1)
 
-            self.lbl_status = QtWidgets.QLabel("Ready. Click 'Scan Level'.")
-            self.lbl_status.setObjectName("Sub")
-            root.addWidget(self.lbl_status)
+            # --- status bar ---------------------------------------------------
+            sb = QtWidgets.QFrame()
+            sb.setObjectName("StatusBar")
+            sbl = QtWidgets.QHBoxLayout(sb)
+            sbl.setContentsMargins(16, 6, 16, 6)
+            self.lbl_status = QtWidgets.QLabel("Ready. Click Scan Level.")
+            self.lbl_stats = QtWidgets.QLabel("")
+            self.lbl_stats.setObjectName("Muted")
+            sbl.addWidget(self.lbl_status, 1)
+            sbl.addWidget(self.lbl_stats)
+            lay.addWidget(sb)
 
         def _checks_menu(self):
             menu = QtWidgets.QMenu(self)
-            all_on = menu.addAction("Enable all")
-            all_off = menu.addAction("Disable all")
+            acts = []
+            on, off = menu.addAction("Enable all checks"), menu.addAction("Disable all checks")
             menu.addSeparator()
-            self._check_actions = []
             for cat in CATEGORIES:
                 sub = menu.addMenu(cat)
                 for c in _CHECKS:
-                    if c["category"] != cat:
-                        continue
-                    act = sub.addAction(c["name"])
-                    act.setCheckable(True)
-                    act.setChecked(c["enabled"])
-                    act.toggled.connect(lambda on, c=c: c.__setitem__("enabled", on))
-                    self._check_actions.append(act)
-
-            def set_all(on):
-                for a in self._check_actions:
-                    a.setChecked(on)
-            all_on.triggered.connect(lambda *_: set_all(True))
-            all_off.triggered.connect(lambda *_: set_all(False))
+                    if c["category"] == cat:
+                        a = sub.addAction(c["name"])
+                        a.setCheckable(True)
+                        a.setChecked(c["enabled"])
+                        a.toggled.connect(lambda state, c=c: c.__setitem__("enabled", state))
+                        acts.append(a)
+            on.triggered.connect(lambda *_: [a.setChecked(True) for a in acts])
+            off.triggered.connect(lambda *_: [a.setChecked(False) for a in acts])
             return menu
 
-        def _welcome_html(self):
-            return ("<h3 style='color:#fff'>How it works</h3><p>1. <b>Scan Level</b> runs %d checks on the loaded "
-                    "actors (lighting, Nanite/LODs, WPO, textures, materials, Niagara, post process, motion "
-                    "vectors...).<br>2. Issues are sorted by <b>Cost</b> (0-100 estimate of impact).<br>3. Select a row "
-                    "for the description and solution. <b>Fix</b> applies the automatic fix, <b>Go To</b> selects "
-                    "the actors / shows the asset.<br>4. Everything is undoable with Ctrl+Z until you <b>Save Changes</b>."
-                    "</p><p style='color:#999'>Asset fixes (Nanite, LODs, textures, materials, Niagara) change the "
-                    "asset for every level that uses it.</p>" % len(_CHECKS))
+        def _fill_revert_menu(self):
+            m = self.revert_menu
+            m.clear()
+            sel = [i for i in self._selected() if i.revertable]
+            a = m.addAction("Revert selected fix%s (%d)" % ("es" if len(sel) != 1 else "", len(sel)))
+            a.setEnabled(bool(sel))
+            a.triggered.connect(lambda *_: self.revert(sel))
+            pending = journal_entries()
+            b = m.addAction("Revert ALL fixes made by this tool (%d)…" % len(pending))
+            b.setEnabled(bool(pending))
+            b.triggered.connect(lambda *_: self.on_revert_all())
+            m.addSeparator()
+            m.addAction("Undo fixes made by the previous version (from logs)…").triggered.connect(
+                lambda *_: self.on_recover_old())
+            m.addAction("Open fix journal folder").triggered.connect(
+                lambda *_: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(_journal_path()))))
 
-        # --------------------------------------------------------------- data
-        def _rebuild(self, *_):
+        # ================================================================== data
+        def _populate(self):
+            self.tree.setSortingEnabled(False)
             self.tree.setUpdatesEnabled(False)
             self.tree.clear()
-            self._rows, self._cat_items = {}, {}
-            limit = CONFIG["max_rows"]
-            shown = self.issues[:limit]
-            if self.chk_group.isChecked():
-                cats = OrderedDict()
-                for i in shown:
-                    cats.setdefault(i.category, []).append(i)
-                for cat in sorted(cats, key=lambda k: -max(i.cost for i in cats[k])):
-                    top = QtWidgets.QTreeWidgetItem([cat])
-                    self.tree.addTopLevelItem(top)
-                    top.setFirstColumnSpanned(True)
-                    f = top.font(0)
-                    f.setBold(True)
-                    f.setPointSize(f.pointSize() + 1)
-                    top.setFont(0, f)
-                    top.setForeground(0, QtGui.QBrush(QtGui.QColor("#e8e8e8")))
-                    top.setSizeHint(0, QtCore.QSize(0, 30))
-                    self._cat_items[cat] = (top, cats[cat])
-                    for i in cats[cat]:
-                        self._add_row(top, i)
-                    top.setExpanded(True)
-            else:
-                for i in shown:
-                    self._add_row(None, i)
+            self._rows = {}
+            for issue in self.issues[:CONFIG["max_rows"]]:
+                self._add_row(issue)
             self.tree.setUpdatesEnabled(True)
-            self._apply_filter()
-            if len(self.issues) > limit:
-                self.lbl_status.setText("Showing the %d most costly of %d issues (CONFIG['max_rows'])."
-                                        % (limit, len(self.issues)))
+            self.tree.setSortingEnabled(True)
+            self.tree.sortByColumn(self.tree.sortColumn(), self.tree.header().sortIndicatorOrder())
 
-        def _add_row(self, parent, issue):
-            it = QtWidgets.QTreeWidgetItem()
-            it.setData(0, USER_ROLE, issue.id)
-            it.setText(0, "\u25CF " + issue.severity_name)
-            it.setForeground(0, QtGui.QBrush(QtGui.QColor(SEVERITY_COLORS[issue.severity])))
-            it.setText(1, "%.0f" % issue.cost)
-            it.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
-            it.setText(2, issue.title)
-            it.setText(3, issue.obj)
-            it.setText(4, issue.metric)
-            it.setToolTip(2, issue.solution)
-            it.setToolTip(3, issue.obj)
-            it.setSizeHint(0, QtCore.QSize(0, 28))
-            if parent is None:
-                self.tree.addTopLevelItem(it)
-            else:
-                parent.addChild(it)
-
+        def _add_row(self, issue):
+            it = _Row()
+            it.setData(0, USER, issue.id)
+            it.setText(self.C_SEV, issue.severity_name)
+            it.setData(self.C_SEV, SORT_ROLE, issue.severity)
+            it.setData(self.C_SEV, COLOR_ROLE, _SEV_PILL[issue.severity])
+            it.setText(self.C_COST, "%.0f" % issue.cost)
+            it.setData(self.C_COST, SORT_ROLE, issue.cost)
+            it.setData(self.C_COST, COLOR_ROLE, _SEV_PILL[issue.severity])
+            it.setText(self.C_TITLE, issue.title)
+            it.setData(self.C_TITLE, SUB_ROLE, issue.obj)
+            it.setText(self.C_METRIC, issue.metric)
+            it.setToolTip(self.C_TITLE, "%s\n%s\n\n%s" % (issue.title, issue.obj, issue.solution))
+            it.setToolTip(self.C_METRIC, issue.metric)
+            it.setForeground(self.C_METRIC, QtGui.QBrush(QtGui.QColor("#a1a1aa")))
+            it.setSizeHint(0, QtCore.QSize(0, 42))
+            self.tree.addTopLevelItem(it)
             cell = QtWidgets.QWidget()
-            lay = QtWidgets.QHBoxLayout(cell)
-            lay.setContentsMargins(2, 1, 4, 1)
-            lay.setSpacing(4)
-            b_fix = QtWidgets.QPushButton("Fix" if issue.fix else "Manual")
-            b_fix.setObjectName("Fix")
-            b_fix.setToolTip(issue.fix_label or "No automatic fix - see the solution text")
-            b_fix.clicked.connect(lambda *_a, i=issue: self.fix_issues([i]))
-            b_go = QtWidgets.QPushButton("Go To")
-            b_go.setObjectName("Small")
-            b_go.setToolTip("Select / frame the actors and show the assets in the Content Browser")
-            b_go.clicked.connect(lambda *_a, i=issue: go_to(i))
-            lay.addWidget(b_fix)
-            lay.addWidget(b_go)
-            self.tree.setItemWidget(it, 6, cell)
-            self._rows[issue.id] = (it, b_fix)
+            cell.setObjectName("Cell")
+            cell.setStyleSheet("QWidget#Cell { background: transparent; }")
+            h = QtWidgets.QHBoxLayout(cell)
+            h.setContentsMargins(6, 7, 8, 7)
+            b = QtWidgets.QPushButton("Fix")
+            b.setCursor(QtGui.QCursor(Qt.CursorShape.PointingHandCursor))
+            b.clicked.connect(lambda *_a, i=issue: self._row_action(i))
+            h.addWidget(b)
+            self.tree.setItemWidget(it, self.C_ACTION, cell)
+            self._rows[issue.id] = (it, b)
             self._refresh_row(issue)
 
         def _refresh_row(self, issue):
             row = self._rows.get(issue.id)
             if not row:
                 return
-            it, b_fix = row
-            b_fix.setEnabled(issue.fixable)
-            if issue.status == "fixed":
-                it.setText(5, "Fixed")
-                b_fix.setText("Fixed")
-                color = "#6fcf73"
-            elif issue.status == "failed":
-                it.setText(5, "Failed")
-                color = "#ff6b6b"
+            it, b = row
+            if issue.fix is None:
+                imp, imp_color = "Manual", "#71717a"
             else:
-                it.setText(5, "Auto-fix" if issue.fix else "Manual")
-                color = None
-            if color:
-                for col in (2, 3, 4, 5):
-                    it.setForeground(col, QtGui.QBrush(QtGui.QColor(color)))
-            it.setToolTip(5, issue.message or "")
+                imp, imp_color = IMPACT_SHORT[issue.impact], IMPACT_COLORS[issue.impact]
+            it.setText(self.C_IMPACT, imp)
+            it.setData(self.C_IMPACT, SORT_ROLE, _IMPACT_ORDER.get(issue.impact, 3) if issue.fix else 9)
+            it.setData(self.C_IMPACT, COLOR_ROLE, imp_color)
+            it.setToolTip(self.C_IMPACT, (IMPACT_LABELS[issue.impact] + ": " + issue.impact_note) if issue.fix else
+                          "No automatic fix")
+            status = {"fixed": "Fixed", "reverted": "Reverted", "failed": "Failed"}.get(issue.status, "")
+            it.setText(self.C_STATUS, status)
+            it.setData(self.C_STATUS, SORT_ROLE, status)
+            it.setData(self.C_STATUS, COLOR_ROLE, _STATUS_COLORS.get(issue.status))
+            it.setToolTip(self.C_STATUS, issue.message)
+            it.setData(self.C_TITLE, COLOR_ROLE, "#8b8b93" if issue.status == "fixed" else "#f4f4f5")
+            if issue.revertable and issue.status == "fixed":
+                b.setText("Revert")
+                b.setObjectName("RowRevert")
+                b.setEnabled(True)
+                b.setToolTip("Put the old values back")
+            else:
+                b.setText("Fix" if issue.fix else "Manual")
+                b.setObjectName("RowFix")
+                b.setEnabled(issue.fixable)
+                b.setToolTip(("%s\n%s: %s" % (issue.fix_label, IMPACT_LABELS[issue.impact], issue.impact_note))
+                             if issue.fix else "No automatic fix: see the solution in the details panel")
+            b.style().unpolish(b)
+            b.style().polish(b)
 
-        def _passes(self, i):
-            sev_min = [0, LOW, MEDIUM, HIGH, CRITICAL][self.cmb_sev.currentIndex()]
-            if i.severity < sev_min:
+        def _passes(self, i, ignore_category=False):
+            if not ignore_category and self._category and i.category != self._category:
                 return False
-            if self.cmb_cat.currentIndex() > 0 and i.category != self.cmb_cat.currentText():
+            if i.severity < [0, LOW, MEDIUM, HIGH, CRITICAL][self.cmb_sev.currentIndex()]:
                 return False
-            if self.chk_fixable.isChecked() and not i.fix:
+            mode = self.cmb_fix.currentIndex()
+            if (mode == 1 and not i.fix) or (mode == 2 and not (i.fix and i.impact == SAFE)) or \
+                    (mode == 3 and not (i.fix and i.impact != SAFE)) or (mode == 4 and i.fix):
                 return False
-            if self.chk_hide_fixed.isChecked() and i.status == "fixed":
+            if not self.chk_show_fixed.isChecked() and i.status == "fixed":
                 return False
-            text = self.txt_filter.text().strip().lower()
-            if text and text not in ("%s %s %s %s" % (i.title, i.obj, i.metric, i.category)).lower():
-                return False
-            return True
+            q = self.txt_filter.text().strip().lower()
+            return not q or q in ("%s %s %s %s" % (i.title, i.obj, i.metric, i.category)).lower()
 
         def _apply_filter(self, *_):
-            visible = []
             for i in self.issues:
                 row = self._rows.get(i.id)
-                if not row:
-                    continue
-                ok = self._passes(i)
-                row[0].setHidden(not ok)
-                if ok:
-                    visible.append(i)
-            for cat, (top, items) in self._cat_items.items():
-                n = sum(1 for i in items if self._passes(i))
-                top.setHidden(n == 0)
-                fixed = sum(1 for i in items if i.status == "fixed")
-                top.setText(0, "%s   (%d issue%s%s)" % (cat, n, "" if n == 1 else "s",
-                                                        ", %d fixed" % fixed if fixed else ""))
-            self._update_stats(visible)
+                if row:
+                    row[0].setHidden(not self._passes(i))
+            self._refresh_sidebar()
+            self._refresh_kpis()
 
-        def _visible_issues(self):
+        def _refresh_sidebar(self):
+            self.sidebar.blockSignals(True)
+            self.sidebar.clear()
+            counts = OrderedDict([(None, 0)] + [(c, 0) for c in CATEGORIES])
+            for i in self.issues:
+                if self._passes(i, ignore_category=True):
+                    counts[None] += 1
+                    counts[i.category] += 1
+            for cat, n in counts.items():
+                if cat is not None and n == 0 and cat != self._category:
+                    continue
+                it = QtWidgets.QTreeWidgetItem(["All issues" if cat is None else cat, str(n)])
+                it.setData(0, USER, cat or "")
+                it.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                it.setForeground(1, QtGui.QBrush(QtGui.QColor("#8e8e96")))
+                if cat is None:
+                    f = it.font(0)
+                    f.setBold(True)
+                    it.setFont(0, f)
+                self.sidebar.addTopLevelItem(it)
+                if (cat or None) == self._category:
+                    it.setSelected(True)
+            self.sidebar.blockSignals(False)
+
+        def _refresh_kpis(self):
+            open_ = [i for i in self.issues if i.status != "fixed"]
+            n = lambda pred: sum(1 for i in open_ if pred(i))
+            vals = {
+                "critical": n(lambda i: i.severity == CRITICAL), "high": n(lambda i: i.severity == HIGH),
+                "medium": n(lambda i: i.severity == MEDIUM), "low": n(lambda i: i.severity <= LOW),
+                "safe": n(lambda i: i.fixable and i.impact == SAFE), "visual": n(lambda i: i.fixable and i.impact != SAFE),
+                "fixed": sum(1 for i in self.issues if i.status == "fixed"),
+            }
+            for k, v in vals.items():
+                self._kpi[k].setText(str(v) if self.issues else "–")
+            safe_shown = len(self._safe_visible())
+            self.btn_fix_safe.setText("Fix Safe (%d)" % safe_shown)
+            self.btn_fix_safe.setEnabled(safe_shown > 0)
+            stats = _STATE.get("stats") or {}
+            self.lbl_stats.setText("   ·   ".join("%s %s" % (k, v) for k, v in stats.items()))
+            if _STATE.get("errors"):
+                self.lbl_stats.setText(self.lbl_stats.text() + "   ·   %d check(s) errored (Output Log)" % len(_STATE["errors"]))
+
+        def _refresh_all(self):
+            self._apply_filter()
+            self._show_detail(self._current)
+
+        def _safe_visible(self):
+            return [i for i in self._visible() if i.fixable and i.impact == SAFE]
+
+        def _visible(self):
             return [i for i in self.issues if i.id in self._rows and not self._rows[i.id][0].isHidden()]
 
-        def _update_stats(self, visible=None):
-            visible = self._visible_issues() if visible is None else visible
-            chips = []
-            for sev in (CRITICAL, HIGH, MEDIUM, LOW, INFO):
-                n = sum(1 for i in self.issues if i.severity == sev and i.status != "fixed")
-                if n:
-                    chips.append("<span style='color:%s'>\u25CF %d %s</span>" % (SEVERITY_COLORS[sev], n,
-                                                                                 SEVERITY_NAMES[sev]))
-            fixable = sum(1 for i in self.issues if i.fixable)
-            fixed = sum(1 for i in self.issues if i.status == "fixed")
-            line1 = "&nbsp;&nbsp;".join(chips) or "<span style='color:#6fcf73'>No open issues</span>"
-            line1 += "&nbsp;&nbsp;|&nbsp;&nbsp;%d auto-fixable &nbsp;&middot;&nbsp; %d fixed &nbsp;&middot;&nbsp; %d shown" % (
-                fixable, fixed, len(visible))
-            stats = " &nbsp;&middot;&nbsp; ".join("<b>%s</b> %s" % (html.escape(k), html.escape(str(v)))
-                                                   for k, v in _STATE.get("stats", {}).items())
-            if _STATE.get("errors"):
-                stats += " &nbsp;&middot;&nbsp; <span style='color:#ff6b6b'>%d check(s) errored - see Output Log</span>" % len(
-                    _STATE["errors"])
-            self.lbl_stats.setText(line1 + ("<br>" + stats if stats else ""))
-            self.btn_fix_all.setText("Fix All Shown (%d)" % sum(1 for i in visible if i.fixable))
-
-        def _selected_issues(self):
-            ids = set()
-            for it in self.tree.selectedItems():
-                v = it.data(0, USER_ROLE)
-                if v is not None:
-                    ids.add(int(v))
+        def _selected(self):
+            ids = {int(it.data(0, USER)) for it in self.tree.selectedItems() if it.data(0, USER) is not None}
             return [i for i in self.issues if i.id in ids]
 
+        # ================================================================ detail
         def _show_detail(self, issue):
-            esc = lambda s: html.escape(str(s)).replace("\n", "<br>")
-            color = SEVERITY_COLORS[issue.severity]
-            if issue.status == "fixed":
-                status = "<p style='color:#6fcf73'><b>Fixed:</b> %s</p>" % esc(issue.message)
-            elif issue.status == "failed":
-                status = "<p style='color:#ff6b6b'><b>Fix failed:</b> %s</p>" % esc(issue.message)
-            else:
-                status = ""
-            fix_txt = ("<span style='color:#7fd486'>%s</span>" % esc(issue.fix_label)) if issue.fix else \
-                "<span style='color:#999'>No automatic fix: use Go To and follow the solution.</span>"
-            self.detail.setHtml(
-                "<h3 style='margin:0;color:#fff'>%s</h3>"
-                "<p style='margin:4px 0 8px 0'><span style='color:%s'><b>%s</b></span> &nbsp;&middot;&nbsp; "
-                "Cost <b>%.0f</b>/100 &nbsp;&middot;&nbsp; %s &nbsp;&middot;&nbsp; <span style='color:#8fb8ff'>%s</span>"
-                " &nbsp;&middot;&nbsp; %s</p>"
-                "<p><b style='color:#fff'>Problem</b><br>%s</p>"
-                "<p><b style='color:#fff'>Solution</b><br>%s</p>"
-                "<p><b style='color:#fff'>Fix button</b><br>%s</p>%s" % (
-                    esc(issue.title), color, issue.severity_name, issue.cost, esc(issue.category), esc(issue.obj),
-                    esc(issue.metric), esc(issue.detail), esc(issue.solution), fix_txt, status))
+            self._current = issue
+            for b in (self.d_fix, self.d_revert, self.d_goto, self.d_open):
+                b.setEnabled(False)
+            if issue is None:
+                self.detail.setHtml(self._welcome_html())
+                return
+            self.d_fix.setEnabled(issue.fixable)
+            self.d_revert.setEnabled(issue.revertable and issue.status == "fixed")
+            self.d_goto.setEnabled(bool(issue.targets or issue.assets))
+            self.d_open.setEnabled(bool(issue.assets))
+            sev_c = _SEV_PILL[issue.severity]
 
-        # ------------------------------------------------------------ actions
+            def badge(text, color):
+                return ("<span style='background-color:%s; color:#0b0b0d; font-weight:600;'>&nbsp;%s&nbsp;</span>"
+                        % (color, esc(text)))
+
+            badges = badge(issue.severity_name.upper(), sev_c) + "&nbsp;&nbsp;"
+            badges += badge(("FIX: " + IMPACT_SHORT[issue.impact].upper()) if issue.fix else "MANUAL",
+                            IMPACT_COLORS[issue.impact] if issue.fix else "#a1a1aa")
+            if issue.status in _STATUS_COLORS:
+                badges += "&nbsp;&nbsp;" + badge(issue.status.upper(), _STATUS_COLORS[issue.status])
+
+            def section(title, body, color="#e4e4e7"):
+                return ("<p style='margin:14px 0 3px 0; color:#8e8e96; font-size:8pt; font-weight:700;'>%s</p>"
+                        "<p style='margin:0; color:%s; line-height:140%%;'>%s</p>" % (title, color, body))
+
+            if issue.fix:
+                fix_html = "<b>%s</b><br><span style='color:%s'>%s</span>%s" % (
+                    esc(issue.fix_label), IMPACT_COLORS[issue.impact], esc(IMPACT_LABELS[issue.impact]),
+                    (": " + esc(issue.impact_note)) if issue.impact_note else "")
+                fix_html += "<br><span style='color:#8e8e96'>Recorded in the fix journal: Revert puts the old values back, even after saving.</span>"
+            else:
+                fix_html = "<span style='color:#a1a1aa'>No automatic fix. Use Go To / Open Asset and follow the solution.</span>"
+            status_html = ""
+            if issue.status in ("fixed", "failed", "reverted") and issue.message:
+                status_html = section("RESULT", esc(issue.message), _STATUS_COLORS.get(issue.status, "#e4e4e7"))
+            self.detail.setHtml(
+                "<div style='font-size:12pt; font-weight:600; color:#fafafa;'>%s</div>"
+                "<p style='margin:8px 0 10px 0;'>%s</p>"
+                "<table cellspacing='0' cellpadding='2'>"
+                "<tr><td style='color:#8e8e96; padding-right:12px;'>Object</td><td style='color:#a5b4fc;'>%s</td></tr>"
+                "<tr><td style='color:#8e8e96; padding-right:12px;'>Measured</td><td>%s</td></tr>"
+                "<tr><td style='color:#8e8e96; padding-right:12px;'>Cost score</td><td>%.0f / 100</td></tr>"
+                "<tr><td style='color:#8e8e96; padding-right:12px;'>Category</td><td>%s</td></tr></table>%s%s%s%s"
+                % (esc(issue.title), badges, esc(issue.obj), esc(issue.metric), issue.cost, esc(issue.category),
+                   section("PROBLEM", esc(issue.detail)), section("SOLUTION", esc(issue.solution)),
+                   section("AUTOMATIC FIX", fix_html), status_html))
+
+        def _welcome_html(self):
+            n_checks = sum(1 for c in _CHECKS if c["enabled"])
+            return (
+                "<div style='font-size:12pt; font-weight:600; color:#fafafa;'>Getting started</div>"
+                "<p style='color:#c4c4cc; line-height:140%%;'>1. <b>Scan Level</b> runs %d checks on the loaded actors.<br>"
+                "2. Issues are ranked by <b>cost</b> (0-100 estimated impact). Pick a category on the left.<br>"
+                "3. Select an issue to read the problem, the solution and exactly what the fix changes.</p>"
+                "<p style='margin-top:14px; color:#8e8e96; font-size:8pt; font-weight:700;'>FIX IMPACT</p>"
+                "<p style='line-height:150%%;'><span style='color:%s'><b>Safe</b></span> no visual change "
+                "(the only kind <b>Fix Safe</b> applies in bulk)<br>"
+                "<span style='color:%s'><b>Visual</b></span> changes the look: review it, then keep or Revert<br>"
+                "<span style='color:%s'><b>Behaviour</b></span> can change gameplay / runtime behaviour</p>"
+                "<p style='color:#8e8e96; line-height:140%%;'>Every fix is journaled to Saved/PerfAudit, so "
+                "<b>Revert</b> works even after saving or restarting. Fixes made by the previous version can be "
+                "undone from <b>Revert ▾ &gt; Undo fixes made by the previous version</b>.</p>"
+                % (n_checks, IMPACT_COLORS[SAFE], IMPACT_COLORS[LOOK], IMPACT_COLORS[GAMEPLAY]))
+
+        # =============================================================== actions
+        def _set_status(self, text):
+            self.lbl_status.setText(text)
+
+        def _after_change(self, issues):
+            for i in issues:
+                self._refresh_row(i)
+            self._apply_filter()
+            self._show_detail(self._current)
+
         def on_scan(self):
             self.btn_scan.setEnabled(False)
-            self.lbl_status.setText("Scanning...")
+            self._set_status("Scanning…")
             try:
                 Issue._counter = 0
                 self.issues = scan(selected_only=self.chk_selected.isChecked())
             except Exception as e:
-                self.lbl_status.setText("Scan failed: %s" % e)
+                self._set_status("Scan failed: %s" % e)
                 _warn(traceback.format_exc())
                 return
             finally:
                 self.btn_scan.setEnabled(True)
-            lvl = _STATE.get("level", "")
-            self.lbl_level.setText("%s%s  -  scanned %s" % (lvl, " (selection)" if _STATE.get("selected_only") else "",
-                                                           datetime.datetime.now().strftime("%H:%M:%S")))
-            self._rebuild()
-            self.detail.setHtml(self._welcome_html())
-            self.lbl_status.setText("%d issues found. Sorted by estimated cost." % len(self.issues))
+            self.lbl_level.setText(_STATE.get("level") or "Level")
+            self.lbl_scanned.setText("%sscanned %s" % ("selection · " if _STATE.get("selected_only") else "",
+                                                        datetime.datetime.now().strftime("%H:%M:%S")))
+            self._category = None
+            self._populate()
+            self._current = None
+            self._refresh_all()
+            self._set_status("%d issues found, sorted by estimated cost." % len(self.issues))
 
-        def fix_issues(self, issues, confirm=False):
+        def _confirm(self, title, text, details, ok_text, warning=False):
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle(title)
+            box.setIcon(QtWidgets.QMessageBox.Icon.Warning if warning else QtWidgets.QMessageBox.Icon.Question)
+            box.setText(text)
+            if details:
+                box.setInformativeText(details)
+            ok = box.addButton(ok_text, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setStyleSheet(_STYLE)
+            _qexec(box)
+            return box.clickedButton() is ok
+
+        def fix_issues(self, issues, bulk=False):
             todo = [i for i in issues if i.fixable]
             if not todo:
                 return
-            heavy = [i for i in todo if i.check in ("mesh_high_poly", "mesh_missing_lods", "anim_skel_lods")]
-            if confirm or len(todo) > 1 or heavy:
-                msg = "Apply %d automatic fix(es)?\n\n" % len(todo)
-                msg += "\n".join("  - %s: %s" % (i.obj, i.fix_label) for i in todo[:12])
-                if len(todo) > 12:
-                    msg += "\n  ... and %d more" % (len(todo) - 12)
-                msg += "\n\nUndo with Ctrl+Z (one step) until you save."
-                if heavy:
-                    msg += "\nMesh rebuilds (Nanite / LODs) can take a while."
-                SB = QtWidgets.QMessageBox.StandardButton
-                btn = QtWidgets.QMessageBox.question(self, TOOL_NAME, msg, SB.Yes | SB.No, SB.Yes)
-                if btn != SB.Yes:
+            risky = [i for i in todo if i.impact != SAFE]
+            if risky or len(todo) > 1:
+                lines = []
+                for i in todo[:8]:
+                    lines.append("• <b>%s</b> – %s<br>&nbsp;&nbsp;&nbsp;<span style='color:%s'>%s</span>%s" % (
+                        esc(i.obj), esc(i.fix_label), IMPACT_COLORS[i.impact], IMPACT_LABELS[i.impact],
+                        (": " + esc(i.impact_note)) if i.impact_note else ""))
+                if len(todo) > 8:
+                    lines.append("… and %d more" % (len(todo) - 8))
+                head = ("Apply %d fix%s?" % (len(todo), "es" if len(todo) > 1 else ""))
+                if risky:
+                    head += "<br><span style='color:%s'>%d of them change how the level looks or behaves.</span>" % (
+                        IMPACT_COLORS[LOOK], len(risky))
+                if not self._confirm(TOOL_NAME, head, "<br>".join(lines) +
+                                     "<br><br>Check the result in the viewport. Revert puts the old values back.",
+                                     "Apply", warning=bool(risky)):
                     return
             fixed, failed = apply_fixes(todo, "World Perf Audit: Fix %d issue(s)" % len(todo))
-            for i in todo:
-                self._refresh_row(i)
-            self._apply_filter()
-            sel = self._selected_issues()
-            if sel:
-                self._show_detail(sel[0])
-            self.lbl_status.setText("Fixed %d, failed %d.%s Remember to Save Changes." % (
-                fixed, failed, " See Output Log for errors." if failed else ""))
+            self._after_change(todo)
+            self._set_status("Fixed %d, failed %d. Not saved yet – review, then Save (or Revert)." % (fixed, failed))
 
-        def on_fix_all(self):
-            self.fix_issues([i for i in self._visible_issues() if i.fixable], confirm=True)
+        def on_fix_safe(self):
+            self.fix_issues(self._safe_visible(), bulk=True)
 
-        def on_save(self):
-            save_changes()
+        def revert(self, issues):
+            issues = [i for i in issues if i.revertable]
+            if not issues:
+                return
+            done, errors = revert_issues(issues)
+            self._after_change(issues)
+            self._set_status("Reverted %d fix(es)%s." % (done, (", %d problem(s): see Output Log" % len(errors)) if errors else ""))
+
+        def _row_action(self, issue):
+            if issue.status == "fixed" and issue.revertable:
+                self.revert([issue])
+            else:
+                self.fix_issues([issue])
+
+        def on_revert_all(self):
+            pending = journal_entries()
+            if not pending:
+                return
+            names = "<br>".join("• %s – %s" % (esc(e.get("title")), esc(e.get("obj"))) for e in pending[:10])
+            if len(pending) > 10:
+                names += "<br>… and %d more" % (len(pending) - 10)
+            if not self._confirm(TOOL_NAME, "Revert all %d recorded fixes?" % len(pending),
+                                 names + "<br><br>Includes fixes from earlier sessions (Saved/PerfAudit/fix_journal.json).",
+                                 "Revert All", warning=True):
+                return
+            done, errors = revert_all()
+            self._after_change(self.issues)
+            self._set_status("Reverted %d fix(es)%s." % (done, (", %d problem(s): see Output Log" % len(errors)) if errors else ""))
+
+        def on_recover_old(self):
+            plan = recover_previous_fixes(apply=False)
+            if not plan:
+                self._confirm(TOOL_NAME, "No fixes from the previous version were found in Saved/Logs.", "", "OK")
+                return
+            doable = [p for p in plan if p[3] is not None]
+            manual = [p for p in plan if p[3] is None]
+            body = "<br>".join("• %s" % esc(p[2]) for p in doable[:14])
+            if len(doable) > 14:
+                body += "<br>… and %d more" % (len(doable) - 14)
+            if manual:
+                body += "<br><br><span style='color:#a1a1aa'>Not restorable automatically (%d): %s</span>" % (
+                    len(manual), esc(", ".join("%s (%s)" % (p[0], p[1]) for p in manual[:6])))
+            if not doable:
+                self._confirm(TOOL_NAME, "Nothing left to restore automatically.", body, "OK")
+                return
+            if not self._confirm(TOOL_NAME, "Restore %d value(s) changed by the previous version?" % len(doable),
+                                 body, "Restore", warning=True):
+                return
+            done, errors = recover_previous_fixes(apply=True)
+            self._set_status("Restored %d value(s)%s. Save to keep it." % (
+                done, (", %d failed: see Output Log" % len(errors)) if errors else ""))
 
         def on_export(self):
             if not self.issues:
-                self.lbl_status.setText("Nothing to export - scan first.")
+                self._set_status("Nothing to export – scan first.")
                 return
             path, _f = QtWidgets.QFileDialog.getSaveFileName(self, "Export report", default_report_path("html"),
                                                              "HTML report (*.html);;CSV (*.csv)")
@@ -2918,56 +3890,53 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             try:
                 export_report(path, self.issues)
             except Exception as e:
-                self.lbl_status.setText("Export failed: %s" % e)
+                self._set_status("Export failed: %s" % e)
                 return
-            self.lbl_status.setText("Report written: %s" % path)
+            self._set_status("Report written: %s" % path)
             if path.lower().endswith(".html"):
                 QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
 
-        def _on_selection(self):
-            sel = self._selected_issues()
-            if sel:
-                self._show_detail(sel[0])
+        # ================================================================ events
+        def _on_category(self):
+            items = self.sidebar.selectedItems()
+            if not items:
+                return
+            self._category = items[0].data(0, USER) or None
+            self._apply_filter()
 
-        def _on_double_click(self, item, _col):
-            v = item.data(0, USER_ROLE)
-            if v is not None:
-                for i in self.issues:
-                    if i.id == int(v):
-                        go_to(i)
-                        break
+        def _on_selection(self):
+            sel = self._selected()
+            self._show_detail(sel[0] if sel else None)
+
+        def _goto_item(self, item):
+            v = item.data(0, USER)
+            for i in self.issues:
+                if v is not None and i.id == int(v):
+                    go_to(i)
 
         def _context_menu(self, pos):
-            item = self.tree.itemAt(pos)
-            if item is None:
+            sel = self._selected()
+            if not sel:
                 return
             menu = QtWidgets.QMenu(self)
-            if item.data(0, USER_ROLE) is None:   # category header
-                cat = next((c for c, (top, _) in self._cat_items.items() if top is item), None)
-                if cat:
-                    items = [i for i in self._cat_items[cat][1] if i.fixable and not self._rows[i.id][0].isHidden()]
-                    a = menu.addAction("Fix all shown in '%s' (%d)" % (cat, len(items)))
-                    a.setEnabled(bool(items))
-                    a.triggered.connect(lambda *_: self.fix_issues(items, confirm=True))
-            else:
-                sel = self._selected_issues()
-                fixable = [i for i in sel if i.fixable]
-                a = menu.addAction("Fix selected (%d)" % len(fixable))
-                a.setEnabled(bool(fixable))
-                a.triggered.connect(lambda *_: self.fix_issues(fixable))
-                if sel:
-                    menu.addAction("Go To").triggered.connect(lambda *_: go_to(sel[0]))
-                    o = menu.addAction("Open asset editor")
-                    o.setEnabled(bool(sel[0].assets))
-                    o.triggered.connect(lambda *_: open_assets(sel[0]))
-                    menu.addAction("Copy details").triggered.connect(lambda *_: QtWidgets.QApplication.clipboard().setText(
-                        "\n\n".join("[%s] %s - %s (%s)\n%s\nSolution: %s" % (i.severity_name, i.title, i.obj, i.metric,
-                                                                              i.detail, i.solution) for i in sel)))
+            fixable = [i for i in sel if i.fixable]
+            revertable = [i for i in sel if i.revertable and i.status == "fixed"]
+            a = menu.addAction("Fix selected (%d)" % len(fixable))
+            a.setEnabled(bool(fixable))
+            a.triggered.connect(lambda *_: self.fix_issues(fixable))
+            r = menu.addAction("Revert selected (%d)" % len(revertable))
+            r.setEnabled(bool(revertable))
+            r.triggered.connect(lambda *_: self.revert(revertable))
             menu.addSeparator()
-            menu.addAction("Expand all").triggered.connect(lambda *_: self.tree.expandAll())
-            menu.addAction("Collapse all").triggered.connect(lambda *_: self.tree.collapseAll())
-            run = getattr(menu, "exec", None) or menu.exec_   # exec_ on older bindings
-            run(self.tree.viewport().mapToGlobal(pos))
+            menu.addAction("Go To").triggered.connect(lambda *_: go_to(sel[0]))
+            o = menu.addAction("Open asset editor")
+            o.setEnabled(bool(sel[0].assets))
+            o.triggered.connect(lambda *_: open_assets(sel[0]))
+            menu.addAction("Copy details").triggered.connect(lambda *_: QtWidgets.QApplication.clipboard().setText(
+                "\n\n".join("[%s] %s - %s (%s)\n%s\nSolution: %s\nFix: %s" % (
+                    i.severity_name, i.title, i.obj, i.metric, i.detail, i.solution,
+                    (i.fix_label + " [" + IMPACT_LABELS[i.impact] + "]") if i.fix else "manual") for i in sel)))
+            _qexec(menu, self.tree.viewport().mapToGlobal(pos))
 
         def closeEvent(self, event):
             _stop_qt_tick()
