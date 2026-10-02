@@ -833,7 +833,7 @@ class Issue(object):
 
     def __init__(self, check, category, severity, title, obj, detail, solution,
                  metric="", cost=None, targets=None, assets=None, fix=None, fix_label="",
-                 impact=LOOK, impact_note=""):
+                 impact=LOOK, impact_note="", children=None):
         Issue._counter += 1
         self.id = Issue._counter
         self.check = check
@@ -854,14 +854,20 @@ class Issue(object):
         self.status = "open"            # open | fixed | failed | reverted
         self.message = ""
         self.journal = None             # journal entry of the last fix (for Revert)
+        self.children = list(children or [])   # group issue: Fix applies these scan issues' fixes
 
     @property
     def fixable(self):
+        if self.children:
+            return any(c.fixable for c in self.children)
         return self.fix is not None and self.status != "fixed"
 
     @property
     def revertable(self):
+        if self.children:
+            return any(c.status == "fixed" and c.revertable for c in self.children)
         return _revertable(self.journal)
+
 
     @property
     def severity_name(self):
@@ -876,6 +882,10 @@ class Issue(object):
             ("fix impact", IMPACT_LABELS[self.impact] if self.fix else ""),
             ("status", self.status), ("message", self.message),
         ])
+
+
+def _group_fix(rec):
+    raise RuntimeError("group issue: apply_fixes() applies its children instead")
 
 
 _CHECKS = []
@@ -2660,8 +2670,14 @@ def scan(selected_only=False, check_keys=None):
 
 def apply_fixes(issues, title="World Perf Audit: Fix"):
     """Apply fixes inside one undo transaction. Every changed value is journaled so the fix can be
-    reverted later (even after saving). Returns (fixed, failed)."""
-    todo = [i for i in issues if i.fixable]
+    reverted later (even after saving). Group issues (GPU findings) apply their children. Returns (fixed, failed)."""
+    groups = [i for i in issues if i.children]
+    todo, seen = [], set()
+    for i in issues:
+        for x in (i.children if i.children else [i]):
+            if x.fixable and x.id not in seen:
+                seen.add(x.id)
+                todo.append(x)
     fixed = failed = 0
     if not todo:
         return 0, 0
@@ -2689,7 +2705,23 @@ def apply_fixes(issues, title="World Perf Audit: Fix"):
                         "level": _STATE.get("level", ""), "check": issue.check, "title": issue.title,
                         "obj": issue.obj, "impact": issue.impact, "changes": rec.changes, "reverted": False}
                     _journal_write(issue.journal)
+    _update_groups(groups)
     return fixed, failed
+
+
+def _update_groups(groups):
+    for g in groups:
+        done = [c for c in g.children if c.status == "fixed"]
+        failed = [c for c in g.children if c.status == "failed"]
+        if done and not any(c.fixable for c in g.children):
+            g.status, g.message = "fixed", "Applied %d related fix(es)" % len(done)
+        elif done:   # partly applied: keep it open so its Fix button applies the rest
+            g.status, g.message = "open", "Applied %d related fix(es), %d still open" % (
+                len(done), sum(1 for c in g.children if c.fixable))
+        elif failed:
+            g.status, g.message = "failed", "; ".join(c.message for c in failed[:3])
+        elif g.status == "fixed":
+            g.status, g.message = "reverted", "Reverted"
 
 
 def _revert_entries(entries, title="World Perf Audit: Revert"):
@@ -2713,12 +2745,15 @@ def _revert_entries(entries, title="World Perf Audit: Revert"):
 
 
 def revert_issues(issues):
-    """Revert the last fix of each issue. Returns (reverted_count, errors)."""
+    """Revert the last fix of each issue (group issues revert their children). Returns (reverted_count, errors)."""
+    groups = [i for i in issues if i.children]
+    issues = [x for i in issues for x in (i.children if i.children else [i])]
     done, errors = _revert_entries([i.journal for i in issues if i.revertable])
     for i in issues:
         if i.journal and i.journal.get("reverted") and i.status == "fixed":
             errs = i.journal.get("revert_errors") or []
             i.status, i.message = "reverted", ("Reverted" + (" (partly): " + "; ".join(errs) if errs else ""))
+    _update_groups(groups)
     return done, errors
 
 
@@ -2736,6 +2771,7 @@ def revert_all():
         if i.journal and i.journal.get("id") in ids and i.status == "fixed":
             i.journal["reverted"] = True
             i.status, i.message = "reverted", "Reverted"
+    _update_groups([i for i in _STATE["issues"] if i.children])
     return done, errors
 
 
@@ -3000,6 +3036,10 @@ def recover_previous_fixes(apply=False):
 
 def go_to(issue):
     """Select + frame the actors involved, and/or show the assets in the Content Browser."""
+    if issue.children:   # GPU finding: everything its related fixes touch
+        issue = Issue("goto", "", INFO, "", "", "", "", targets=[t for c in issue.children for t in c.targets],
+                      assets=[a for c in issue.children for a in c.assets])
+        Issue._counter -= 1
     actors = []
     for t in issue.targets:
         try:
@@ -3032,6 +3072,9 @@ def go_to_many(issues):
 
 
 def open_assets(issue):
+    if issue.children and not issue.assets:
+        issue = Issue("open", "", INFO, "", "", "", "", assets=[a for c in issue.children for a in c.assets])
+        Issue._counter -= 1
     if issue.assets:
         try:
             unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).open_editor_for_assets(issue.assets)
@@ -3141,57 +3184,76 @@ tr:hover td{background:#232323}.o{color:#8fb8ff}</style></head><body>
 # =============================================================================
 _PROFILE = {"handle": None, "busy": False}
 
-# (keywords in the GPU stat name, label, related scan category, why it costs, what to do)
+# (keywords in the GPU stat name, label, related scan category, why it costs, what to do,
+#  scan fixes that reduce it: [(check key, optional text the issue title/object must contain)])
 _GPU_PASS_RULES = [
     (("shadowdepth", "virtualshadow", "shadowprojection", "vsm", "shadow"), "Shadows", CAT_LIGHT,
      "Shadow map / Virtual Shadow Map rendering. Usual causes: many shadow-casting movable lights, big light "
      "radii, WPO or moving meshes invalidating VSM pages every frame, dense non-Nanite shadow casters.",
      "Look at the Lighting & Shadows and Meshes findings (shadowed lights, WPO Disable Distance, tiny shadow "
-     "casters). Debug with 'r.Shadow.Virtual.Visualize' / 'stat shadowrendering'."),
+     "casters). Debug with 'r.Shadow.Virtual.Visualize' / 'stat shadowrendering'.",
+     [("light_radius",), ("light_max_draw_distance",), ("light_cascades",), ("mesh_wpo_distance",), ("mesh_tiny_shadows",), ("mesh_high_poly",)]),
     (("lumen", "diffuseindirect", "radiancecache", "screenprobe"), "Lumen GI & reflections", CAT_POST,
      "Lumen cost scales with resolution and the Lumen quality settings in post-process volumes / scalability.",
      "Check the Post Process findings (Final Gather / Reflection quality overrides), lower 'Lumen Scene Detail', "
-     "use 'r.Lumen.Visualize' and 'stat lumen' to see which part is heavy."),
+     "use 'r.Lumen.Visualize' and 'stat lumen' to see which part is heavy.",
+     [("pp_expensive_settings", "Lumen")]),
     (("translucen", "distortion"), "Translucency / FX overdraw", CAT_VFX,
      "Every overlapping translucent pixel is shaded again: big particle cards, many layers, lit or expensive "
      "particle materials.",
      "Look at the Niagara / VFX and Materials findings. View Mode > Optimization > Quad Overdraw / Shader "
-     "Complexity on your FX; fewer/smaller cards, cheaper unlit materials, particle LOD by distance."),
+     "Complexity on your FX; fewer/smaller cards, cheaper unlit materials, particle LOD by distance.",
+     [("pp_expensive_settings", "translucency")]),
     (("basepass", "prepass", "nanite", "visbuffer", "depthpass"), "Geometry & materials (base pass)", CAT_MESH,
      "Rasterising and shading the opaque scene: dense non-Nanite meshes, many draw calls, expensive materials.",
      "Look at the Meshes & Geometry and Materials findings (Nanite, LODs, cull distances, instruction counts). "
-     "Use 'stat nanite' and View Mode > Shader Complexity."),
+     "Use 'stat nanite' and View Mode > Shader Complexity.",
+     [("mesh_high_poly",), ("mesh_missing_lods",), ("mesh_cull_distance",), ("mesh_ism_cull",), ("mesh_stacked_duplicates",)]),
     (("volumetricfog", "heightfog", "fog"), "Fog / volumetric fog", CAT_LIGHT,
      "Volumetric fog grid plus every light that injects into it (shadowed point/spot lights are the expensive ones).",
      "Disable 'Cast Volumetric Shadow' on secondary lights (Lighting findings), keep r.VolumetricFog.GridPixelSize "
-     "at 8+ and GridSizeZ at 64."),
+     "at 8+ and GridSizeZ at 64.",
+     [("light_volumetric_shadow",)]),
     (("cloud", "skyatmosphere"), "Sky & clouds", CAT_SCENE,
      "Volumetric clouds / sky atmosphere ray marching.",
-     "Lower cloud 'View Sample Count Scale' / shadow samples, or use r.VolumetricCloud.* scalability."),
+     "Lower cloud 'View Sample Count Scale' / shadow samples, or use r.VolumetricCloud.* scalability.",
+     [("skylight_realtime",)]),
     (("lights", "directlighting", "lightcomposition", "clustered", "deferredlight", "lighting"), "Direct lighting",
      CAT_LIGHT, "Deferred lighting of every pixel touched by each light's radius.",
      "Fewer/smaller local lights, Max Draw Distance on lights (Lighting findings), consider MegaLights for "
-     "light-heavy scenes."),
+     "light-heavy scenes.",
+     [("light_radius",), ("light_max_draw_distance",)]),
     (("postprocess", "bloom", "depthoffield", "dof", "motionblur", "tonemap", "tsr", "temporal", "upscal"),
      "Post processing / TSR", CAT_POST,
      "Full-screen passes at output resolution: TSR, DOF, motion blur, bloom (FFT is expensive), post materials.",
      "Check the Post Process findings (FFT bloom, post materials); lower screen percentage or TSR quality "
-     "('r.TSR.*'), cinematic DOF only where needed."),
+     "('r.TSR.*'), cinematic DOF only where needed.",
+     [("pp_expensive_settings", "bloom")]),
     (("niagara", "particle", "fxsystem", "gpusim"), "Niagara GPU simulation", CAT_VFX,
      "GPU particle simulation and sorting.",
-     "Cap particle counts, use Effect Types with distance culling (VFX findings), avoid sorting when not needed."),
+     "Cap particle counts, use Effect Types with distance culling (VFX findings), avoid sorting when not needed.",
+     []),
     (("scenecapture", "planar", "reflectioncapture"), "Scene captures / planar reflections", CAT_POST,
      "The scene is rendered again for a capture or mirror.",
-     "Turn off Capture Every Frame, lower capture resolution, prefer Lumen/SSR over planar reflections."),
+     "Turn off Capture Every Frame, lower capture resolution, prefer Lumen/SSR over planar reflections.",
+     [("scene_capture",)]),
     (("ssr", "screenspacereflection", "ssao", "ambientocclusion", "hzb"), "Screen-space effects", CAT_POST,
-     "SSR / SSAO / HZB passes.", "Lower their quality in the post-process volume or scalability settings."),
+     "SSR / SSAO / HZB passes.", "Lower their quality in the post-process volume or scalability settings.",
+     [("pp_expensive_settings", "SSR")]),
     (("raytrac", "rtgi", "rtao"), "Ray tracing", CAT_POST,
-     "Hardware ray-traced effects.", "Disable RT effects you don't need (post-process / project settings)."),
+     "Hardware ray-traced effects.", "Disable RT effects you don't need (post-process / project settings).",
+     [("pp_expensive_settings", "Ray-traced"), ("pp_expensive_settings", "Hit Lighting")]),
     (("hair", "groom"), "Hair / grooms", CAT_ANIM, "Strand-based hair rendering.",
-     "Use hair cards / LODs at distance."),
+     "Use hair cards / LODs at distance.",
+     []),
     (("skincache", "skin"), "Skinning", CAT_ANIM, "GPU skinning of skeletal meshes.",
-     "Skeletal mesh LODs, fewer bones on lower LODs (Animation findings)."),
+     "Skeletal mesh LODs, fewer bones on lower LODs (Animation findings).",
+     [("anim_skel_lods",), ("anim_uro",), ("anim_offscreen_tick",)]),
 ]
+
+
+_DRAWCALL_FIXES = [("mesh_stacked_duplicates",), ("mesh_cull_distance",), ("mesh_ism_cull",), ("mesh_tiny_shadows",),
+                   ("light_max_draw_distance",), ("mesh_high_poly",)]
 
 
 def _csv_dir():
@@ -3245,6 +3307,35 @@ def _mean(means, *names):
     return None
 
 
+def _related_fixes(scan_issues, spec):
+    """Open, auto-fixable scan issues matching [(check, title filter)]."""
+    out, seen = [], set()
+    for entry in spec:
+        check_key, needle = entry[0], (entry[1].lower() if len(entry) > 1 else None)
+        for i in scan_issues or []:
+            if i.category == CAT_GPU or i.children or i.check != check_key or i.id in seen:
+                continue
+            if not i.fixable or (needle and needle not in (i.title + " " + i.obj).lower()):
+                continue
+            seen.add(i.id)
+            out.append(i)
+    return out
+
+
+def _group_kwargs(children, what):
+    """fix/label/impact for a GPU finding that applies its related scan fixes."""
+    if not children:
+        return {}
+    impact = GAMEPLAY if any(c.impact == GAMEPLAY for c in children) else (
+        LOOK if any(c.impact == LOOK for c in children) else SAFE)
+    lines = ["\u2022 %s \u2013 %s [%s]" % (c.obj, c.fix_label, IMPACT_SHORT[c.impact]) for c in children[:10]]
+    if len(children) > 10:
+        lines.append("\u2026 and %d more" % (len(children) - 10))
+    return {"fix": _group_fix, "children": children, "impact": impact,
+            "fix_label": "Apply the %d related scan fix(es) that reduce %s" % (len(children), what),
+            "impact_note": "Applies (each one can be reverted):\n" + "\n".join(lines)}
+
+
 def gpu_profile_issues(result, scan_issues=None):
     """Turn an analysed CSV profile into issues (category 'GPU Profile (measured)')."""
     means = result["means"]
@@ -3270,6 +3361,9 @@ def gpu_profile_issues(result, scan_issues=None):
                               "casters. Instancing, Nanite, cull distances and fewer shadowed lights help "
                               "(Meshes & Lighting findings)."),
         }[bound]
+        frame_spec = {"Game thread": [("anim_offscreen_tick",), ("anim_uro",), ("mesh_overlap_events",)],
+                      "Render thread": _DRAWCALL_FIXES}.get(bound, [])
+        frame_kw = _group_kwargs(_related_fixes(scan_issues, frame_spec), "the %s cost" % bound.lower()) if sev != INFO else {}
         out.append(Issue(
             "gpu_frame", CAT_GPU, sev, "%s-bound: %.1f ms per frame" % (bound, frame),
             "Frame (%.0f fps, target %d)" % (1000.0 / frame, CONFIG["target_fps"]),
@@ -3278,7 +3372,7 @@ def gpu_profile_issues(result, scan_issues=None):
                     "Standalone game for final numbers." % (
                         src, frame, ("%.2f ms" % gt) if gt else "n/a", ("%.2f ms" % rt) if rt else "n/a",
                         ("%.2f ms" % gpu) if gpu else "n/a", budget, CONFIG["target_fps"])),
-            solution=advice, metric="%.1f ms" % frame, cost=_score(sev, min(1.0, ratio - 1.0))))
+            solution=advice, metric="%.1f ms" % frame, cost=_score(sev, min(1.0, ratio - 1.0)), **frame_kw))
 
     passes = [(k, v) for k, v in means.items() if k.lower().startswith("gpu/") and
               k.lower() not in ("gpu/total", "gpu/unaccounted") and v > 0]
@@ -3290,14 +3384,18 @@ def gpu_profile_issues(result, scan_issues=None):
         sev = HIGH if share >= 0.25 else (MEDIUM if share >= 0.12 else LOW)
         short = name.split("/", 1)[1]
         rule = next((r for r in _GPU_PASS_RULES if any(k in short.lower() for k in r[0])), None)
-        label, cat, why, todo = (rule[1], rule[2], rule[3], rule[4]) if rule else (
-            short, None, "GPU pass '%s'." % short, "Run 'ProfileGPU' (Ctrl+Shift+,) and expand this pass to see what's inside.")
+        label, cat, why, todo, spec = (rule[1], rule[2], rule[3], rule[4], rule[5]) if rule else (
+            short, None, "GPU pass '%s'." % short, "Run 'ProfileGPU' (Ctrl+Shift+,) and expand this pass to see what's inside.", [])
+        children = _related_fixes(scan_issues, spec)
         if cat and related.get(cat):
             todo += "\n\nThe scene scan found %d open issue(s) in '%s' - start there." % (related[cat], cat)
+        if spec and not children and not any(i.category != CAT_GPU for i in (scan_issues or [])):
+            todo += "\n\nScan the level, then profile again to get a Fix button for this."
         out.append(Issue(
             "gpu_pass", CAT_GPU, sev, "%s: %.2f ms" % (label, ms), "GPU pass %s" % short,
             detail="%s\n%.2f ms on average = %.0f%% of the %.1f ms frame budget (%s)." % (why, ms, share * 100, budget, src),
-            solution=todo, metric="%.2f ms" % ms, cost=_score(sev, min(1.0, share))))
+            solution=todo, metric="%.2f ms" % ms, cost=_score(sev, min(1.0, share)),
+            **_group_kwargs(children, label.lower())))
 
     draws = _mean(means, "RHI/DrawCalls")
     if draws and draws > CONFIG["draw_calls_warn"]:
@@ -3308,14 +3406,17 @@ def gpu_profile_issues(result, scan_issues=None):
                    "render-thread bottleneck." % (draws, src),
             solution=("Merge/instance repeated props (Meshes findings: instancing candidates), enable Nanite, add cull "
                       "distances, reduce dynamic shadow casters and material slots per mesh."),
-            metric="%s draws" % _fmt_count(draws), cost=_score(sev, min(1.0, draws / (CONFIG["draw_calls_warn"] * 4.0)))))
+            metric="%s draws" % _fmt_count(draws), cost=_score(sev, min(1.0, draws / (CONFIG["draw_calls_warn"] * 4.0))),
+            **_group_kwargs(_related_fixes(scan_issues, _DRAWCALL_FIXES), "draw calls")))
     prims = _mean(means, "RHI/PrimitivesDrawn")
     if prims and prims > CONFIG["primitives_warn"]:
         out.append(Issue(
             "gpu_prims", CAT_GPU, MEDIUM, "%s triangles drawn per frame (non-Nanite)" % _fmt_count(prims), "RHI",
             detail="%s primitives rasterised per frame by the classic (non-Nanite) path (%s)." % (_fmt_count(prims), src),
             solution="Enable Nanite or add LODs on the dense meshes (Meshes findings: high-poly without Nanite).",
-            metric=_fmt_count(prims), cost=_score(MEDIUM, 0.5)))
+            metric=_fmt_count(prims), cost=_score(MEDIUM, 0.5),
+            **_group_kwargs(_related_fixes(scan_issues, [("mesh_high_poly",), ("mesh_missing_lods",), ("mesh_cull_distance",)]),
+                            "the triangle count")))
     if not passes:
         out.append(Issue(
             "gpu_nopasses", CAT_GPU, INFO, "No per-pass GPU timings in the capture", os.path.basename(result["path"]),
@@ -4109,7 +4210,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             vals = {
                 "critical": n(lambda i: i.severity == CRITICAL), "high": n(lambda i: i.severity == HIGH),
                 "medium": n(lambda i: i.severity == MEDIUM), "low": n(lambda i: i.severity <= LOW),
-                "safe": n(lambda i: i.fixable and i.impact == SAFE), "visual": n(lambda i: i.fixable and i.impact != SAFE),
+                "safe": n(lambda i: i.fixable and i.impact == SAFE and not i.children),
+                "visual": n(lambda i: i.fixable and i.impact != SAFE and not i.children),
                 "fixed": sum(1 for i in self.issues if i.status == "fixed"),
             }
             for k, v in vals.items():
@@ -4152,8 +4254,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.d_revert.setText("Revert")
             self.d_fix.setEnabled(issue.fixable)
             self.d_revert.setEnabled(issue.revertable and issue.status == "fixed")
-            self.d_goto.setEnabled(bool(issue.targets or issue.assets))
-            self.d_open.setEnabled(bool(issue.assets))
+            self.d_goto.setEnabled(bool(issue.targets or issue.assets or issue.children))
+            self.d_open.setEnabled(bool(issue.assets or any(c.assets for c in issue.children)))
             sev_c = _SEV_PILL[issue.severity]
 
             def badge(text, color):
@@ -4220,7 +4322,15 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.lbl_status.setText(text)
 
         def _after_change(self, issues):
+            touched = {}
             for i in issues:
+                for x in [i] + list(i.children):
+                    touched[x.id] = x
+            for g in self.issues:            # a scan fix can complete a GPU finding's group too
+                if g.children and any(c.id in touched for c in g.children):
+                    _update_groups([g])
+                    touched[g.id] = g
+            for i in touched.values():
                 self._refresh_row(i)
             self._apply_filter()
             self._on_selection()
