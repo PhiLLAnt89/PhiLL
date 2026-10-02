@@ -1,0 +1,677 @@
+"""Minimal fake of the Unreal Python API used by the tests (not a real engine binding)."""
+import os
+import tempfile
+
+_LOG = []
+SET_CALLS = []
+
+
+def log(m): _LOG.append(("log", m)); print("LOG:", m[:200])
+def log_warning(m): _LOG.append(("warn", m)); print("WARN:", m[:2000])
+def log_error(m): _LOG.append(("err", m)); print("ERR:", m)
+
+
+# ---------------------------------------------------------------- enums
+class _EnumVal(object):
+    def __init__(self, cls, name, value):
+        self._cls, self.name, self.value = cls, name, value
+
+    def __repr__(self):
+        return "<%s.%s: %d>" % (self._cls, self.name, self.value)
+
+    def __eq__(self, o):
+        return isinstance(o, _EnumVal) and o._cls == self._cls and o.name == self.name
+
+    def __hash__(self):
+        return hash((self._cls, self.name))
+
+
+def _enum(name, *members):
+    cls = type(name, (_EnumVal,), {})
+    for i, m in enumerate(members):
+        setattr(cls, m, cls(name, m, i))
+    return cls
+
+
+BlendMode = _enum("BlendMode", "BLEND_OPAQUE", "BLEND_MASKED", "BLEND_TRANSLUCENT", "BLEND_ADDITIVE")
+ComponentMobility = _enum("ComponentMobility", "STATIC", "STATIONARY", "MOVABLE")
+NiagaraRendererMotionVectorSetting = _enum("NiagaraRendererMotionVectorSetting", "AUTO_DETECT", "PRECISE", "APPROXIMATE", "DISABLE")
+MaterialProperty = _enum("MaterialProperty", "MP_WORLD_POSITION_OFFSET", "MP_BASE_COLOR")
+TranslucencyLightingMode = _enum("TranslucencyLightingMode", "TLM_VOLUMETRIC_NON_DIRECTIONAL", "TLM_VOLUMETRIC_PER_VERTEX_DIRECTIONAL", "TLM_SURFACE_PER_PIXEL_LIGHTING")
+MaterialShadingModel = _enum("MaterialShadingModel", "MSM_UNLIT", "MSM_DEFAULT_LIT")
+TextureMipGenSettings = _enum("TextureMipGenSettings", "TMGS_FROM_TEXTURE_GROUP", "TMGS_NO_MIPMAPS")
+TextureCompressionSettings = _enum("TextureCompressionSettings", "TC_DEFAULT", "TC_HDR", "TC_HDR_COMPRESSED", "TC_VECTOR_DISPLACEMENTMAP")
+TextureGroup = _enum("TextureGroup", "TEXTUREGROUP_WORLD", "TEXTUREGROUP_UI")
+TexturePowerOfTwoSetting = _enum("TexturePowerOfTwoSetting", "NONE", "PAD_TO_POWER_OF_TWO", "STRETCH_TO_POWER_OF_TWO")
+CollisionTraceFlag = _enum("CollisionTraceFlag", "CTF_USE_DEFAULT", "CTF_USE_SIMPLE_AS_COMPLEX", "CTF_USE_COMPLEX_AS_SIMPLE")
+CollisionEnabled = _enum("CollisionEnabled", "NO_COLLISION", "QUERY_AND_PHYSICS")
+VisibilityBasedAnimTickOption = _enum("VisibilityBasedAnimTickOption", "ALWAYS_TICK_POSE_AND_REFRESH_BONES", "ALWAYS_TICK_POSE", "ONLY_TICK_MONTAGES_WHEN_NOT_RENDERED", "ONLY_TICK_POSE_WHEN_RENDERED")
+BloomMethod = _enum("BloomMethod", "BM_SOG", "BM_FFT")
+AppMsgType = _enum("AppMsgType", "OK", "YES_NO", "YES_NO_CANCEL")
+AppReturnType = _enum("AppReturnType", "NO", "YES", "CANCEL")
+
+
+class PropertyAccessChangeNotifyMode:
+    DEFAULT, NEVER, ALWAYS = 0, 1, 2
+
+
+# ---------------------------------------------------------------- objects
+_ALL = []
+
+
+class Vector(object):
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x, self.y, self.z = x, y, z
+
+
+class Rotator(object):
+    def __init__(self, pitch=0.0, yaw=0.0, roll=0.0):
+        self.pitch, self.yaw, self.roll = pitch, yaw, roll
+
+
+class _Class(object):
+    def __init__(self, n): self.n = n
+    def get_name(self): return self.n
+
+
+class _Struct(object):
+    _defaults = {}
+
+    def __init__(self, **kw):
+        self._p = dict(self._defaults)
+        self._p.update(kw)
+
+    def get_editor_property(self, n):
+        if n not in self._p:
+            raise AttributeError(n)
+        return self._p[n]
+
+    def set_editor_property(self, n, v, mode=None):
+        self._p[n] = v
+
+    def __getattr__(self, n):
+        if n.startswith("_"):
+            raise AttributeError(n)
+        return self.get_editor_property(n)
+
+
+class Object(object):
+    _defaults = {}
+
+    def __init__(self, name="Obj", outer=None, path=None, **props):
+        self._name, self._outer, self._path = name, outer, path
+        self._p = {}
+        for klass in reversed(type(self).__mro__):
+            self._p.update(getattr(klass, "_defaults", {}))
+        self._p.update(props)
+        self.modified = 0
+        _ALL.append(self)
+
+    def get_name(self): return self._name
+    def get_fname(self): return self._name
+    def get_class(self): return _Class(type(self).__name__)
+    def get_outer(self): return self._outer
+
+    def get_outermost(self):
+        o = self
+        while o._outer is not None:
+            o = o._outer
+        return _Package(o._path or ("/Game/Mock/" + o._name))
+
+    def get_path_name(self):
+        if self._outer is not None:
+            return self._outer.get_path_name() + ":" + self._name
+        return (self._path or ("/Game/Mock/" + self._name)) + "." + self._name
+
+    def modify(self, always_mark_dirty=True): self.modified += 1
+
+    def get_typed_outer(self, cls):
+        o = self._outer
+        while o is not None and not isinstance(o, cls):
+            o = o._outer
+        return o
+
+    def get_editor_property(self, n):
+        if n not in self._p:
+            raise Exception("no property %s on %s" % (n, type(self).__name__))
+        return self._p[n]
+
+    def set_editor_property(self, n, v, mode=None):
+        if n not in self._p:
+            raise Exception("no property %s on %s" % (n, type(self).__name__))
+        SET_CALLS.append((self._name, n, v))
+        self._p[n] = v
+
+
+def _obj_getattr(self, n):
+    if n.startswith("_"):
+        raise AttributeError(n)
+    p = self.__dict__.get("_p", {})
+    if n in p:
+        return p[n]
+    raise AttributeError(n)
+
+
+Object.__getattr__ = _obj_getattr
+
+
+class _Package(object):
+    def __init__(self, n): self.n = n
+    def get_name(self): return self.n
+
+
+class Actor(Object):
+    _defaults = {"hidden": False}
+
+    def __init__(self, label="Actor", loc=None, rot=None, scale=None, **kw):
+        Object.__init__(self, label, **kw)
+        self.label = label
+        self.comps = []
+        self.loc, self.rot, self.scale = loc or Vector(), rot or Rotator(), scale or Vector(1, 1, 1)
+
+    def add(self, comp):
+        comp._owner = self
+        comp._outer = self
+        self.comps.append(comp)
+        return comp
+
+    def get_actor_label(self): return self.label
+    def get_components_by_class(self, cls): return [c for c in self.comps if isinstance(c, cls)]
+    def get_actor_location(self): return self.loc
+    def get_actor_rotation(self): return self.rot
+    def get_actor_scale3d(self): return self.scale
+
+
+class Pawn(Actor): pass
+class CullDistanceVolume(Actor): pass
+
+
+class ActorComponent(Object):
+    _defaults = {"hidden_in_game": False, "mobility": ComponentMobility.MOVABLE}
+    _owner = None
+    radius = 100.0
+    loc = Vector()
+
+    def get_owner(self): return self._owner
+    def is_visible(self): return True
+    def get_world_location(self): return self.loc
+    def get_attach_parent(self): return None
+    def set_mobility(self, m): self.set_editor_property("mobility", m)
+
+
+class SceneComponent(ActorComponent): pass
+
+
+class PrimitiveComponent(SceneComponent):
+    _defaults = {"cast_shadow": True, "ld_max_draw_distance": 0.0}
+    mats = ()
+    overlap = False
+    def get_num_materials(self): return len(self.mats)
+    def get_material(self, i): return self.mats[i]
+    def set_cast_shadow(self, b): self.set_editor_property("cast_shadow", b)
+    def set_cull_distance(self, d): self.set_editor_property("ld_max_draw_distance", d)
+    def is_simulating_physics(self): return False
+    def get_generate_overlap_events(self): return self.overlap
+    def set_generate_overlap_events(self, b): self.overlap = b
+    def get_collision_enabled(self): return CollisionEnabled.QUERY_AND_PHYSICS
+
+
+class MeshComponent(PrimitiveComponent): pass
+
+
+class StaticMeshComponent(MeshComponent):
+    _defaults = {"static_mesh": None, "evaluate_world_position_offset": True,
+                 "world_position_offset_disable_distance": 0}
+    def set_world_position_offset_disable_distance(self, d):
+        self.set_editor_property("world_position_offset_disable_distance", d)
+
+
+class InstancedStaticMeshComponent(StaticMeshComponent):
+    _defaults = {"instance_end_cull_distance": 0, "instance_start_cull_distance": 0}
+    count = 0
+    def get_instance_count(self): return self.count
+    def set_cull_distances(self, s, e):
+        self.set_editor_property("instance_start_cull_distance", s)
+        self.set_editor_property("instance_end_cull_distance", e)
+
+
+class HierarchicalInstancedStaticMeshComponent(InstancedStaticMeshComponent): pass
+class FoliageInstancedStaticMeshComponent(HierarchicalInstancedStaticMeshComponent): pass
+
+
+class SkinnedMeshComponent(MeshComponent): pass
+
+
+class SkeletalMeshComponent(SkinnedMeshComponent):
+    _defaults = {"visibility_based_anim_tick_option": VisibilityBasedAnimTickOption.ALWAYS_TICK_POSE,
+                 "enable_update_rate_optimizations": True, "skeletal_mesh_asset": None}
+    def get_skeletal_mesh_asset(self): return self.get_editor_property("skeletal_mesh_asset")
+
+
+class LightComponentBase(SceneComponent):
+    _defaults = {"cast_shadows": True, "affects_world": True, "intensity": 5000.0, "cast_volumetric_shadow": False,
+                 "volumetric_scattering_intensity": 1.0, "light_function_material": None, "contact_shadow_length": 0.0, "max_draw_distance": 0.0,
+                 "max_distance_fade_range": 0.0}
+
+
+class LightComponent(LightComponentBase): pass
+
+
+class LocalLightComponent(LightComponent):
+    _defaults = {"attenuation_radius": 1000.0}
+    def set_attenuation_radius(self, r): self.set_editor_property("attenuation_radius", r)
+
+
+class PointLightComponent(LocalLightComponent): pass
+
+
+class DirectionalLightComponent(LightComponent):
+    _defaults = {"dynamic_shadow_cascades": 3}
+
+
+class SkyLightComponent(LightComponentBase):
+    _defaults = {"real_time_capture": False}
+    def recapture_sky(self): pass
+
+
+class ExponentialHeightFogComponent(SceneComponent):
+    _defaults = {"enable_volumetric_fog": False}
+
+
+class SkyAtmosphereComponent(SceneComponent): pass
+class VolumetricCloudComponent(SceneComponent): pass
+
+
+class DecalComponent(PrimitiveComponent):
+    _defaults = {"fade_screen_size": 0.01, "decal_material": None}
+
+
+class SceneCaptureComponent(SceneComponent):
+    _defaults = {"capture_every_frame": True}
+
+
+class SceneCaptureComponent2D(SceneCaptureComponent): pass
+class PlanarReflectionComponent(SceneCaptureComponent): pass
+
+
+class ParticleSystemComponent(PrimitiveComponent):
+    _defaults = {"template": None}
+
+
+class NiagaraComponent(PrimitiveComponent):
+    _defaults = {"asset": None}
+    reinit = 0
+    def get_asset(self): return self.get_editor_property("asset")
+    def reinitialize_system(self): self.reinit += 1
+
+
+class StaticMeshActor(Actor):
+    def __init__(self, label, mesh, **kw):
+        Actor.__init__(self, label, **kw)
+        self.add(StaticMeshComponent("StaticMeshComponent0", static_mesh=mesh, mobility=ComponentMobility.STATIC))
+        self._p["static_mesh_component"] = self.comps[0]
+
+
+class PostProcessVolume(Actor):
+    _defaults = {"enabled": True, "unbound": True, "settings": None}
+
+
+# assets
+class MaterialInterface(Object):
+    def get_base_material(self): return self
+
+
+class Material(MaterialInterface):
+    _defaults = {"blend_mode": BlendMode.BLEND_OPAQUE, "output_translucent_velocity": False,
+                 "translucency_lighting_mode": TranslucencyLightingMode.TLM_VOLUMETRIC_NON_DIRECTIONAL,
+                 "shading_model": MaterialShadingModel.MSM_DEFAULT_LIT}
+    wpo = False
+    ps = 150
+    textures = ()
+
+
+class MaterialInstance(MaterialInterface):
+    _defaults = {"base_property_overrides": None}
+    parent = None
+    def get_base_material(self): return self.parent
+
+
+class MaterialInstanceConstant(MaterialInstance): pass
+
+
+class StaticMesh(Object):
+    _defaults = {"static_materials": [], "body_setup": None}
+    tris = 1000
+    lods = 1
+    def get_num_triangles(self, lod): return self.tris
+    def get_num_lods(self): return self.lods
+
+
+class SkeletalMesh(Object):
+    lods = 1
+    verts = 1000
+    def get_lod_num(self): return self.lods
+
+
+class Texture(Object): pass
+
+
+class Texture2D(Texture):
+    _defaults = {"never_stream": False, "mip_gen_settings": TextureMipGenSettings.TMGS_FROM_TEXTURE_GROUP,
+                 "compression_settings": TextureCompressionSettings.TC_DEFAULT,
+                 "lod_group": TextureGroup.TEXTUREGROUP_WORLD, "max_texture_size": 0,
+                 "virtual_texture_streaming": False, "power_of_two_mode": TexturePowerOfTwoSetting.NONE}
+    w = h = 1024
+    def blueprint_get_size_x(self): return self.w
+    def blueprint_get_size_y(self): return self.h
+
+
+class NiagaraSystem(Object):
+    _defaults = {"effect_type": None}
+
+
+class NiagaraEmitter(Object): pass
+
+
+class NiagaraRendererProperties(Object):
+    _defaults = {"motion_vector_setting": NiagaraRendererMotionVectorSetting.AUTO_DETECT}
+
+
+class NiagaraSpriteRendererProperties(NiagaraRendererProperties):
+    _defaults = {"material": None}
+
+
+class NiagaraMeshRendererProperties(NiagaraRendererProperties):
+    _defaults = {"meshes": [], "override_materials": False}
+
+
+class NiagaraRibbonRendererProperties(NiagaraRendererProperties):
+    _defaults = {"material": None}
+
+
+class NiagaraLightRendererProperties(NiagaraRendererProperties): pass
+
+
+class FoliageType_InstancedStaticMesh(Object):
+    _defaults = {"mesh": None, "cull_distance": None}
+
+
+# structs
+class MeshNaniteSettings(_Struct):
+    _defaults = {"enabled": False}
+
+
+class StaticMaterial(_Struct): pass
+class BodySetup(Object):
+    _defaults = {"collision_trace_flag": CollisionTraceFlag.CTF_USE_DEFAULT}
+
+
+class NiagaraMeshRendererMeshProperties(_Struct): pass
+
+
+class PostProcessSettings(_Struct):
+    _defaults = {"override_lumen_final_gather_quality": False, "lumen_final_gather_quality": 1.0,
+                 "override_bloom_method": False, "bloom_method": BloomMethod.BM_SOG,
+                 "weighted_blendables": None}
+
+
+class WeightedBlendables(_Struct): pass
+class WeightedBlendable(_Struct): pass
+class Int32Interval(_Struct): pass
+class StaticMeshReductionOptions(_Struct): pass
+class StaticMeshReductionSettings(_Struct): pass
+
+
+class MaterialStatistics(_Struct): pass
+
+
+# ---------------------------------------------------------------- libraries
+class SystemLibrary(object):
+    CVARS = {"r.Velocity.EnableVertexDeformation": 0, "r.VelocityOutputPass": 1, "r.Nanite.ProjectEnabled": 1,
+             "r.Shadow.Virtual.Enable": 1, "r.AllowStaticLighting": 1}
+    commands = []
+
+    @staticmethod
+    def get_console_variable_int_value(n): return int(SystemLibrary.CVARS.get(n, 0))
+
+    @staticmethod
+    def get_console_variable_float_value(n): return float(SystemLibrary.CVARS.get(n, 0))
+
+    @staticmethod
+    def get_component_bounds(c): return (Vector(), Vector(), c.radius)
+
+    CSV_TEXT = None
+
+    @staticmethod
+    def execute_console_command(w, cmd):
+        SystemLibrary.commands.append(cmd)
+        parts = cmd.split()
+        if len(parts) == 2 and parts[0].lower().startswith("r."):
+            try:
+                SystemLibrary.CVARS[parts[0]] = float(parts[1])
+            except ValueError:
+                pass
+        if cmd.lower().startswith("csvprofile") and SystemLibrary.CSV_TEXT:
+            d = os.path.join(_TMP, "Saved", "Profiling", "CSV")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "Profile(20261002_153000).csv"), "w") as f:
+                f.write(SystemLibrary.CSV_TEXT)
+
+
+class MaterialEditingLibrary(object):
+    recompiled = []
+
+    @staticmethod
+    def get_material_property_input_node(m, prop): return object() if m.wpo else None
+
+    @staticmethod
+    def recompile_material(m): MaterialEditingLibrary.recompiled.append(m.get_name())
+
+    @staticmethod
+    def get_statistics(m):
+        b = m.get_base_material()
+        return MaterialStatistics(num_pixel_shader_instructions=b.ps, num_samplers=4)
+
+
+class EditorAssetLibrary(object):
+    synced = []
+    @staticmethod
+    def sync_browser_to_objects(p): EditorAssetLibrary.synced.append(p)
+
+
+class _AD(object):
+    def __init__(self, obj):
+        self.obj = obj
+        self.asset_class_path = _Struct(asset_name=type(obj).__name__)
+    def get_asset(self): return self.obj
+
+
+class _AR(object):
+    def get_dependencies(self, pkg, opts):
+        for o in _ALL:
+            if isinstance(o, MaterialInterface) and o.get_outermost().get_name() == pkg:
+                deps = [t.get_outermost().get_name() for t in getattr(o, "textures", ())]
+                if isinstance(o, MaterialInstance) and o.parent:
+                    deps.append(o.parent.get_outermost().get_name())
+                return deps
+        return []
+
+    def get_assets_by_path(self, path, recursive=False):
+        out = []
+        for o in _ALL:
+            if o._outer is None and not isinstance(o, (Actor, ActorComponent)) and o.get_outermost().get_name().startswith(path + "/"):
+                ad = _AD(o)
+                ad.asset_name = o.get_name()
+                out.append(ad)
+        return out
+
+    def get_assets_by_package_name(self, pkg):
+        return [_AD(o) for o in _ALL if o._outer is None and isinstance(o, (Texture, MaterialInterface))
+                and o.get_outermost().get_name() == pkg]
+
+
+class AssetRegistryHelpers(object):
+    @staticmethod
+    def get_asset_registry(): return _AR()
+
+
+class AssetRegistryDependencyOptions(_Struct): pass
+
+
+class ScopedSlowTask(object):
+    def __init__(self, total, msg=""): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def make_dialog(self, b=False): pass
+    def enter_progress_frame(self, n=1, msg=""): pass
+    def should_cancel(self): return False
+
+
+class ScopedEditorTransaction(ScopedSlowTask):
+    def __init__(self, msg): pass
+
+
+class EditorActorSubsystem(object):
+    actors = []
+    selected = []
+    destroyed = []
+    def get_all_level_actors(self): return list(self.actors)
+    def get_selected_level_actors(self): return list(self.selected)
+    def set_selected_level_actors(self, a): EditorActorSubsystem.selected = list(a)
+    def destroy_actors(self, a):
+        EditorActorSubsystem.destroyed += a
+        for x in a:
+            EditorActorSubsystem.actors.remove(x)
+        return True
+
+
+class _World(object):
+    def get_name(self): return "L_MockLevel"
+
+
+_THE_WORLD = _World()
+EXTRA_WORLD_ACTORS = []     # actors only the raw world iterator sees (Level Instance contents, spawnables)
+
+
+class UnrealEditorSubsystem(object):
+    def get_editor_world(self): return _THE_WORLD
+
+
+class GameplayStatics(object):
+    @staticmethod
+    def get_all_actors_of_class(world, cls):
+        return [a for a in EditorActorSubsystem.actors + EXTRA_WORLD_ACTORS if isinstance(a, cls)]
+
+
+class _Level(Object): pass
+
+
+LOADED_LEVELS = []
+
+
+class EditorLevelUtils(object):
+    @staticmethod
+    def get_levels(world): return list(LOADED_LEVELS)
+
+
+class LevelStreaming(Object):
+    loaded = None
+    def get_loaded_level(self): return self.loaded
+    def get_world_asset_package_name(self): return self._p.get("pkg", "")
+    def get_outer(self): return _THE_WORLD
+
+
+class StaticMeshEditorSubsystem(object):
+    def set_nanite_settings(self, mesh, ns, apply):
+        mesh._p["nanite_settings"] = MeshNaniteSettings(enabled=ns.enabled)
+
+    def remove_lods(self, mesh):
+        mesh.lods = 1
+        return True
+
+    def set_lods_with_notification(self, mesh, opts, apply):
+        mesh.lods = len(opts.reduction_settings)
+        return mesh.lods
+
+
+class SkeletalMeshEditorSubsystem(object):
+    def get_num_verts(self, skm, lod): return skm.verts
+    def get_lod_count(self, skm): return skm.lods
+    def regenerate_lod(self, skm, n, a, b):
+        skm.lods = n
+        return True
+
+
+class AssetEditorSubsystem(object):
+    def open_editor_for_assets(self, a): pass
+
+
+class EditorLoadingAndSavingUtils(object):
+    @staticmethod
+    def save_dirty_packages_with_dialog(a, b): return True
+
+
+_SUBS = {}
+
+
+def get_editor_subsystem(cls):
+    if cls not in _SUBS:
+        _SUBS[cls] = cls()
+    return _SUBS[cls]
+
+
+_TMP = tempfile.mkdtemp(prefix="mockproj_")
+os.makedirs(os.path.join(_TMP, "Config"))
+os.makedirs(os.path.join(_TMP, "Saved"))
+os.makedirs(os.path.join(_TMP, "Plugins"))
+with open(os.path.join(_TMP, "Config", "DefaultEngine.ini"), "w") as f:
+    f.write("[/Script/EngineSettings.GameMapsSettings]\nGameDefaultMap=/Game/Map\n\n"
+            "[/Script/Engine.RendererSettings]\nr.ReflectionMethod=1\nr.DynamicGlobalIlluminationMethod=1\n\n"
+            "[/Script/Engine.Other]\nx=1\n")
+
+
+class Paths(object):
+    @staticmethod
+    def project_config_dir(): return os.path.join(_TMP, "Config")
+    @staticmethod
+    def project_saved_dir(): return os.path.join(_TMP, "Saved")
+    @staticmethod
+    def project_plugins_dir(): return os.path.join(_TMP, "Plugins")
+    @staticmethod
+    def convert_relative_path_to_full(p): return p
+    @staticmethod
+    def project_log_dir(): return os.path.join(_TMP, "Saved", "Logs")
+
+
+def find_object(outer, path):
+    for o in _ALL:
+        if o.get_path_name() == path:
+            return o
+    return None
+
+
+load_object = find_object
+
+
+def ObjectIterator(cls):
+    return [o for o in list(_ALL) if isinstance(o, cls)]
+
+
+class EditorDialog(object):
+    @staticmethod
+    def show_message(*a, **k): return AppReturnType.NO
+
+
+def get_interpreter_executable_path(): return "python"
+def parent_external_window_to_slate(h): pass
+TICKS = []
+
+
+def register_slate_post_tick_callback(fn):
+    TICKS.append(fn)
+    return len(TICKS)
+def unregister_slate_post_tick_callback(h):
+    TICKS[h - 1] = None
+
+
+class WorldSettings(Actor): pass
