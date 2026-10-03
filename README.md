@@ -18,9 +18,9 @@ A single-file Python tool for **Unreal Engine 5.6**. It scans the open level for
 ## Run it
 **A. Paste:** open *Window → Output Log*, set the dropdown next to the input box to **Python** (not *Cmd*, not *Python (REPL)*), paste the whole `world_perf_audit.py` and press Enter.
 
-**B. One line:** paste this into the Output Log in Python mode. It downloads the v1.0.0 release, **checks its SHA-256** and only then runs it:
+**B. One line:** paste this into the Output Log in Python mode. It downloads the v1.1.0 release, **checks its SHA-256** and only then runs it:
 ```python
-import urllib.request as u, hashlib as h; s = u.urlopen("https://raw.githubusercontent.com/PhiLLAnt89/PhiLL/v1.0.0/world_perf_audit." + "py").read(); assert h.sha256(s).hexdigest() == "99acfa40d398795b72ec2a6e4b1d1d86a20ef5746e52d3ebf35731993221d80c", "checksum mismatch - not running it"; exec(s.decode("utf-8"), {"__name__": "__main__"})
+import urllib.request as u, hashlib as h; s = u.urlopen("https://raw.githubusercontent.com/PhiLLAnt89/PhiLL/v1.1.0/world_perf_audit." + "py").read(); assert h.sha256(s).hexdigest() == "81c5b26592db7de8ed5b56c28aef1d503091f4c128f9097ce65cff204684f420", "checksum mismatch - not running it"; exec(s.decode("utf-8"), {"__name__": "__main__"})
 ```
 **C. File:** *Tools → Execute Python Script…* and pick `world_perf_audit.py`.
 
