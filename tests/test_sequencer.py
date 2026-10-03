@@ -8,9 +8,14 @@ os.makedirs(OUT, exist_ok=True)
 exec(open(os.path.join(HERE, "scene.py")).read())   # mock "unreal" module + demo level (U, M_snow, big, ...)
 
 # a sequence with three shots; a spawnable (template lives in the sequence asset) with an oversized light
+# sh020 and sh030 reuse the same shot sequence, which has its own spawnable
+SHOT = U.LevelSequence("SEQ_sh020", path="/Game/Cine/SEQ_sh020")
+cam_tmpl = U.Actor("CineCam_Template", outer=SHOT)
+cam_tmpl.add(U.PointLightComponent("Rim", attenuation_radius=9000.0))
+SHOT.spawnables = [cam_tmpl]
 SEQ = U.LevelSequence("SEQ_Intro", path="/Game/Cine/SEQ_Intro", tracks=[
-    U._Track(U.MovieSceneCinematicShotTrack, [U._Section("sh010", 0, 100), U._Section("sh020", 100, 250),
-                                              U._Section("sh030", 250, 300)])])
+    U._Track(U.MovieSceneCinematicShotTrack, [U._Section("sh010", 0, 100), U._Section("sh020", 100, 250, SHOT),
+                                              U._Section("sh030", 250, 300, SHOT)])])
 tmpl = U.Actor("BP_Spotlight_Template", outer=SEQ)
 tlight = tmpl.add(U.PointLightComponent("LightComponent0", attenuation_radius=12000.0))
 SEQ.spawnables = [tmpl]
@@ -50,8 +55,18 @@ win = W.show()
 win.on_profile_sequence()
 assert "Open a Level Sequence" in win.lbl_status.text() and not W._PROFILE["busy"]
 SEQ_LIB.current = SEQ
+templates = W.sequence_spawnable_templates()
+assert [t.get_name() for t in templates] == ["BP_Spotlight_Template", "CineCam_Template"], templates
+# templates only take part in the template-safe actor checks: assets and counts come from the spawned copy
+ctx = W.ScanContext(W._get_actors(), templates)
+assert tlight not in ctx.components("PointLightComponent", include_readonly=True)
+assert slight in ctx.components("PointLightComponent", include_readonly=True)
+assert tlight not in ctx.components("PointLightComponent")
+ctx.allow_templates = True
+assert tlight in ctx.components("PointLightComponent") and slight not in ctx.components("PointLightComponent")
 win.on_scan()
 radius = [i for i in win.issues if i.check == "light_radius"]
+assert len([i for i in radius if i.targets[0] is tlight]) == 1, "listed once"
 assert [i for i in radius if i.targets[0] is tlight], "template light found"
 assert not [i for i in radius if i.targets[0] is slight], "spawned copy: no actor-level fix (it would be lost)"
 assert "spawnable template" in win.lbl_scanned.text(), win.lbl_scanned.text()

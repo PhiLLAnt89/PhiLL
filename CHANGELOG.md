@@ -35,6 +35,7 @@
 - Console allowlist: added `csvprofile stop` and `HighResShot <w>x<h>` only.
 - Ini writes: only `DefaultEngine.ini` and `DefaultScalability.ini`. Journal entries for quality levels and distance-field scale are validated (section names, console variable, numbers).
 - A journal with malformed entries no longer breaks the Revert menu.
+- Scan, Fix and Revert wait while a capture or screenshot job runs, so measurements and row states stay consistent.
 
 ## 1.0.0 – first production release
 

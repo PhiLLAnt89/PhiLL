@@ -43,8 +43,16 @@ Asset-level fixes (Nanite, LODs, textures, materials, Niagara) change the asset
 for every level that uses it - nothing is saved until you click Save.
 
 GPU PROFILE: "Profile GPU" (or world_perf_audit.profile_gpu()) captures frames
-with the CSV profiler, reports GPU/game/render-thread bound and the expensive
-GPU passes (shadows, Lumen, translucency...), linked to the scan findings.
+with the CSV profiler, reports GPU/game/render-thread bound, the expensive GPU
+passes (shadows, Lumen, translucency...) and game/render-thread work, linked to
+the scan findings. Each new profile is compared with the previous one (pinned
+row): fixes that bought nothing measurable can be reverted in one click.
+"Before/after shots" wraps visual fixes in two viewport screenshots
+(Saved/PerfAudit/Shots) with a wipe / difference compare view.
+"Profile Sequence" (profile_sequence()) profiles the Level Sequence open in
+Sequencer shot by shot; spawnables are fixed on their template in the sequence.
+Console-variable fixes go to Config/DefaultScalability.ini for Low/Medium/High
+only (CONFIG "scalability_fix_levels"): Epic and Cinematic keep their look.
 
 SCOPE: the persistent level + every LOADED sublevel (visible or hidden), Level
 Instance contents, child actors and spawned Sequencer spawnables. Unloaded
@@ -1117,8 +1125,9 @@ class ScanContext(object):
 
     def __init__(self, actors, templates=None):
         self.actors = [a for a in actors if a is not None]
-        # Sequencer spawnable templates: they live in the sequence asset, so fixes on them stick. Seen by asset
-        # checks and by the actor checks in _TEMPLATE_CHECKS (no bounds/positions: a template isn't placed)
+        # Sequencer spawnable templates: they live in the sequence asset, so fixes on them stick. Only the actor
+        # checks in _TEMPLATE_CHECKS see them (no bounds/positions: a template isn't placed). Asset checks and counts
+        # use the spawned copy instead, so nothing is counted twice.
         self.templates = [t for t in (templates or []) if t is not None]
         self.allow_templates = False
         self.found = []                 # issues found so far in this scan (for checks that group earlier ones)
@@ -1136,7 +1145,7 @@ class ScanContext(object):
     # --- generic -------------------------------------------------------------
     def _actors(self, include_readonly):
         if include_readonly:
-            return self.actors + self.templates
+            return self.actors
         if self._editable is None:
             ro = set(_READONLY_ACTORS)
             self._editable = [a for a in self.actors if a.get_path_name() not in ro] if ro else self.actors
@@ -1148,7 +1157,7 @@ class ScanContext(object):
         cls = _ucls(class_name)
         if cls is None:
             return []
-        key = (class_name, bool(include_readonly), self.allow_templates)
+        key = (class_name, bool(include_readonly), self.allow_templates and not include_readonly)
         cached = self._components.get(key)
         if cached is None:
             cached = []
@@ -4442,7 +4451,7 @@ def _csv_complete(path):
 # Jobs: multi-step work (captures, screenshots, shot-by-shot profiling) driven by the Slate tick, so the editor
 # keeps rendering while the tool waits. A job is a generator that yields seconds to wait.
 # =============================================================================
-_JOB = {"gen": None, "until": 0.0, "next_poll": 0.0, "on_done": None, "name": "", "cancel": False}
+_JOB = {"gen": None, "until": 0.0, "next_poll": 0.0, "on_done": None, "name": "", "cancel": False, "stepping": False}
 
 
 def job_busy():
@@ -4453,10 +4462,10 @@ def start_job(gen, on_done=None, name="job"):
     """Run generator `gen` on the Slate tick; on_done(result, error) when it returns, fails or is cancelled."""
     if _PROFILE["busy"]:
         raise RuntimeError("%s is already running." % (_JOB["name"] or "Another job"))
-    _JOB.update(gen=gen, until=0.0, next_poll=0.0, on_done=on_done, name=name, cancel=False)
+    _JOB.update(gen=gen, until=0.0, next_poll=0.0, on_done=on_done, name=name, cancel=False, stepping=False)
     _PROFILE["busy"] = True
     _PROFILE["handle"] = unreal.register_slate_post_tick_callback(_job_tick)
-    _job_step(time.time())        # the first step runs now (console commands, early errors)
+    _job_step()                   # the first step runs now (console commands, early errors)
 
 
 def cancel_job():
@@ -4492,7 +4501,8 @@ def _job_finish(result, error):
 
 
 def _job_tick(_dt):
-    if not _PROFILE["busy"]:
+    # A step can tick Slate itself (the slow-task dialog of apply_fixes): never re-enter a running step
+    if not _PROFILE["busy"] or _JOB["stepping"]:
         return
     now = time.time()
     if now < _JOB["next_poll"]:
@@ -4503,24 +4513,28 @@ def _job_tick(_dt):
         return
     if now < _JOB["until"]:
         return
-    _job_step(now)
+    _job_step()
 
 
-def _job_step(now):
+def _job_step():
     gen = _JOB["gen"]
-    if gen is None:
+    if gen is None or _JOB["stepping"]:
         return
+    _JOB["stepping"] = True
     try:
         wait = gen.send(None)
     except StopIteration as e:
+        _JOB["stepping"] = False
         _job_finish(getattr(e, "value", None), None)
         return
     except Exception as e:
+        _JOB["stepping"] = False
         if not isinstance(e, RuntimeError):            # RuntimeErrors are expected failures with a clear message
             _warn("%s failed:\n%s" % (_JOB["name"], traceback.format_exc()))
         _job_finish(None, str(e) or e.__class__.__name__)
         return
-    _JOB["until"] = now + float(wait or 0.0)
+    _JOB["stepping"] = False
+    _JOB["until"] = time.time() + float(wait or 0.0)     # from the end of the step (a fix can take a while)
 
 
 def _capture_csv(frames):
@@ -4748,26 +4762,37 @@ def _sub_sequences(seq):
     return out
 
 
-def sequence_spawnable_templates(seq=None, depth=0):
-    """Template actors of the spawnables in the open Level Sequence (and its shots). They live in the sequence
-    asset, so fixes on them stick - unlike the temporary actors Sequencer spawns into the level."""
+def sequence_spawnable_templates(seq=None):
+    """Template actors of the spawnables in the open Level Sequence (and its shots / subsequences). They live in the
+    sequence asset, so fixes on them stick - unlike the temporary actors Sequencer spawns into the level."""
     seq = seq if seq is not None else current_sequence()
-    if seq is None or depth > 3:
-        return []
-    out = []
-    try:
-        bindings = seq.get_spawnables() or []
-    except Exception:
-        bindings = []
-    for b in bindings:
+    out, seen, visited = [], set(), set()
+
+    def walk(sq, depth):
         try:
-            t = b.get_object_template()
+            key = sq.get_path_name()
         except Exception:
-            t = None
-        if t is not None and isinstance(t, unreal.Actor):
-            out.append(t)
-    for sub in _sub_sequences(seq):
-        out += sequence_spawnable_templates(sub, depth + 1)
+            return
+        if depth > 4 or key in visited:      # a shot used twice, or a shot track found as a sub track too
+            return
+        visited.add(key)
+        try:
+            bindings = sq.get_spawnables() or []
+        except Exception:
+            bindings = []
+        for b in bindings:
+            try:
+                t = b.get_object_template()
+            except Exception:
+                t = None
+            if t is not None and isinstance(t, unreal.Actor) and t.get_path_name() not in seen:
+                seen.add(t.get_path_name())
+                out.append(t)
+        for sub in _sub_sequences(sq):
+            walk(sub, depth + 1)
+
+    if seq is not None:
+        walk(seq, 0)
     return out
 
 
@@ -5350,6 +5375,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.setMinimumSize(1100, 640)
             self.issues = []
             self._rows = {}            # issue.id -> (item, row button)
+            self._row_obj = {}         # issue.id -> the issue shown in that row
             self._warns = {}           # issue.id -> warning icon label
             self._category = None      # sidebar filter (None = all)
             self._current = None       # issue shown in the detail panel
@@ -5671,7 +5697,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.tree.setSortingEnabled(False)
             self.tree.setUpdatesEnabled(False)
             self.tree.clear()
-            self._rows, self._warns = {}, {}
+            self._rows, self._warns, self._row_obj = {}, {}, {}
             for issue in self.issues[:CONFIG["max_rows"]]:
                 self._add_row(issue)
             self.tree.setUpdatesEnabled(True)
@@ -5714,12 +5740,13 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             h.addWidget(b)
             self.tree.setItemWidget(it, self.C_ACTION, cell)
             self._rows[issue.id] = (it, b)
+            self._row_obj[issue.id] = issue
             self._warns[issue.id] = warn
             self._refresh_row(issue)
 
         def _refresh_row(self, issue):
             row = self._rows.get(issue.id)
-            if not row:
+            if not row or self._row_obj.get(issue.id) is not issue:     # ids restart with every scan
                 return
             it, b = row
             if issue.check == "gpu_compare":
@@ -5973,7 +6000,17 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self._apply_filter()
             self._on_selection()
 
+        def _busy(self):
+            """True (and says so) while a capture / screenshot job runs: scans and fixes would spoil it."""
+            if not _PROFILE["busy"]:
+                return False
+            self._set_status("Wait for '%s' to finish%s." % (
+                _JOB["name"] or "the running job", " (or click Stop)" if self._job_btn is not None else ""))
+            return True
+
         def on_scan(self):
+            if self._busy():
+                return
             self.btn_scan.setEnabled(False)
             self._set_status("Scanning\u2026")
             try:
@@ -6089,13 +6126,9 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             """Apply immediately - no popup. Fixes that may change the look carry a warning icon on their row;
             everything is journaled, so Revert puts it back."""
             todo = [i for i in issues if i.fixable]
-            if not todo:
+            if not todo or self._busy():
                 return
             if self.chk_shots.isChecked() and any(i.impact != SAFE for i in todo):
-                if _PROFILE["busy"]:
-                    self._set_status("Wait for the running %s to finish (or untick Before/after shots)." % (
-                        _JOB["name"] or "job"))
-                    return
                 self._set_status("Screenshot before the fix\u2026 keep the level viewport visible.")
                 try:
                     fix_with_screenshots(todo, lambda res, err, todo=todo: self._on_shots_done(todo, res, err))
@@ -6200,6 +6233,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 if self._job_btn is self.btn_profile:
                     cancel_job()
                     self._set_status("Stopping the GPU profile\u2026")
+                else:
+                    self._busy()
                 return
             if not any(i.category not in (CAT_GPU, CAT_SEQ) for i in self.issues):
                 self.on_scan()      # Fix buttons on GPU findings come from the scan (once, honours the selection)
@@ -6232,6 +6267,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 if self._job_btn is self.btn_profile_seq:
                     cancel_job()
                     self._set_status("Stopping the sequence profile\u2026")
+                else:
+                    self._busy()
                 return
             if current_sequence() is None:
                 self._set_status("Open a Level Sequence in Sequencer first, then click Profile Sequence.")
@@ -6277,7 +6314,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
 
         def revert(self, issues):
             issues = [i for i in issues if i.revertable]
-            if not issues:
+            if not issues or self._busy():
                 return
             done, errors = revert_issues(issues)
             self._after_change(issues)
@@ -6291,7 +6328,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
 
         def on_revert_all(self):
             pending = journal_entries()
-            if not pending:
+            if not pending or self._busy():
                 return
             def changes_of(e):
                 parts = []
@@ -6314,6 +6351,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self._set_status("Reverted %d fix(es)%s." % (done, (", %d problem(s): see Output Log" % len(errors)) if errors else ""))
 
         def on_recover_old(self):
+            if self._busy():
+                return
             plan = recover_previous_fixes(apply=False)
             if not plan:
                 self._dialog("Nothing to restore", "No fixes from the previous version were found in Saved/Logs.",

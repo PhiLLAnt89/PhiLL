@@ -93,9 +93,28 @@ assert safe.status == "fixed" and not W._PROFILE["busy"] and safe.shots is None,
 looks = [i for i in win.issues if i.fixable and i.impact == W.LOOK and not i.children and i.category != W.CAT_GPU]
 light = looks[0]
 print("shots on:", light.title, "/", light.obj)
+# in the editor the slow-task dialog of a long fix ticks Slate (and so the job tick) while the fix runs
+reentered = []
+orig_frame = U.ScopedSlowTask.enter_progress_frame
+
+
+def ticking_frame(self, n=1, msg=""):
+    clock.Clock.t += 1.0
+    for fn in list(U.TICKS):
+        if fn:
+            reentered.append(1)
+            fn(0.016)
+
+
+U.ScopedSlowTask.enter_progress_frame = ticking_frame
 win.fix_issues([light])
 assert W._PROFILE["busy"] and light.status == "open", "the before shot comes first"
+n_issues = len(win.issues)
+win.on_scan()                                  # no re-scan while the job runs (row ids would be reused)
+assert len(win.issues) == n_issues and "Wait for" in win.lbl_status.text(), win.lbl_status.text()
 clock.run_until_idle(U, W)
+U.ScopedSlowTask.enter_progress_frame = orig_frame
+assert reentered, "the tick fired during the fix"
 assert light.status == "fixed" and light.shots, light.message
 assert all(os.path.isfile(light.shots[k]) and "PerfAudit" in light.shots[k] for k in ("before", "after"))
 assert "Before / After" in win.lbl_status.text(), win.lbl_status.text()

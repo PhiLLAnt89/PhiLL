@@ -774,9 +774,9 @@ def flush_screenshots():
 
 
 # ---------------------------------------------------------------- Sequencer
-class MovieSceneCinematicShotTrack(Object): pass
-class MovieSceneCameraCutTrack(Object): pass
 class MovieSceneSubTrack(Object): pass
+class MovieSceneCinematicShotTrack(MovieSceneSubTrack): pass      # like the engine: a shot track IS a sub track
+class MovieSceneCameraCutTrack(Object): pass
 
 
 class _Section(Object):
@@ -805,7 +805,7 @@ class LevelSequence(Object):
     def __init__(self, name, tracks=(), spawnables=(), start=0, end=0, **kw):
         Object.__init__(self, name, **kw)
         self.tracks, self.spawnables, self.start, self.end = list(tracks), list(spawnables), start, end
-    def find_tracks_by_type(self, cls): return [t for t in self.tracks if t.cls is cls]
+    def find_tracks_by_type(self, cls): return [t for t in self.tracks if issubclass(t.cls, cls)]   # subclasses too
     def get_spawnables(self): return [_Binding(t) for t in self.spawnables]
     def get_playback_start(self): return self.start
     def get_playback_end(self): return self.end
