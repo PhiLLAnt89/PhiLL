@@ -37,17 +37,31 @@ tr = gpu["Translucency / FX overdraw"]
 assert tr.fix and tr.children[0].obj == "r.SeparateTranslucencyScreenPercentage"
 fog = gpu["Fog / volumetric fog"]
 assert {c.obj for c in fog.children} >= {"r.VolumetricFog.GridPixelSize", "r.VolumetricFog.GridSizeZ"}
-# apply translucency (cvar) fix -> runtime + ini; revert -> both restored
+# apply translucency (cvar) fix -> DefaultScalability.ini for Low/Medium/High only; revert -> restored
 ini_path = os.path.join(U._TMP, "Config", "DefaultEngine.ini")
+scal_path = os.path.join(U._TMP, "Config", "DefaultScalability.ini")
 ini_before = open(ini_path).read()
-win._row_action(tr)
-assert U.SystemLibrary.CVARS["r.SeparateTranslucencyScreenPercentage"] == 50
-assert "[SystemSettings]\nr.SeparateTranslucencyScreenPercentage=50" in open(ini_path).read()
+assert "Low/Medium/High" in tr.children[0].fix_label and "Epic/Cinematic untouched" in tr.children[0].fix_label
+win._row_action(tr)                         # the editor runs at Epic: nothing changes live
+assert U.SystemLibrary.CVARS["r.SeparateTranslucencyScreenPercentage"] == 100
+text = open(scal_path).read()
+for lv in (0, 1, 2):
+    assert "[EffectsQuality@%d]\nr.SeparateTranslucencyScreenPercentage=50" % lv in text, text
+assert "EffectsQuality@3" not in text and "Cine" not in text, text
+assert open(ini_path).read() == ini_before, "DefaultEngine.ini must not change any more"
 print("translucency fix:", tr.status, tr.message, "| row:", win._rows[tr.id][1].text())
 win._row_action(tr)
-assert U.SystemLibrary.CVARS["r.SeparateTranslucencyScreenPercentage"] == 100, U.SystemLibrary.CVARS
-assert "SeparateTranslucencyScreenPercentage" not in open(ini_path).read(), open(ini_path).read()
+assert "SeparateTranslucencyScreenPercentage" not in open(scal_path).read(), open(scal_path).read()
 print("translucency revert:", tr.status)
+# at a fixed quality level the change is visible right away, and the revert puts the live value back
+U.SystemLibrary.CVARS["sg.EffectsQuality"] = 1
+win._row_action(tr)
+assert U.SystemLibrary.CVARS["r.SeparateTranslucencyScreenPercentage"] == 50
+win._row_action(tr)
+assert U.SystemLibrary.CVARS["r.SeparateTranslucencyScreenPercentage"] == 100, U.SystemLibrary.CVARS
+assert "SeparateTranslucencyScreenPercentage" not in open(scal_path).read()
+U.SystemLibrary.CVARS["sg.EffectsQuality"] = 3
+print("quality-level aware cvar fix: OK")
 # rescan keeps the GPU findings (re-linked), no duplicates
 n_gpu = len([i for i in win.issues if i.category == W.CAT_GPU])
 win.on_scan()

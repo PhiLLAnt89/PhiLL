@@ -49,6 +49,9 @@ VisibilityBasedAnimTickOption = _enum("VisibilityBasedAnimTickOption", "ALWAYS_T
 BloomMethod = _enum("BloomMethod", "BM_SOG", "BM_FFT")
 AppMsgType = _enum("AppMsgType", "OK", "YES_NO", "YES_NO_CANCEL")
 AppReturnType = _enum("AppReturnType", "NO", "YES", "CANCEL")
+ShadowCacheInvalidationBehavior = _enum("ShadowCacheInvalidationBehavior", "AUTO", "ALWAYS", "RIGID", "STATIC")
+NiagaraScalabilityUpdateFrequency = _enum("NiagaraScalabilityUpdateFrequency", "SPAWN_ONLY", "LOW", "MEDIUM", "HIGH", "CONTINUOUS")
+NiagaraCullReaction = _enum("NiagaraCullReaction", "DEACTIVATE", "DEACTIVATE_IMMEDIATE", "DEACTIVATE_RESUME", "DEACTIVATE_IMMEDIATE_RESUME")
 
 
 class PropertyAccessChangeNotifyMode:
@@ -203,7 +206,8 @@ class SceneComponent(ActorComponent): pass
 
 
 class PrimitiveComponent(SceneComponent):
-    _defaults = {"cast_shadow": True, "ld_max_draw_distance": 0.0}
+    _defaults = {"cast_shadow": True, "ld_max_draw_distance": 0.0, "affect_distance_field_lighting": True,
+                 "shadow_cache_invalidation_behavior": ShadowCacheInvalidationBehavior.AUTO}
     mats = ()
     overlap = False
     def get_num_materials(self): return len(self.mats)
@@ -370,6 +374,29 @@ class NiagaraSystem(Object):
     _defaults = {"effect_type": None}
 
 
+class NiagaraSystemScalabilitySettings(_Struct):
+    _defaults = {"cull_by_distance": False, "max_distance": 0.0}
+
+
+class NiagaraSystemScalabilitySettingsArray(_Struct):
+    _defaults = {"settings": []}
+
+
+_DEFAULT_CULL = NiagaraCullReaction.DEACTIVATE_IMMEDIATE
+
+
+class NiagaraEffectType(Object):
+    def __init__(self, *a, **kw):
+        Object.__init__(self, *a, **kw)
+        self._p.setdefault("update_frequency", NiagaraScalabilityUpdateFrequency.SPAWN_ONLY)
+        self._p.setdefault("cull_reaction", _DEFAULT_CULL)
+        self._p.setdefault("system_scalability_settings", NiagaraSystemScalabilitySettingsArray(
+            settings=[NiagaraSystemScalabilitySettings()]))
+
+
+class NiagaraEffectTypeFactoryNew(Object): pass
+
+
 class NiagaraEmitter(Object): pass
 
 
@@ -393,12 +420,16 @@ class NiagaraLightRendererProperties(NiagaraRendererProperties): pass
 
 
 class FoliageType_InstancedStaticMesh(Object):
-    _defaults = {"mesh": None, "cull_distance": None}
+    _defaults = {"mesh": None, "cull_distance": None, "affect_distance_field_lighting": True}
 
 
 # structs
 class MeshNaniteSettings(_Struct):
     _defaults = {"enabled": False}
+
+
+class MeshBuildSettings(_Struct):
+    _defaults = {"distance_field_resolution_scale": 1.0}
 
 
 class StaticMaterial(_Struct): pass
@@ -428,7 +459,8 @@ class MaterialStatistics(_Struct): pass
 # ---------------------------------------------------------------- libraries
 class SystemLibrary(object):
     CVARS = {"r.Velocity.EnableVertexDeformation": 0, "r.VelocityOutputPass": 1, "r.Nanite.ProjectEnabled": 1,
-             "r.Shadow.Virtual.Enable": 1, "r.AllowStaticLighting": 1}
+             "r.Shadow.Virtual.Enable": 1, "r.AllowStaticLighting": 1, "sg.ShadowQuality": 3, "sg.EffectsQuality": 3,
+             "r.DynamicGlobalIlluminationMethod": 1, "r.GenerateMeshDistanceFields": 1, "r.Streaming.PoolSize": 1000}
     commands = []
 
     @staticmethod
@@ -441,6 +473,7 @@ class SystemLibrary(object):
     def get_component_bounds(c): return (Vector(), Vector(), c.radius)
 
     CSV_TEXT = None
+    pending_shots = []      # screenshots requested, written on the next tick (like the engine's next frame)
 
     @staticmethod
     def execute_console_command(w, cmd):
@@ -451,7 +484,9 @@ class SystemLibrary(object):
                 SystemLibrary.CVARS[parts[0]] = float(parts[1])
             except ValueError:
                 pass
-        if cmd.lower().startswith("csvprofile") and SystemLibrary.CSV_TEXT:
+        if cmd.startswith("HighResShot"):
+            SystemLibrary.pending_shots.append(None)
+        if cmd.lower().startswith("csvprofile frames") and SystemLibrary.CSV_TEXT:
             d = os.path.join(_TMP, "Saved", "Profiling", "CSV")
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, "Profile(20261002_153000).csv"), "w") as f:
@@ -475,8 +510,46 @@ class MaterialEditingLibrary(object):
 
 class EditorAssetLibrary(object):
     synced = []
+    deleted = []
     @staticmethod
     def sync_browser_to_objects(p): EditorAssetLibrary.synced.append(p)
+    @staticmethod
+    def does_asset_exist(p): return EditorAssetLibrary.load_asset(p) is not None
+    @staticmethod
+    def load_asset(p):
+        for o in _ALL:
+            if o._outer is None and o._path == p:
+                return o
+        return None
+    @staticmethod
+    def delete_asset(p):
+        o = EditorAssetLibrary.load_asset(p)
+        if o is not None:
+            _ALL.remove(o)
+            EditorAssetLibrary.deleted.append(p)
+        return o is not None
+
+
+class _AssetTools(object):
+    created = []
+    def create_asset(self, name, folder, cls, factory):
+        o = cls(name, path=folder + "/" + name)
+        _AssetTools.created.append(o)
+        return o
+
+
+class AssetToolsHelpers(object):
+    @staticmethod
+    def get_asset_tools(): return _AssetTools()
+
+
+class AutomationLibrary(object):
+    requested = []
+    @staticmethod
+    def take_high_res_screenshot(w, h, filename, *a, **k):
+        AutomationLibrary.requested.append(filename)
+        SystemLibrary.pending_shots.append(filename)
+        return True
 
 
 class _AD(object):
@@ -582,6 +655,12 @@ class LevelStreaming(Object):
 
 
 class StaticMeshEditorSubsystem(object):
+    def get_lod_build_settings(self, mesh, lod):
+        return MeshBuildSettings(distance_field_resolution_scale=getattr(mesh, "df_scale", 1.0))
+
+    def set_lod_build_settings(self, mesh, lod, bs):
+        mesh.df_scale = bs.distance_field_resolution_scale
+
     def set_nanite_settings(self, mesh, ns, apply):
         mesh._p["nanite_settings"] = MeshNaniteSettings(enabled=ns.enabled)
 
@@ -630,7 +709,18 @@ with open(os.path.join(_TMP, "Config", "DefaultEngine.ini"), "w") as f:
             "[/Script/Engine.Other]\nx=1\n")
 
 
+os.makedirs(os.path.join(_TMP, "EngineConfig"))
+with open(os.path.join(_TMP, "EngineConfig", "BaseScalability.ini"), "w") as f:      # excerpt of the engine's file
+    f.write("[ShadowQuality@0]\nr.VolumetricFog=0\n\n[ShadowQuality@1]\nr.VolumetricFog.GridPixelSize=16\n"
+            "r.VolumetricFog.GridSizeZ=64\n\n[ShadowQuality@2]\nr.VolumetricFog.GridPixelSize=8\n"
+            "r.VolumetricFog.GridSizeZ=128\n\n[ShadowQuality@3]\nr.VolumetricFog.GridPixelSize=8\n"
+            "r.VolumetricFog.GridSizeZ=128\n\n[EffectsQuality@0]\nr.SeparateTranslucencyScreenPercentage=100\n\n"
+            "[EffectsQuality@3]\nr.SeparateTranslucencyScreenPercentage=100\n")
+
+
 class Paths(object):
+    @staticmethod
+    def engine_config_dir(): return os.path.join(_TMP, "EngineConfig")
     @staticmethod
     def project_config_dir(): return os.path.join(_TMP, "Config")
     @staticmethod
@@ -665,6 +755,81 @@ class EditorDialog(object):
 def get_interpreter_executable_path(): return "python"
 def parent_external_window_to_slate(h): pass
 TICKS = []
+
+
+_PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00IEND\xaeB`\x82")
+SHOT_COUNT = [0]
+
+
+def flush_screenshots():
+    """The engine writes requested screenshots a frame later: called from the test clock's ticks."""
+    while SystemLibrary.pending_shots:
+        name = SystemLibrary.pending_shots.pop(0)
+        SHOT_COUNT[0] += 1
+        d = os.path.join(_TMP, "Saved", "Screenshots", "WindowsEditor")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name or "HighresScreenshot%05d.png" % SHOT_COUNT[0]), "wb") as f:
+            f.write(_PNG)
+
+
+# ---------------------------------------------------------------- Sequencer
+class MovieSceneCinematicShotTrack(Object): pass
+class MovieSceneCameraCutTrack(Object): pass
+class MovieSceneSubTrack(Object): pass
+
+
+class _Section(Object):
+    def __init__(self, name, start, end, sub=None):
+        Object.__init__(self, name)
+        self.start, self.end, self.sub = start, end, sub
+    def get_start_frame(self): return self.start
+    def get_end_frame(self): return self.end
+    def get_shot_display_name(self): return self._name
+    def get_sequence(self): return self.sub
+
+
+class _Track(Object):
+    def __init__(self, cls, sections):
+        Object.__init__(self, cls.__name__)
+        self.cls, self.sections = cls, sections
+    def get_sections(self): return list(self.sections)
+
+
+class _Binding(object):
+    def __init__(self, template): self.template = template
+    def get_object_template(self): return self.template
+
+
+class LevelSequence(Object):
+    def __init__(self, name, tracks=(), spawnables=(), start=0, end=0, **kw):
+        Object.__init__(self, name, **kw)
+        self.tracks, self.spawnables, self.start, self.end = list(tracks), list(spawnables), start, end
+    def find_tracks_by_type(self, cls): return [t for t in self.tracks if t.cls is cls]
+    def get_spawnables(self): return [_Binding(t) for t in self.spawnables]
+    def get_playback_start(self): return self.start
+    def get_playback_end(self): return self.end
+
+
+class LevelSequenceEditorBlueprintLibrary(object):
+    current = None
+    time = 0
+    locked = False
+    history = []
+    @staticmethod
+    def get_current_level_sequence(): return LevelSequenceEditorBlueprintLibrary.current
+    @staticmethod
+    def get_current_time(): return LevelSequenceEditorBlueprintLibrary.time
+    @staticmethod
+    def set_current_time(t):
+        LevelSequenceEditorBlueprintLibrary.time = t
+        LevelSequenceEditorBlueprintLibrary.history.append(t)
+    @staticmethod
+    def is_camera_cut_locked_to_viewport(): return LevelSequenceEditorBlueprintLibrary.locked
+    @staticmethod
+    def set_lock_camera_cut_to_viewport(b): LevelSequenceEditorBlueprintLibrary.locked = b
+    @staticmethod
+    def pause(): pass
 
 
 def register_slate_post_tick_callback(fn):

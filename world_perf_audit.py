@@ -60,6 +60,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -121,9 +122,30 @@ CONFIG = {
     "gpu_pass_min_share": 0.06,       # report GPU passes using >= 6% of the frame budget
     "draw_calls_warn": 3000,
     "primitives_warn": 15000000,
+    "cpu_item_min_ms": 1.0,           # report game/render-thread stats above this (CSV "Exclusive/..." columns)
+    "megalights_lights": 20,          # suggest MegaLights from this many shadowed lights
+    # --- Quality levels (console-variable fixes go to DefaultScalability.ini) ------------------------------
+    "scalability_fix_levels": [0, 1, 2],   # 0 Low, 1 Medium, 2 High, 3 Epic, 4 Cinematic. Epic/Cinematic untouched
+    # --- Before/after screenshots ---------------------------------------------------------------------------
+    "shot_width": 1280,
+    "shot_height": 720,
+    "shot_timeout_seconds": 20,
+    "shot_settle_seconds": 2.0,       # wait after the fix before the "after" shot (shaders, rebuilds, streaming)
+    "before_after_shots": False,      # start state of the "Before/after shots" checkbox
+    # --- Sequencer (Profile Sequence button) ------------------------------------------------------------------
+    "shot_profile_frames": 60,        # frames captured per shot
+    "shot_warmup_seconds": 2.0,       # wait after jumping to a shot (spawnables, streaming)
+    "sequence_segments": 4,           # no shots / camera cuts: profile this many equal parts
+    "max_shots": 40,
+    # --- New checks -------------------------------------------------------------------------------------------
+    "effect_type_cull_distance": 15000.0,   # cm, distance culling of the Effect Type the fix creates
+    "generated_asset_folder": "/Game/PerfAudit",
+    "lumen_df_instances": 1000,       # instanced components with this many instances: foliage for the Lumen check
+    "df_resolution_scale_max": 2.0,   # mesh Distance Field Resolution Scale above this is flagged
+    "texture_pool_ratio_warn": 1.5,   # level textures (full res) > pool size x this
 }
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 WINDOW_OBJECT_NAME = "WorldPerfAuditWindow"
 TOOL_NAME = "World Performance Audit"
 
@@ -145,7 +167,8 @@ CAT_POST = "Post Process & Rendering"
 CAT_ANIM = "Animation"
 CAT_SCENE = "Scene Setup"
 CAT_GPU = "GPU Profile (measured)"
-CATEGORIES = [CAT_GPU, CAT_MOTION, CAT_LIGHT, CAT_MESH, CAT_MATERIAL, CAT_TEXTURE, CAT_VFX, CAT_POST, CAT_ANIM, CAT_SCENE]
+CAT_SEQ = "Sequencer Shots (measured)"
+CATEGORIES = [CAT_GPU, CAT_SEQ, CAT_MOTION, CAT_LIGHT, CAT_MESH, CAT_MATERIAL, CAT_TEXTURE, CAT_VFX, CAT_POST, CAT_ANIM, CAT_SCENE]
 
 
 # =============================================================================
@@ -501,6 +524,23 @@ def _generate_lods(mesh, count, rec):
     return "Generated %s LODs on %s" % (n if n is not None else count, mesh.get_name())
 
 
+def _df_scale(mesh):
+    """Distance Field Resolution Scale of LOD0's build settings, or None when it can't be read."""
+    sub = _sm_subsystem()
+    try:
+        return float(sub.get_lod_build_settings(mesh, 0).get_editor_property("distance_field_resolution_scale"))
+    except Exception:
+        return None
+
+
+def _set_df_scale(mesh, value):
+    _modify(mesh)
+    sub = _sm_subsystem()
+    bs = sub.get_lod_build_settings(mesh, 0)
+    bs.set_editor_property("distance_field_resolution_scale", float(value))
+    sub.set_lod_build_settings(mesh, 0, bs)      # rebuilds the mesh (and its distance field)
+
+
 # --- skeletal meshes ---------------------------------------------------------
 def _skel_asset(comp):
     try:
@@ -587,6 +627,9 @@ def _after_niagara_edit(system, comps):
 
 
 # --- project ini -------------------------------------------------------------
+_INI_FILES = ("DefaultEngine.ini", "DefaultScalability.ini")     # the only config files the tool writes
+
+
 def _ini_path(ini_name="DefaultEngine.ini"):
     return os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_config_dir()), ini_name)
 
@@ -634,11 +677,11 @@ def _get_project_ini(section, key, ini_name="DefaultEngine.ini"):
 
 def _set_project_ini(section, key, value, ini_name="DefaultEngine.ini"):
     """Write key=value into Config/<ini_name> [section]; value=None removes the key."""
-    if not re.match(r"^[A-Za-z0-9_./]{1,80}$", str(section)) or not re.match(r"^[A-Za-z0-9_.]{1,80}$", str(key)):
+    if not re.match(r"^[A-Za-z0-9_./@]{1,80}$", str(section)) or not re.match(r"^[A-Za-z0-9_.]{1,80}$", str(key)):
         raise RuntimeError("Refusing unexpected ini section/key: %r / %r" % (section, key))
     if value is not None and not re.match(r"^[A-Za-z0-9_.\-]{0,32}$", str(value)):
         raise RuntimeError("Refusing unexpected ini value: %r" % (value,))
-    if ini_name != "DefaultEngine.ini":
+    if ini_name not in _INI_FILES:
         raise RuntimeError("Refusing to edit %s" % ini_name)
     if "[" in key or "]" in key:
         raise RuntimeError("Refusing unexpected ini key: %r" % (key,))
@@ -687,7 +730,7 @@ SAFE, LOOK, GAMEPLAY = "safe", "look", "gameplay"
 IMPACT_LABELS = {SAFE: "No visual change", LOOK: "Changes the look", GAMEPLAY: "Can change behaviour"}
 IMPACT_SHORT = {SAFE: "Safe", LOOK: "Visual", GAMEPLAY: "Behaviour"}
 IMPACT_COLORS = {SAFE: "#4caf6a", LOOK: "#e0a03a", GAMEPLAY: "#a77bdb"}
-_REVERTABLE = ("prop", "call", "struct", "nanite", "lods", "ini", "cvar")
+_REVERTABLE = ("prop", "call", "struct", "nanite", "lods", "ini", "cvar", "scal", "dfscale")
 
 # The journal lives on disk, so a revert treats it as untrusted input: only what this tool itself changes
 # can be replayed (property names, setters, enums, console variables, ini keys), with validated values.
@@ -696,16 +739,18 @@ _JOURNAL_PROPS = {
     "max_draw_distance", "max_distance_fade_range", "cast_volumetric_shadow", "dynamic_shadow_cascades",
     "real_time_capture", "world_position_offset_disable_distance", "contact_shadow_length", "max_texture_size",
     "never_stream", "mip_gen_settings", "compression_settings", "power_of_two_mode", "capture_every_frame",
-    "fade_screen_size", "visibility_based_anim_tick_option", "enable_update_rate_optimizations"}
+    "fade_screen_size", "visibility_based_anim_tick_option", "enable_update_rate_optimizations",
+    "shadow_cache_invalidation_behavior", "affect_distance_field_lighting", "effect_type"}
 _JOURNAL_SETTERS = {"set_cast_shadow", "set_cull_distance", "set_cull_distances", "set_mobility",
                     "set_generate_overlap_events"}
 _JOURNAL_STRUCTS = {"settings", "cull_distance"}
 _JOURNAL_ENUMS = {"NiagaraRendererMotionVectorSetting", "TranslucencyLightingMode", "ComponentMobility",
                   "TextureMipGenSettings", "TextureCompressionSettings", "TexturePowerOfTwoSetting",
-                  "VisibilityBasedAnimTickOption"}
+                  "VisibilityBasedAnimTickOption", "ShadowCacheInvalidationBehavior"}
 _JOURNAL_POSTS = {None, "material", "niagara", "skylight"}
 _ALLOWED_CVARS = {"r.SeparateTranslucencyScreenPercentage", "r.VolumetricFog.GridPixelSize", "r.VolumetricFog.GridSizeZ"}
 _ALLOWED_INI = {("/Script/Engine.RendererSettings", "r.Velocity.EnableVertexDeformation")}
+_SCAL_SECTION_RE = re.compile(r"^(ShadowQuality|EffectsQuality)@([0-4]|Cine)$")
 _NUMBER_RE = re.compile(r"^-?\d{1,9}(\.\d{1,6})?$")
 
 
@@ -739,7 +784,7 @@ def _check_journal_change(ch):
     k = ch.get("k")
     if ch.get("post") not in _JOURNAL_POSTS:
         raise RuntimeError("journal: unexpected post step %r" % ch.get("post"))
-    if k in ("prop", "call", "struct", "nanite", "lods") and not isinstance(ch.get("path"), str):
+    if k in ("prop", "call", "struct", "nanite", "lods", "dfscale") and not isinstance(ch.get("path"), str):
         raise RuntimeError("journal: missing object path")
     if k == "prop" and ch.get("prop") not in _JOURNAL_PROPS:
         raise RuntimeError("journal: property %r not allowed" % ch.get("prop"))
@@ -757,6 +802,21 @@ def _check_journal_change(ch):
         for v in (ch.get("old"), ch.get("ini_old")):
             if v is not None and not _NUMBER_RE.match(str(v)):
                 raise RuntimeError("journal: bad console variable value %r" % (v,))
+    if k == "scal":
+        name, sections = ch.get("name"), ch.get("sections")
+        if name not in _ALLOWED_CVARS or not isinstance(sections, list) or not 0 < len(sections) <= 6:
+            raise RuntimeError("journal: quality-level change %r not allowed" % (name,))
+        for item in sections:
+            m = _SCAL_SECTION_RE.match(str(item[0])) if isinstance(item, list) and len(item) == 2 else None
+            if m is None or m.group(1) != _CVAR_GROUP.get(name):
+                raise RuntimeError("journal: scalability section %r not allowed" % (item,))
+            if item[1] is not None and not _NUMBER_RE.match(str(item[1])):
+                raise RuntimeError("journal: bad scalability value %r" % (item[1],))
+        if ch.get("old") is not None and not _NUMBER_RE.match(str(ch["old"])):
+            raise RuntimeError("journal: bad console variable value %r" % (ch["old"],))
+    if k == "dfscale" and (not isinstance(ch.get("old"), (int, float)) or isinstance(ch.get("old"), bool)
+                           or not 0.0 < float(ch["old"]) <= 100.0):
+        raise RuntimeError("journal: bad distance field resolution %r" % (ch.get("old"),))
     if k == "ini":
         if (ch.get("section"), ch.get("key")) not in _ALLOWED_INI or ch.get("file", "DefaultEngine.ini") != "DefaultEngine.ini":
             raise RuntimeError("journal: ini key %r not allowed" % ch.get("key"))
@@ -795,13 +855,29 @@ class ChangeRecorder(object):
         d.update(data)
         self.changes.append(d)
 
-    def cvar(self, name, value):
-        """Set a console variable now (so you see the result) and in DefaultEngine.ini [SystemSettings]
-        (so it sticks after a restart). Both old values are recorded."""
-        self.changes.append({"k": "cvar", "name": name, "label": name, "old": _cvar_str(name),
-                             "ini_old": _get_project_ini("SystemSettings", name)})
-        _run_console("%s %s" % (name, value))
-        _set_project_ini("SystemSettings", name, str(value))
+    def scalability(self, name, value, group, levels):
+        """Write name=value into Config/DefaultScalability.ini for these quality levels of `group` only (the other
+        levels keep their values) and apply it now if the editor runs at one of them. Old values are recorded.
+        Returns (applied_now, editor_level)."""
+        cur = max(0, min(4, _cvar_int(_GROUP_LEVEL_CVAR[group], 3)))
+        live = cur in levels
+        sections = [s for lv in levels for s in _scalability_sections(group, lv)]
+        self.changes.append({"k": "scal", "name": name, "label": "%s (%s quality)" % (name, _level_label(levels)),
+                             "sections": [[s, _get_project_ini(s, name, "DefaultScalability.ini")] for s in sections],
+                             "old": _cvar_str(name) if live else None, "live": live})
+        for s in sections:
+            _set_project_ini(s, name, str(value), "DefaultScalability.ini")
+        if live:
+            _run_console("%s %s" % (name, value))
+        return live, cur
+
+    def df_scale(self, mesh, value):
+        """Distance Field Resolution Scale of LOD0's build settings (rebuilds the mesh's distance field)."""
+        old = _df_scale(mesh)
+        if old is None:
+            raise RuntimeError("Can't read the build settings of %s" % mesh.get_name())
+        self.changes.append({"k": "dfscale", "path": mesh.get_path_name(), "label": mesh.get_name(), "old": old})
+        _set_df_scale(mesh, value)
 
 
 def _cvar_str(name):
@@ -812,9 +888,11 @@ def _cvar_str(name):
         return None
 
 
-# Only the commands this tool uses: render cvars ("r.Name value") and "csvprofile frames=N". Nothing else
+# Only the commands this tool uses: render cvars ("r.Name value"), "csvprofile frames=N" / "csvprofile stop" and
+# "HighResShot WxH" (before/after screenshots). Nothing else
 # (no "py ...", no "|" / ";" chaining, no quotes) can ever reach the console through it.
-_CONSOLE_RE = re.compile(r"^(r\.[A-Za-z0-9_.]{1,80} -?[0-9.]{1,12}|csvprofile frames=[0-9]{1,5})$")
+_CONSOLE_RE = re.compile(r"^(r\.[A-Za-z0-9_.]{1,80} -?[0-9.]{1,12}|csvprofile frames=[0-9]{1,5}|csvprofile stop"
+                         r"|HighResShot [0-9]{2,5}x[0-9]{2,5})$")
 
 
 def _run_console(cmd):
@@ -897,10 +975,17 @@ def _revert_changes(changes):
                 _remove_lods(_resolve(ch["path"]))
             elif k == "ini":
                 _set_project_ini(ch["section"], ch["key"], ch["old"], ch.get("file", "DefaultEngine.ini"))
-            elif k == "cvar":
+            elif k == "cvar":                 # fixes made by 1.0.0: DefaultEngine.ini [SystemSettings]
                 if ch.get("old") is not None:
                     _run_console("%s %s" % (ch["name"], ch["old"]))
                 _set_project_ini("SystemSettings", ch["name"], ch.get("ini_old"))
+            elif k == "scal":
+                for section, old in ch["sections"]:
+                    _set_project_ini(section, ch["name"], old, "DefaultScalability.ini")
+                if ch.get("old") is not None:
+                    _run_console("%s %s" % (ch["name"], ch["old"]))
+            elif k == "dfscale":
+                _set_df_scale(_resolve(ch["path"]), float(ch["old"]))
             else:
                 raise RuntimeError("%s: %s" % (ch.get("label", k), ch.get("why", "only Ctrl+Z / source control can undo this")))
         except Exception as e:
@@ -919,7 +1004,7 @@ def _journal_load():
     try:
         with open(_journal_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
+        return [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
     except Exception:
         return []
 
@@ -936,7 +1021,9 @@ def _journal_write(entry):
 
 
 def _revertable(entry):
-    return bool(entry) and not entry.get("reverted") and any(c["k"] in _REVERTABLE for c in entry.get("changes", []))
+    changes = entry.get("changes") if isinstance(entry, dict) else None
+    return bool(entry) and not entry.get("reverted") and isinstance(changes, list) and any(
+        isinstance(c, dict) and c.get("k") in _REVERTABLE for c in changes)
 
 
 # =============================================================================
@@ -969,6 +1056,9 @@ class Issue(object):
         self.message = ""
         self.journal = None             # journal entry of the last fix (for Revert)
         self.children = list(children or [])   # group issue: Fix applies these scan issues' fixes
+        self.pinned = False             # kept at the top of the list (profile comparison)
+        self.extra = {}                 # check-specific data (e.g. the Sequencer shot)
+        self.shots = None               # {"before": png, "after": png} from a fix with screenshots
 
     @property
     def fixable(self):
@@ -1025,8 +1115,13 @@ class _MatUse(object):
 class ScanContext(object):
     """Collects scene data once; checks read from here."""
 
-    def __init__(self, actors):
+    def __init__(self, actors, templates=None):
         self.actors = [a for a in actors if a is not None]
+        # Sequencer spawnable templates: they live in the sequence asset, so fixes on them stick. Seen by asset
+        # checks and by the actor checks in _TEMPLATE_CHECKS (no bounds/positions: a template isn't placed)
+        self.templates = [t for t in (templates or []) if t is not None]
+        self.allow_templates = False
+        self.found = []                 # issues found so far in this scan (for checks that group earlier ones)
         self._editable = None
         self._components = {}
         self._mesh_usage = None
@@ -1041,11 +1136,11 @@ class ScanContext(object):
     # --- generic -------------------------------------------------------------
     def _actors(self, include_readonly):
         if include_readonly:
-            return self.actors
+            return self.actors + self.templates
         if self._editable is None:
             ro = set(_READONLY_ACTORS)
             self._editable = [a for a in self.actors if a.get_path_name() not in ro] if ro else self.actors
-        return self._editable
+        return self._editable + self.templates if self.allow_templates else self._editable
 
     def components(self, class_name, include_readonly=False):
         """Components of the scanned actors. Actor-level checks (they change components) leave out
@@ -1053,7 +1148,7 @@ class ScanContext(object):
         cls = _ucls(class_name)
         if cls is None:
             return []
-        key = (class_name, bool(include_readonly))
+        key = (class_name, bool(include_readonly), self.allow_templates)
         cached = self._components.get(key)
         if cached is None:
             cached = []
@@ -1201,9 +1296,12 @@ class ScanContext(object):
 
     def wpo_components(self):
         if self._wpo_comps is None:
-            self._wpo_comps = [c for c in self.visible("MeshComponent")
-                               if any(self.uses_wpo(m) for m in self.component_materials(c))]
-        return self._wpo_comps
+            self._wpo_comps = {}
+        key = self.allow_templates
+        if key not in self._wpo_comps:
+            self._wpo_comps[key] = [c for c in self.visible("MeshComponent")
+                                    if any(self.uses_wpo(m) for m in self.component_materials(c))]
+        return self._wpo_comps[key]
 
     # --- textures ------------------------------------------------------------
     def textures(self):
@@ -1798,6 +1896,86 @@ def _check_wpo_distance(ctx):
             impact=LOOK, impact_note="These meshes stop swaying/animating beyond %d uu from the camera." % dist)
 
 
+@check("mesh_vsm_invalidation", CAT_LIGHT, "WPO meshes invalidating Virtual Shadow Map pages")
+def _check_vsm_invalidation(ctx):
+    if not _cvar_int("r.Shadow.Virtual.Enable", 0):
+        return
+    rigid = _enum_member(_ucls("ShadowCacheInvalidationBehavior"), "RIGID")
+    groups = OrderedDict()
+    for c in ctx.wpo_components():
+        if not _prop(c, "cast_shadow", False) or not _prop(c, "evaluate_world_position_offset", True):
+            continue
+        if _enum_name(_prop(c, "shadow_cache_invalidation_behavior")) not in ("AUTO", "ALWAYS"):
+            continue
+        mesh = _prop(c, "static_mesh") if _isinst(c, "StaticMeshComponent") else None
+        key = mesh.get_path_name() if mesh else c.get_path_name()
+        g = groups.setdefault(key, {"name": mesh.get_name() if mesh else _label(c), "mesh": mesh, "comps": [], "n": 0})
+        g["comps"].append(c)
+        n = 1
+        if _isinst(c, "InstancedStaticMeshComponent"):
+            try:
+                n = int(c.get_instance_count())
+            except Exception:
+                n = 1
+        g["n"] += n
+    for g in groups.values():
+        comps, n = g["comps"], g["n"]
+        sev = MEDIUM if n >= 100 else LOW
+        dist = [int(_prop(c, "world_position_offset_disable_distance", 0) or 0) for c in comps]
+
+        def fix(rec, comps=comps):
+            for c in comps:
+                rec.set(c, "shadow_cache_invalidation_behavior", rigid)
+            return "Shadow Cache Invalidation Behavior = Rigid on %d component(s)" % len(comps)
+
+        yield Issue(
+            "mesh_vsm_invalidation", CAT_LIGHT, sev, "WPO re-renders shadow pages every frame",
+            "%s (%d)" % (g["name"], len(comps)),
+            detail=("These shadow-casting components animate with World Position Offset, so Virtual Shadow Maps throw "
+                    "away and re-render their cached shadow pages every frame (%d instance(s))%s. With wind on "
+                    "foliage this is often the biggest part of the shadow pass." % (
+                        n, "" if not any(dist) else "; WPO Disable Distance limits it to the nearby ones")),
+            solution=("Primitive component > Rendering > 'Shadow Cache Invalidation Behavior' = Rigid: the shadow only "
+                      "updates when the component moves, not for the WPO sway. Also set a WPO Disable Distance. "
+                      "Check it with 'r.Shadow.Virtual.Visualize' (cache / invalidation mode)."),
+            metric="%d instance(s)" % n, cost=_score(sev, _mag_log(n, 1, 20000)), targets=comps,
+            assets=[g["mesh"]] if g["mesh"] else [],
+            fix=fix if rigid is not None else None, fix_label="Set Shadow Cache Invalidation Behavior = Rigid",
+            impact=LOOK, impact_note=("The shadows of these meshes stop following the WPO sway (the meshes themselves "
+                                      "still animate; moving the actor still updates its shadow)."))
+
+
+@check("mesh_nanite_programmable", CAT_MESH, "Nanite meshes on the programmable (masked / WPO) raster path")
+def _check_nanite_programmable(ctx):
+    for u in ctx.mesh_usage().values():
+        mesh = u["mesh"]
+        if not _nanite_enabled(mesh):
+            continue
+        mats = []
+        for c in u["comps"]:
+            for m in ctx.component_materials(c):
+                if m not in mats:
+                    mats.append(m)
+        masked = [m for m in mats if _blend_mode_name(m) == "BLEND_MASKED"]
+        wpo = [m for m in mats if ctx.uses_wpo(m)]
+        if not masked and not wpo:
+            continue
+        n = max(1, u["instances"])
+        sev = MEDIUM if n >= 1000 else LOW
+        what = " + ".join(x for x, on in (("masked", masked), ("World Position Offset", wpo)) if on)
+        yield Issue(
+            "mesh_nanite_programmable", CAT_MESH, sev, "Nanite mesh with %s material" % what, mesh.get_name(),
+            detail=("Nanite rasterises %s materials on its programmable path: the material runs during rasterisation "
+                    "(per pixel for masked, per vertex for WPO), typically 2-3x the cost of opaque Nanite, in the base "
+                    "pass and in every shadow view. Drawn %d time(s). Materials: %s" % (
+                        what, n, ", ".join(m.get_name() for m in (masked + wpo)[:4]))),
+            solution=("Masked foliage: model the leaf shapes as geometry (opaque Nanite foliage), or set "
+                      "'Nanite Pixel Programmable Distance' on the components (UE 5.4+) so distant copies rasterise as "
+                      "opaque. WPO: set a WPO Disable Distance (see 'WPO animates at any distance'). Check it with "
+                      "Nanite Visualization > Raster Bins / Programmable Raster."),
+            metric="%s x%d" % (what, n), cost=_score(sev, _mag_log(n, 10, 50000)), targets=u["comps"], assets=[mesh])
+
+
 @check("mesh_tiny_shadows", CAT_MESH, "Tiny meshes casting shadows")
 def _check_tiny_shadows(ctx):
     r_max = CONFIG["tiny_shadow_radius"]
@@ -1877,6 +2055,25 @@ def _sync_foliage_cull(mesh, start, end, rec):
             rec.struct_field(ft, "cull_distance", "max", int(end))
         except Exception:
             pass
+
+
+def _sync_foliage_flag(mesh, prop, value, rec):
+    """Same change on the project's Foliage Types of this mesh, so repainting / editing the foliage keeps it."""
+    cls = _ucls("FoliageType_InstancedStaticMesh")
+    if cls is None or mesh is None or not hasattr(unreal, "ObjectIterator"):
+        return 0
+    n = 0
+    for ft in unreal.ObjectIterator(cls):
+        try:
+            if ft.get_name().startswith("Default__") or _prop(ft, "mesh") != mesh or not _is_editable_asset(ft):
+                continue
+            if _prop(ft, prop) in (None, value):
+                continue
+            rec.set(ft, prop, value)
+            n += 1
+        except Exception:
+            pass
+    return n
 
 
 @check("mesh_ism_cull", CAT_MESH, "Instanced meshes / foliage without cull distance")
@@ -2353,14 +2550,103 @@ def _check_tex_npot(ctx):
             fx=tex.get_path_name() in fx_tex)
 
 
+@check("tex_streaming_pool", CAT_TEXTURE, "Level textures vs. texture streaming pool")
+def _check_tex_pool(ctx):
+    pool_mb = _cvar_int("r.Streaming.PoolSize", 0) or 0
+    if pool_mb <= 0:
+        return
+    texs = [(e["tex"], _texture_bytes(e["tex"])) for e in ctx.textures().values()
+            if _isinst(e["tex"], "Texture2D") and not _prop(e["tex"], "virtual_texture_streaming", False)]
+    total = sum(b for _t, b in texs)
+    pool = pool_mb * float(1 << 20)
+    if total <= pool * CONFIG["texture_pool_ratio_warn"]:
+        return
+    texs.sort(key=lambda tb: -tb[1])
+    children = _related_fixes(ctx.found, [("tex_oversized",), ("tex_never_stream",)])
+    sev = HIGH if total > pool * 4 else MEDIUM
+    yield Issue(
+        "tex_streaming_pool", CAT_TEXTURE, sev, "Textures far exceed the streaming pool",
+        "%s vs %d MB pool" % (_fmt_bytes(total), pool_mb),
+        detail=("The textures used in this level add up to ~%s at full resolution; the streaming pool "
+                "(r.Streaming.PoolSize) is %d MB. Close-up views then can't get their top mips: blurry surfaces, "
+                "'Texture streaming pool over budget', mip popping. Largest: %s" % (
+                    _fmt_bytes(total), pool_mb, ", ".join("%s (%s)" % (t.get_name(), _fmt_bytes(b)) for t, b in texs[:8]))),
+        solution=("Cap oversized textures (Maximum Texture Size), let Never Stream textures stream, use Virtual "
+                  "Texture Streaming for huge maps, or raise r.Streaming.PoolSize if the target GPU has the VRAM. "
+                  "'stat streaming' shows the live numbers."),
+        metric="%.1fx the pool" % (total / pool), cost=_score(sev, _mag_log(total / pool, 1.0, 8.0)),
+        assets=[t for t, _b in texs[:20]], **_group_kwargs(children, "texture memory"))
+
+
 # =============================================================================
 # CHECKS - Niagara / VFX
 # =============================================================================
+_EFFECT_TYPE_NAME = "ET_PerfAudit_DistanceCull"
+
+
+def _configure_effect_type(et):
+    """Distance culling at CONFIG['effect_type_cull_distance'], re-checked continuously, and culled systems come back
+    when the camera gets closer (the engine default only checks at spawn, so an FX spawned far away never returns)."""
+    freq = _enum_member(_ucls("NiagaraScalabilityUpdateFrequency"), "MEDIUM", "HIGH", "CONTINUOUS")
+    reaction = _enum_member(_ucls("NiagaraCullReaction"), "DEACTIVATE_IMMEDIATE_RESUME", "DEACTIVATE_RESUME")
+    if freq is None or reaction is None:
+        raise RuntimeError("Niagara scalability settings aren't exposed to Python in this engine version")
+    et.set_editor_property("update_frequency", freq)
+    et.set_editor_property("cull_reaction", reaction)
+    arr = et.get_editor_property("system_scalability_settings")
+    items = list(arr.get_editor_property("settings") or [])
+    if not items:
+        items = [unreal.NiagaraSystemScalabilitySettings()]
+    for it in items:
+        it.set_editor_property("cull_by_distance", True)
+        it.set_editor_property("max_distance", float(CONFIG["effect_type_cull_distance"]))
+    arr.set_editor_property("settings", items)
+    et.set_editor_property("system_scalability_settings", arr)
+
+
+def _perf_effect_type():
+    """The Effect Type the fix assigns: reused when it exists (keeping any tuning you did), else created."""
+    folder = "/" + str(CONFIG["generated_asset_folder"]).strip("/")
+    if not re.match(r"^/Game(/[A-Za-z0-9_]{1,64}){0,6}$", folder):
+        raise RuntimeError("generated_asset_folder must be a folder under /Game: %r" % folder)
+    path = "%s/%s" % (folder, _EFFECT_TYPE_NAME)
+    lib = unreal.EditorAssetLibrary
+    if lib.does_asset_exist(path):
+        et = lib.load_asset(path)
+        if et is None or not _isinst(et, "NiagaraEffectType"):
+            raise RuntimeError("%s exists but isn't a Niagara Effect Type" % path)
+        return et, path, False
+    cls, factory = _ucls("NiagaraEffectType"), _ucls("NiagaraEffectTypeFactoryNew")
+    if cls is None:
+        raise RuntimeError("Niagara isn't available")
+    et = unreal.AssetToolsHelpers.get_asset_tools().create_asset(_EFFECT_TYPE_NAME, folder, cls,
+                                                                 factory() if factory is not None else None)
+    if et is None:
+        raise RuntimeError("Could not create %s" % path)
+    try:
+        _configure_effect_type(et)
+    except Exception:
+        try:
+            lib.delete_asset(path)          # never leave a half-configured culling asset behind
+        except Exception:
+            pass
+        raise
+    return et, path, True
+
+
 @check("vfx_no_effect_type", CAT_VFX, "Niagara systems without Effect Type (no culling)")
 def _check_effect_type(ctx):
+    dist = float(CONFIG["effect_type_cull_distance"])
     for system, comps in ctx.niagara_systems():
         if _prop(system, "effect_type") is not None:
             continue
+        editable = _is_editable_asset(system)
+
+        def fix(rec, system=system):
+            et, path, created = _perf_effect_type()
+            rec.set(system, "effect_type", et)
+            return "Effect Type %s assigned%s" % (path, " (created; Revert keeps the asset)" if created else "")
+
         yield Issue(
             "vfx_no_effect_type", CAT_VFX, MEDIUM if len(comps) > 3 else LOW, "No Effect Type / scalability",
             system.get_name(),
@@ -2368,9 +2654,17 @@ def _check_effect_type(ctx):
                     "handling or per-platform budget. %d instance(s) in this level simulate even off-screen "
                     "or far away." % len(comps)),
             solution=("Create a Niagara Effect Type (e.g. FX_Ambient) with Max Distance / Cull by visibility, "
-                      "set Update Frequency, and assign it in System Properties > Effect Type."),
+                      "set Update Frequency, and assign it in System Properties > Effect Type. The fix assigns "
+                      "%s/%s (created once: culls beyond %d m, re-checked continuously, culled FX resume when "
+                      "you come closer). Tune that asset to change it for every system that uses it." % (
+                          CONFIG["generated_asset_folder"], _EFFECT_TYPE_NAME, dist / 100)
+                      + ("" if editable else _READONLY_NOTE)),
             metric="%d instance(s)" % len(comps), cost=_score(LOW if len(comps) <= 3 else MEDIUM, len(comps) / 20.0),
-            targets=comps, assets=[system])
+            targets=comps, assets=[system], fix=fix if editable else None,
+            fix_label="Assign a distance-culling Effect Type (%d m)" % (dist / 100),
+            impact=LOOK, impact_note=("Instances further than %d m from the camera stop simulating and rendering; they "
+                                      "come back when you get closer. Check FX meant to be seen from far away (fires "
+                                      "on the horizon, weather, skybox effects)." % (dist / 100)))
 
 
 @check("vfx_light_renderer", CAT_VFX, "Niagara light renderers")
@@ -2445,6 +2739,80 @@ def _check_cascade(ctx):
                 "proper motion vector options: %s" % _names(comps)),
         solution="Convert to Niagara (Cascade to Niagara Converter plugin) and assign an Effect Type.",
         metric="%d comps" % len(comps), cost=_score(LOW, len(comps) / 20.0), targets=comps)
+
+
+# =============================================================================
+# CHECKS - Lumen / distance fields
+# =============================================================================
+@check("lumen_foliage_df", CAT_LIGHT, "Dense instanced foliage in Lumen's distance-field scene")
+def _check_lumen_foliage(ctx):
+    if _cvar_int("r.DynamicGlobalIlluminationMethod", 0) != 1:
+        return
+    comps = []
+    for c in ctx.visible("InstancedStaticMeshComponent"):
+        try:
+            n = int(c.get_instance_count())
+        except Exception:
+            continue
+        if n >= CONFIG["lumen_df_instances"] and _prop(c, "affect_distance_field_lighting", False):
+            comps.append((c, n))
+    if not comps:
+        return
+    total = sum(n for _c, n in comps)
+    sev = MEDIUM if total >= CONFIG["lumen_df_instances"] * 20 else LOW
+
+    def fix(rec, comps=[c for c, _n in comps]):
+        meshes = []
+        for c in comps:
+            rec.set(c, "affect_distance_field_lighting", False)
+            mesh = _prop(c, "static_mesh")
+            if mesh is not None and mesh not in meshes:
+                meshes.append(mesh)
+        n_ft = sum(_sync_foliage_flag(m, "affect_distance_field_lighting", False, rec) for m in meshes)
+        return "Affect Distance Field Lighting off on %d instanced component(s)%s" % (
+            len(comps), (" and %d Foliage Type(s)" % n_ft) if n_ft else "")
+
+    yield Issue(
+        "lumen_foliage_df", CAT_LIGHT, sev, "Dense foliage traced by Lumen",
+        "%d component(s), %s instances" % (len(comps), _fmt_count(total)),
+        detail=("These instanced meshes (%s) have 'Affect Distance Field Lighting' on, so every instance goes into "
+                "Lumen's mesh distance-field scene. Thousands of grass/small-plant instances make Lumen's distance "
+                "field culling and tracing slower for very little GI difference." % _names([c for c, _n in comps])),
+        solution=("Turn off 'Affect Distance Field Lighting' on grass and small foliage (component or Foliage Type > "
+                  "Lighting). Keep it on trees and large rocks. Check with 'r.Lumen.Visualize' > Mesh SDF / 'stat lumen'."),
+        metric="%s instances" % _fmt_count(total), cost=_score(sev, _mag_log(total, 1000, 500000)),
+        targets=[c for c, _n in comps], fix=fix, fix_label="Turn off Affect Distance Field Lighting on them",
+        impact=LOOK, impact_note=("This foliage no longer blocks Lumen GI / sky light: the ground under dense grass can "
+                                  "get slightly brighter."))
+
+
+@check("mesh_df_resolution", CAT_MESH, "Meshes with a high Distance Field Resolution Scale")
+def _check_df_resolution(ctx):
+    if not _cvar_int("r.GenerateMeshDistanceFields", 0):
+        return
+    limit = float(CONFIG["df_resolution_scale_max"])
+    for u in ctx.mesh_usage().values():
+        mesh = u["mesh"]
+        scale = _df_scale(mesh)
+        if scale is None or scale <= limit:
+            continue
+        editable = _is_editable_asset(mesh)
+        sev = MEDIUM if scale >= limit * 2 else LOW
+
+        def fix(rec, mesh=mesh):
+            rec.df_scale(mesh, 1.0)
+            return "Distance Field Resolution Scale 1.0 on %s (rebuilt)" % mesh.get_name()
+
+        yield Issue(
+            "mesh_df_resolution", CAT_MESH, sev, "High distance-field resolution", mesh.get_name(),
+            detail=("Distance Field Resolution Scale is %.1f: the mesh distance field uses ~%.0fx the memory of the "
+                    "default and takes longer to build and stream. Lumen and distance-field shadows/AO use it." % (
+                        scale, scale ** 3)),
+            solution=("Static Mesh Editor > LOD0 Build Settings > Distance Field Resolution Scale = 1 (raise it only on "
+                      "meshes whose thin parts leak light)." + ("" if editable else _READONLY_NOTE)),
+            metric="scale %.1f" % scale, cost=_score(sev, _mag_log(scale, limit, 16.0)), targets=u["comps"],
+            assets=[mesh], fix=fix if editable else None, fix_label="Set Distance Field Resolution Scale = 1 (rebuilds)",
+            impact=LOOK, impact_note="Lumen GI / distance-field shadows of this mesh get a little less detailed.")
 
 
 # =============================================================================
@@ -2749,6 +3117,50 @@ def _get_actors(selected_only=False):
     return actors
 
 
+# Actor checks that also run on Sequencer spawnable templates: they read component settings only (no bounds or
+# positions, which a template doesn't have).
+_TEMPLATE_CHECKS = {"light_radius", "light_max_draw_distance", "light_volumetric_shadow", "light_contact_shadows",
+                    "light_function", "skylight_realtime", "mesh_wpo_distance", "mesh_overlap_events",
+                    "mesh_vsm_invalidation", "scene_capture", "decal_fade", "anim_offscreen_tick", "anim_uro"}
+
+
+def _template_actors():
+    try:
+        return sequence_spawnable_templates()
+    except Exception:
+        _warn("Could not read the open sequence's spawnables:\n%s" % traceback.format_exc())
+        return []
+
+
+def _scene_counts(ctx):
+    """Numbers that drive render-thread cost, for the GPU profile's 'what drives it' finding."""
+    c = {"primitives": 0, "instances": 0, "non_nanite": 0, "movable": 0, "movable_shadow": 0, "shadowed_lights": 0,
+         "captures": 0}
+    try:
+        for comp in ctx.visible("PrimitiveComponent", include_readonly=True):
+            c["primitives"] += 1
+            if _isinst(comp, "InstancedStaticMeshComponent"):
+                try:
+                    c["instances"] += int(comp.get_instance_count())
+                except Exception:
+                    pass
+            if _isinst(comp, "StaticMeshComponent"):
+                mesh = _prop(comp, "static_mesh")
+                if mesh is not None and not _nanite_enabled(mesh):
+                    c["non_nanite"] += 1
+            if _mobility(comp) == "MOVABLE":
+                c["movable"] += 1
+                if _prop(comp, "cast_shadow", False):
+                    c["movable_shadow"] += 1
+        c["shadowed_lights"] = sum(1 for l in ctx.visible("LocalLightComponent", include_readonly=True)
+                                   if _prop(l, "cast_shadows", False) and _mobility(l) != "STATIC")
+        c["captures"] = sum(1 for s in ctx.components("SceneCaptureComponent", include_readonly=True)
+                            if _prop(s, "capture_every_frame", False))
+    except Exception:
+        _warn("Scene counts incomplete:\n%s" % traceback.format_exc())
+    return c
+
+
 def _short_level_name(path):
     path = str(path or "")
     return path.rsplit("/", 1)[-1].split(".")[0] or path
@@ -2797,15 +3209,18 @@ def _scope_text(scope):
             + (" ..." if len(scope["levels_unloaded"]) > 8 else "")))
     if scope["wp_total"]:
         parts.append("World Partition: %d actors exist, only loaded regions are scanned" % scope["wp_total"])
+    if scope.get("templates"):
+        parts.append("%d Sequencer spawnable template(s) of the open sequence" % scope["templates"])
     return " \u00b7 ".join(parts)
 
 
 def scan(selected_only=False, check_keys=None):
     """Run all enabled checks. Returns the issue list (sorted by cost, highest first)."""
     actors = _get_actors(selected_only)
-    ctx = ScanContext(actors)
+    templates = [] if selected_only else _template_actors()
+    ctx = ScanContext(actors, templates)
     checks = [c for c in _CHECKS if (c["key"] in check_keys if check_keys else c["enabled"])]
-    issues, errors = [], []
+    issues, errors = ctx.found, []
     with unreal.ScopedSlowTask(len(checks) + 1, "%s: scanning..." % TOOL_NAME) as task:
         task.make_dialog(True)
         task.enter_progress_frame(1, "Collecting %d actors..." % len(actors))
@@ -2813,29 +3228,41 @@ def scan(selected_only=False, check_keys=None):
             if task.should_cancel():
                 break
             task.enter_progress_frame(1, c["name"])
+            ctx.allow_templates = c["key"] in _TEMPLATE_CHECKS
             try:
                 for issue in (c["fn"](ctx) or []):
                     issues.append(issue)
             except Exception:
                 errors.append((c["name"], traceback.format_exc()))
                 _warn("Check '%s' failed:\n%s" % (c["name"], traceback.format_exc()))
+        ctx.allow_templates = False
     try:
         ctx.build_stats()
     except Exception:
         pass
-    world_name = _editor_world().get_name() if _editor_world() else ""
-    if _STATE.get("gpu_profile") and _STATE["gpu_profile"].get("level") != world_name:
-        _STATE["gpu_profile"] = None                        # measured on another level: drop it
+    issues = list(issues)
+    world = _editor_world()
+    world_name = world.get_name() if world else ""
+    if not selected_only:
+        _STATE["counts"] = _scene_counts(ctx)
+    for key in ("gpu_profile", "sequence_profile"):
+        if _STATE.get(key) and _STATE[key].get("level") != world_name:
+            _STATE[key] = None                              # measured on another level: drop it
+    if _STATE.get("sequence_profile") and not selected_only:
+        try:
+            issues += sequence_issues(_STATE["sequence_profile"], issues)
+        except Exception:
+            _warn("Could not re-link the sequence profile:\n%s" % traceback.format_exc())
     if _STATE.get("gpu_profile") and not selected_only:     # re-link measured GPU findings to the new scan
         try:
             issues += gpu_profile_issues(_STATE["gpu_profile"], issues)
         except Exception:
             _warn("Could not re-link the GPU profile:\n%s" % traceback.format_exc())
-    issues.sort(key=lambda i: (-i.cost, -i.severity, i.title))
-    world = _editor_world()
+    issues = _sorted_issues(issues)
     scope = scan_scope(actors)
+    scope["templates"] = len(templates)
     _STATE.update(issues=issues, stats=ctx.stats, errors=errors, scope=scope,
-                  level=world.get_name() if world else "", selected_only=selected_only)
+                  level=world_name, selected_only=selected_only)
     _log("v%s scan done: %d issue(s), %d auto-fixable, %d check error(s). Scope: %s"
          % (__version__, len(issues), sum(1 for i in issues if i.fixable), len(errors), _scope_text(scope)))
     if scope["levels_unloaded"]:
@@ -2903,6 +3330,11 @@ def _refresh_all_groups():
 
 def _update_groups(groups):
     for g in groups:
+        if g.check == "gpu_compare":      # its children are fixes to take back: it's done once they're reverted
+            left = sum(1 for c in g.children if c.status == "fixed")
+            g.status, g.message = ("open", "%d fix(es) without measurable gain still applied" % left) if left else (
+                "reverted", "Reverted the fixes without measurable gain")
+            continue
         done = [c for c in g.children if c.status == "fixed"]
         failed = [c for c in g.children if c.status == "failed"]
         if done and not any(c.fixable for c in g.children):
@@ -2925,7 +3357,7 @@ def _revert_entries(entries, title="World Perf Audit: Revert"):
     with unreal.ScopedEditorTransaction(title):
         with unreal.ScopedSlowTask(len(entries), "Reverting fixes...") as task:
             task.make_dialog(True)
-            for e in sorted(entries, key=lambda x: x.get("time", ""), reverse=True):
+            for e in sorted(entries, key=lambda x: str(x.get("time", "")), reverse=True):
                 task.enter_progress_frame(1, "Reverting: %s - %s" % (e.get("title"), e.get("obj")))
                 errs = _revert_changes(e.get("changes", []))
                 e["reverted"], e["revert_errors"] = True, errs
@@ -3238,7 +3670,10 @@ def recover_previous_fixes(apply=False):
 
 
 def go_to(issue):
-    """Select + frame the actors involved, and/or show the assets in the Content Browser."""
+    """Select + frame the actors involved, and/or show the assets in the Content Browser.
+    A Sequencer shot finding jumps the open sequence to that shot instead."""
+    if issue.check == "seq_shot" and issue.extra.get("shot"):
+        return goto_shot(issue.extra["shot"], issue.extra.get("sequence"))
     if issue.children:   # GPU finding: everything its related fixes touch
         issue = Issue("goto", "", INFO, "", "", "", "", targets=[t for c in issue.children for t in c.targets],
                       assets=[a for c in issue.children for a in c.assets])
@@ -3576,8 +4011,62 @@ def _group_kwargs(children, what):
             "impact_note": "Applies (each one can be reverted):\n" + "\n".join(lines)}
 
 
+# --- quality-level aware console-variable fixes (DefaultScalability.ini) ---------------------------------------
+_LEVEL_NAMES = ["Low", "Medium", "High", "Epic", "Cinematic"]
+_CVAR_GROUP = {"r.VolumetricFog.GridPixelSize": "ShadowQuality", "r.VolumetricFog.GridSizeZ": "ShadowQuality",
+               "r.SeparateTranslucencyScreenPercentage": "EffectsQuality"}
+_GROUP_LEVEL_CVAR = {"ShadowQuality": "sg.ShadowQuality", "EffectsQuality": "sg.EffectsQuality"}
+# a quality level where this feature is switched off doesn't need the tweak
+_CVAR_FEATURE = {"r.VolumetricFog.GridPixelSize": "r.VolumetricFog", "r.VolumetricFog.GridSizeZ": "r.VolumetricFog"}
+
+
+def _fix_levels():
+    out = []
+    for lv in CONFIG["scalability_fix_levels"]:
+        try:
+            lv = int(lv)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= lv <= 4 and lv not in out:
+            out.append(lv)
+    return sorted(out)
+
+
+def _scalability_sections(group, level):
+    return ["%s@%d" % (group, level)] + (["%s@Cine" % group] if level == 4 else [])
+
+
+def _scalability_value(group, level, name):
+    """Effective value of `name` at a quality level: the project's DefaultScalability.ini, else the engine's."""
+    paths = [_ini_path("DefaultScalability.ini")]
+    try:
+        paths.append(os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.engine_config_dir()),
+                                  "BaseScalability.ini"))
+    except Exception:
+        pass
+    for path in paths:
+        try:
+            lines, _e, _n = _ini_read(path)
+        except Exception:
+            continue
+        for section in _scalability_sections(group, level):
+            start, end = _ini_section(lines, section)
+            if start is None:
+                continue
+            for i in range(start + 1, end):
+                k, sep, v = lines[i].partition("=")
+                if sep and k.strip().lower() == name.lower():
+                    return v.strip()
+    return None
+
+
+def _level_label(levels):
+    return "/".join(_LEVEL_NAMES[lv] for lv in levels)
+
+
 def _cvar_children(tweaks, pass_label, cache=None):
-    """Hidden child issues that change a console variable (only when it would actually lower the cost).
+    """Hidden child issues that lower a console variable for the configured quality levels (default Low/Medium/High,
+    so Epic and Cinematic stay untouched). Only offered where it would actually lower the cost.
     cache: one shared child per cvar for the whole profile, so two passes can't record each other's values."""
     out = []
     cache = {} if cache is None else cache
@@ -3585,37 +4074,241 @@ def _cvar_children(tweaks, pass_label, cache=None):
         if name in cache:
             out.append(cache[name])
             continue
-        cur = _cvar_str(name)
+        group = _CVAR_GROUP.get(name)
+        if group is None:
+            continue
         try:
-            curf = float(cur)
-        except (TypeError, ValueError):
+            if _get_project_ini("SystemSettings", name) is not None:
+                continue      # forced for every quality level in DefaultEngine.ini [SystemSettings]: your call
+        except Exception:
             continue
-        if (mode == "min" and curf >= target) or (mode == "max" and curf <= target):
+        levels = []
+        feature = _CVAR_FEATURE.get(name)
+        for lv in _fix_levels():
+            if feature and _scalability_value(group, lv, feature) == "0":
+                continue
+            eff = _scalability_value(group, lv, name)
+            try:
+                effv = float(eff) if eff is not None else None
+            except ValueError:
+                effv = None
+            if effv is None or (mode == "min" and effv < target) or (mode == "max" and effv > target):
+                levels.append(lv)
+        if not levels:
             continue
+        untouched = [lv for lv in range(5) if lv not in levels]
 
-        def fix(rec, name=name, target=target):
-            rec.cvar(name, target)
-            return "%s = %s (now + DefaultEngine.ini [SystemSettings])" % (name, target)
+        def fix(rec, name=name, target=target, group=group, levels=levels):
+            live, cur = rec.scalability(name, target, group, levels)
+            return "%s = %s for %s quality%s" % (
+                name, target, _level_label(levels),
+                "" if live else " (not visible right now: the editor runs at %s quality)" % _LEVEL_NAMES[cur])
 
-        cache[name] = Issue("gpu_cvar", CAT_GPU, INFO, "%s %s -> %s" % (name, cur, target), name,
-                            detail=note, solution=note, fix=fix,
-                            fix_label="Set %s from %s to %s" % (name, cur, target), impact=LOOK, impact_note=note)
+        label = "Set %s to %s for %s quality (DefaultScalability.ini%s)" % (
+            name, target, _level_label(levels), (", %s untouched" % _level_label(untouched)) if untouched else "")
+        cache[name] = Issue("gpu_cvar", CAT_GPU, INFO, label, name, detail=note, solution=note, fix=fix,
+                            fix_label=label, impact=LOOK,
+                            impact_note=note + " Only for %s quality." % _level_label(levels))
         out.append(cache[name])
     return out
+
+
+# --- CPU (game thread / render thread) analysis ------------------------------------------------------------------
+# (thread, keywords in the CSV column, label, why, what to do, related scan fixes)
+_CPU_RULES = [
+    ("RenderThread", ("initviews", "visibility", "occlusion", "culling", "frustum", "computeview"), "Visibility & culling",
+     "Culling and visibility work for every primitive in the view.",
+     "Fewer, merged primitives (instancing / Packed Level Actors), cull distances on small props, distance culling on "
+     "instanced meshes.", [("mesh_cull_distance",), ("mesh_ism_cull",), ("light_max_draw_distance",)]),
+    ("RenderThread", ("shadow",), "Shadow setup",
+     "Gathering and submitting dynamic shadow casters for every shadowed light.",
+     "Fewer/smaller shadow-casting lights, no shadows on tiny props, Static mobility where possible.",
+     [("light_radius",), ("light_max_draw_distance",), ("mesh_tiny_shadows",), ("mesh_movable_static",)]),
+    ("RenderThread", ("meshdrawcommand", "drawcommand", "basepass", "mesh", "draw", "rhi", "submit"), "Draw submission",
+     "Building and submitting draw calls.",
+     "Instancing, Nanite, fewer material slots per mesh, cull distances.", None),
+    ("RenderThread", ("scenecapture", "capture", "reflection"), "Scene captures",
+     "Extra scene renders for captures/mirrors.", "Turn off Capture Every Frame; avoid planar reflections.",
+     [("scene_capture",)]),
+    ("RenderThread", ("translucen", "particle", "niagara", "fx", "velocity"), "FX / translucency submission",
+     "Sorting and submitting particles and translucent meshes.", "Cap particle counts, Effect Types with distance "
+     "culling, fewer translucent sorting layers.", [("vfx_no_effect_type",)]),
+    ("GameThread", ("anim", "skeletal", "skin"), "Animation",
+     "Anim graphs and bone updates.", "Only tick pose when rendered, Update Rate Optimizations, skeletal LODs.",
+     [("anim_offscreen_tick",), ("anim_uro",), ("anim_skel_lods",)]),
+    ("GameThread", ("physics", "collision", "overlap", "chaos"), "Physics & overlaps",
+     "Physics simulation, sweeps and overlap tests.", "No overlap events on scenery, Static mobility for props, "
+     "simple collision instead of per-poly.", [("mesh_overlap_events",), ("mesh_movable_static",)]),
+    ("GameThread", ("effect", "niagara", "particle", "fx"), "FX on the CPU",
+     "Niagara/Cascade CPU simulation and scalability.", "Effect Types with distance culling, GPU sim for big emitters.",
+     [("vfx_no_effect_type",)]),
+    ("GameThread", ("blueprint", "tick", "kismet", "world", "actor", "script"), "Blueprint / actor tick",
+     "Actors and components ticking every frame.",
+     "Disable 'Start with Tick Enabled' where not needed, raise Tick Interval, use timers/events. "
+     "'stat game' and Unreal Insights show which actors.", []),
+    ("GameThread", ("slate", "umg", "editor"), "Editor / UI",
+     "Editor and UI work - not part of a packaged game.", "Profile in PIE or a Standalone game for game numbers.", []),
+]
+
+
+def _cpu_findings(means, budget, scan_issues, src):
+    out = []
+    for thread in ("RenderThread", "GameThread"):
+        prefix = "exclusive/%s/" % thread.lower()
+        cols = sorted([(k, v) for k, v in means.items() if k.lower().startswith(prefix) and v > 0], key=lambda kv: -kv[1])
+        cols = [(k, v) for k, v in cols if not any(w in k.lower() for w in ("wait", "idle", "stall", "sleep"))]
+        for name, ms in cols[:6]:         # waiting for another thread isn't work: those stats are skipped
+            if ms < CONFIG["cpu_item_min_ms"]:
+                continue
+            short = name.split("/", 2)[-1]
+            rule = next((r for r in _CPU_RULES if r[0] == thread and any(k in short.lower() for k in r[1])), None)
+            label, why, todo, spec = (rule[2], rule[3], rule[4], rule[5]) if rule else (
+                short, "CPU work in '%s'." % short, "Use Unreal Insights to see what's inside.", [])
+            if spec is None:
+                spec = _DRAWCALL_FIXES
+            share = ms / budget
+            sev = HIGH if share >= 0.25 else (MEDIUM if share >= 0.12 else LOW)
+            nice = "Render thread" if thread == "RenderThread" else "Game thread"
+            out.append(Issue(
+                "cpu_item", CAT_GPU, sev, "%s - %s: %.2f ms" % (nice, label, ms), "CPU %s/%s" % (thread, short),
+                detail="%s\n%.2f ms per frame on the %s (%s)." % (why, ms, nice.lower(), src),
+                solution=todo, metric="%.2f ms" % ms, cost=_score(sev, min(1.0, share)),
+                **_group_kwargs(_related_fixes(scan_issues, spec), "%s cost" % label.lower())))
+    return out
+
+
+def _render_thread_drivers(rt, budget, scan_issues, draws):
+    """What in this level loads the render thread (from the scan counts) + the fixes that reduce it."""
+    c = _STATE.get("counts") or {}
+    if not c:
+        return []
+    lines = ["Primitives drawn by the classic (non-Nanite) path: %s" % _fmt_count(c.get("non_nanite", 0)),
+             "Visible primitive components: %s (+%s instances)" % (_fmt_count(c.get("primitives", 0)),
+                                                                   _fmt_count(c.get("instances", 0))),
+             "Movable primitives: %s (%s cast dynamic shadows)" % (_fmt_count(c.get("movable", 0)),
+                                                                   _fmt_count(c.get("movable_shadow", 0))),
+             "Shadow-casting dynamic lights: %s" % c.get("shadowed_lights", 0),
+             "Scene captures rendering every frame: %s" % c.get("captures", 0)]
+    if draws:
+        lines.append("Measured draw calls per frame: %s" % _fmt_count(draws))
+    spec = _DRAWCALL_FIXES + [("mesh_movable_static",), ("scene_capture",), ("light_contact_shadows",)]
+    sev = HIGH if rt > budget * 1.5 else MEDIUM
+    return [Issue(
+        "rt_drivers", CAT_GPU, sev, "Render thread %.1f ms: what drives it in this level" % rt, "Scene counts",
+        detail="\n".join(lines),
+        solution=("Each primitive, shadow caster and capture costs render-thread time every frame. Biggest levers: "
+                  "Nanite / instancing for repeated props, cull distances, Static mobility, fewer shadowed lights."),
+        metric="%.1f ms" % rt, cost=_score(sev, min(1.0, rt / budget - 0.6)),
+        **_group_kwargs(_related_fixes(scan_issues, spec), "render-thread cost"))]
+
+
+# --- comparing with the previous profile (before/after proof) ----------------------------------------------------------
+def _rule_for_column(col):
+    short = col.split("/", 1)[1].lower()
+    return next((r for r in _GPU_PASS_RULES if any(k in short for k in r[0])), None)
+
+
+def _rule_deltas(prev_means, means):
+    """Measured change per GPU pass rule label: (before ms, after ms)."""
+    out = {}
+    for col in set(prev_means) | set(means):
+        if not col.lower().startswith("gpu/") or col.lower() in ("gpu/total", "gpu/unaccounted"):
+            continue
+        rule = _rule_for_column(col)
+        if rule is None:
+            continue
+        b, a = out.get(rule[1], (0.0, 0.0))
+        out[rule[1]] = (b + prev_means.get(col, 0.0), a + means.get(col, 0.0))
+    return out
+
+
+def _compare_issue(result, scan_issues):
+    """'Since the last profile' summary + a one-click Revert for the fixes that bought nothing measurable."""
+    prev = result.get("prev")
+    if not prev:
+        return []
+    pm, nm = prev["means"], result["means"]
+    f0, f1 = _mean(pm, "FrameTime"), _mean(nm, "FrameTime")
+    if not f0 or not f1:
+        return []
+    deltas = _rule_deltas(pm, nm)
+    t0, t1 = prev.get("time_iso", ""), result.get("time_iso", "~")
+    # fixes applied between the two profiles, from the journal (so a re-scan in between doesn't lose them)
+    known = {}
+    for i in scan_issues or []:
+        for x in [i] + list(i.children):
+            if x.journal:
+                known[x.journal.get("id")] = x
+    applied = []
+    for e in _journal_load():
+        if e.get("reverted") or not t0 <= str(e.get("time", "")) <= t1 or e.get("level", "") not in ("", result.get("level")):
+            continue
+        x = known.get(e.get("id"))
+        if x is None:          # fixed before a re-scan: stand-in issue that can still revert it
+            imp = e.get("impact")
+            x = Issue(str(e.get("check", "")), CAT_GPU, INFO, str(e.get("title", "")), str(e.get("obj", "")), "", "",
+                      fix_label=str(e.get("title", "")), impact=imp if isinstance(imp, str) and imp in IMPACT_LABELS else LOOK)
+            x.status, x.journal = "fixed", e
+        applied.append(x)
+    no_gain = []
+    for i in applied:
+        if any(isinstance(ch, dict) and ch.get("k") == "scal" and not ch.get("live") for ch in i.journal.get("changes") or []):
+            continue          # quality levels the editor isn't running at: nothing to measure here
+        labels = [r[1] for r in _GPU_PASS_RULES if any(e[0] == i.check for e in r[5]) and r[1] in deltas]
+        if not labels and i.check == "gpu_cvar":
+            labels = [r[1] for r in _GPU_PASS_RULES if any(t[0] == i.obj for t in r[6]) and r[1] in deltas]
+        if labels and all(deltas[lb][1] - deltas[lb][0] > -max(0.05, 0.02 * deltas[lb][0]) for lb in labels):
+            if i.revertable:
+                no_gain.append(i)
+    lines = ["Frame: %.2f -> %.2f ms (%+.2f ms)" % (f0, f1, f1 - f0)]
+    for key, name in (("GPUTime", "GPU"), ("RenderThreadTime", "Render thread"), ("GameThreadTime", "Game thread")):
+        a, b = _mean(pm, key), _mean(nm, key)
+        if a and b:
+            lines.append("%s: %.2f -> %.2f ms (%+.2f ms)" % (name, a, b, b - a))
+    moved = sorted(deltas.items(), key=lambda kv: (kv[1][1] - kv[1][0]))
+    if moved:
+        lines.append("GPU passes that changed most:")
+    for label, (b, a) in moved[:4] + [m for m in moved[-2:] if m not in moved[:4] and m[1][1] - m[1][0] > 0.05]:
+        lines.append("  %s: %.2f -> %.2f ms (%+.2f)" % (label, b, a, a - b))
+    lines.append("Fixes applied in between: %d" % len(applied) + "".join(
+        "\n  - %s (%s)" % (i.title, i.obj) for i in applied[:10]) + ("\n  ..." if len(applied) > 10 else ""))
+    if no_gain:
+        lines.append("No measurable gain on their GPU pass:" + "".join(
+            "\n  - %s (%s)" % (i.title, i.obj) for i in no_gain[:10]))
+    issue = Issue("gpu_compare", CAT_GPU, INFO if f1 <= f0 else LOW,
+                  "Since the last profile: %.1f -> %.1f ms (%+.1f)" % (f0, f1, f1 - f0),
+                  "Profiles %s -> %s" % (prev.get("time", "?"), result.get("time", "?")),
+                  detail="\n".join(lines),
+                  solution=("Re-profile after each batch of fixes to see what each one bought. " + (
+                      "%d applied fix(es) showed no measurable gain on their GPU pass: Revert on this row undoes just "
+                      "those (they may still help other views, quality levels or the shipped game)." % len(no_gain)
+                      if no_gain else "Every measured fix got faster or stayed within noise.")),
+                  metric="%+.1f ms" % (f1 - f0), cost=0.0, children=no_gain,
+                  fix_label="Revert the %d fix(es) that showed no measurable gain" % len(no_gain) if no_gain else "")
+    issue.pinned = True
+    return [issue]
+
+
+def _delta_suffix(prev_means, key, now):
+    if prev_means and key in prev_means:
+        return " (%+.2f)" % (now - prev_means[key])
+    return ""
 
 
 def gpu_profile_issues(result, scan_issues=None):
     """Turn an analysed CSV profile into issues (category 'GPU Profile (measured)')."""
     means = result["means"]
+    prev_means = (result.get("prev") or {}).get("means") or {}
     budget = 1000.0 / float(CONFIG["target_fps"])
     cvar_cache = {}
     related = {}
     for i in scan_issues or []:
-        if i.category != CAT_GPU and i.status != "fixed":
+        if i.category not in (CAT_GPU, CAT_SEQ) and i.status != "fixed":
             related[i.category] = related.get(i.category, 0) + 1
-    out = []
+    out = _compare_issue(result, scan_issues)
     frame = _mean(means, "FrameTime")
     gt, rt, gpu = _mean(means, "GameThreadTime"), _mean(means, "RenderThreadTime"), _mean(means, "GPUTime", "GPU/Total")
+    draws = _mean(means, "RHI/DrawCalls")
     src = "%d frames, %s, measured %s" % (result["frames"], os.path.basename(result["path"]), result.get("time", "?"))
 
     if frame:
@@ -3625,10 +4318,9 @@ def gpu_profile_issues(result, scan_issues=None):
         advice = {
             "GPU": "The GPU is the limit: the passes below show where its time goes.",
             "Game thread": ("The game thread is the limit: Blueprint/actor Tick, physics, animation, CPU Niagara. "
-                            "Use 'stat game', 'stat anim' or Unreal Insights to find it; check the Animation findings."),
+                            "See the 'Game thread' findings below, 'stat game' or Unreal Insights."),
             "Render thread": ("The render thread is the limit: too many draw calls / primitives / dynamic shadow "
-                              "casters. Instancing, Nanite, cull distances and fewer shadowed lights help "
-                              "(Meshes & Lighting findings)."),
+                              "casters. See 'Render thread ... what drives it' below."),
         }[bound]
         frame_spec = {"Game thread": [("anim_offscreen_tick",), ("anim_uro",), ("mesh_overlap_events",)],
                       "Render thread": _DRAWCALL_FIXES}.get(bound, [])
@@ -3641,7 +4333,8 @@ def gpu_profile_issues(result, scan_issues=None):
                     "Standalone game for final numbers." % (
                         src, frame, ("%.2f ms" % gt) if gt else "n/a", ("%.2f ms" % rt) if rt else "n/a",
                         ("%.2f ms" % gpu) if gpu else "n/a", budget, CONFIG["target_fps"])),
-            solution=advice, metric="%.1f ms" % frame, cost=_score(sev, min(1.0, ratio - 1.0)), **frame_kw))
+            solution=advice, metric="%.1f ms%s" % (frame, _delta_suffix(prev_means, "FrameTime", frame)),
+            cost=_score(sev, min(1.0, ratio - 1.0)), **frame_kw))
 
     passes = [(k, v) for k, v in means.items() if k.lower().startswith("gpu/") and
               k.lower() not in ("gpu/total", "gpu/unaccounted") and v > 0]
@@ -3652,28 +4345,39 @@ def gpu_profile_issues(result, scan_issues=None):
             continue
         sev = HIGH if share >= 0.25 else (MEDIUM if share >= 0.12 else LOW)
         short = name.split("/", 1)[1]
-        rule = next((r for r in _GPU_PASS_RULES if any(k in short.lower() for k in r[0])), None)
+        rule = _rule_for_column(name)
         label, cat, why, todo, spec, tweaks = rule[1:7] if rule else (
             short, None, "GPU pass '%s'." % short, "Run 'ProfileGPU' (Ctrl+Shift+,) and expand this pass to see what's inside.",
             [], [])
         children = _related_fixes(scan_issues, spec) + _cvar_children(tweaks, label, cvar_cache)
+        if rule is not None and rule[1] == "Direct lighting" and (_STATE.get("counts") or {}).get("shadowed_lights", 0) >= CONFIG["megalights_lights"]:
+            todo += ("\n\nMany shadowed lights: UE 5.5+ MegaLights (Project Settings > Rendering > MegaLights) can make "
+                     "direct lighting cost nearly independent of the light count. Test it on a copy of the level.")
         if cat and related.get(cat):
             todo += "\n\nThe scene scan found %d open issue(s) in '%s' - start there." % (related[cat], cat)
         if not children:
-            if not any(i.category != CAT_GPU for i in (scan_issues or [])):
+            if not any(i.category not in (CAT_GPU, CAT_SEQ) for i in (scan_issues or [])):
                 todo += "\n\nNo Fix button yet: scan the level so the related fixes can be linked."
             elif spec or tweaks:
                 todo += ("\n\nNo Fix button: the scan found no open, auto-fixable issue behind this pass (they may "
                          "already be fixed or need manual work - see the solution above).")
             else:
                 todo += "\n\nNo automatic fix: this cost comes from content (see the solution above)."
+        before = ""
+        if prev_means and name in prev_means:
+            b = prev_means[name]
+            before = "\nPrevious profile: %.2f ms -> now %.2f ms (%+.2f ms, %+.0f%%)." % (
+                b, ms, ms - b, (ms - b) / b * 100.0 if b else 0.0)
         out.append(Issue(
             "gpu_pass", CAT_GPU, sev, "%s: %.2f ms" % (label, ms), "GPU pass %s" % short,
-            detail="%s\n%.2f ms on average = %.0f%% of the %.1f ms frame budget (%s)." % (why, ms, share * 100, budget, src),
-            solution=todo, metric="%.2f ms" % ms, cost=_score(sev, min(1.0, share)),
+            detail="%s\n%.2f ms on average = %.0f%% of the %.1f ms frame budget (%s).%s" % (
+                why, ms, share * 100, budget, src, before),
+            solution=todo, metric="%.2f ms%s" % (ms, _delta_suffix(prev_means, name, ms)), cost=_score(sev, min(1.0, share)),
             **_group_kwargs(children, label.lower())))
 
-    draws = _mean(means, "RHI/DrawCalls")
+    out += _cpu_findings(means, budget, scan_issues, src)
+    if rt and rt > budget * 0.6:
+        out += _render_thread_drivers(rt, budget, scan_issues, draws)
     if draws and draws > CONFIG["draw_calls_warn"]:
         sev = HIGH if draws > CONFIG["draw_calls_warn"] * 2 else MEDIUM
         out.append(Issue(
@@ -3682,7 +4386,9 @@ def gpu_profile_issues(result, scan_issues=None):
                    "render-thread bottleneck." % (draws, src),
             solution=("Merge/instance repeated props (Meshes findings: instancing candidates), enable Nanite, add cull "
                       "distances, reduce dynamic shadow casters and material slots per mesh."),
-            metric="%s draws" % _fmt_count(draws), cost=_score(sev, min(1.0, draws / (CONFIG["draw_calls_warn"] * 4.0))),
+            metric="%s draws%s" % (_fmt_count(draws), (" (%+d)" % (draws - prev_means["RHI/DrawCalls"]))
+                                   if "RHI/DrawCalls" in prev_means else ""),
+            cost=_score(sev, min(1.0, draws / (CONFIG["draw_calls_warn"] * 4.0))),
             **_group_kwargs(_related_fixes(scan_issues, _DRAWCALL_FIXES), "draw calls")))
     prims = _mean(means, "RHI/PrimitivesDrawn")
     if prims and prims > CONFIG["primitives_warn"]:
@@ -3693,6 +4399,7 @@ def gpu_profile_issues(result, scan_issues=None):
             metric=_fmt_count(prims), cost=_score(MEDIUM, 0.5),
             **_group_kwargs(_related_fixes(scan_issues, [("mesh_high_poly",), ("mesh_missing_lods",), ("mesh_cull_distance",)]),
                             "the triangle count")))
+    out += _streaming_measured(means, scan_issues, src)
     if not passes:
         out.append(Issue(
             "gpu_nopasses", CAT_GPU, INFO, "No per-pass GPU timings in the capture", os.path.basename(result["path"]),
@@ -3700,6 +4407,22 @@ def gpu_profile_issues(result, scan_issues=None):
                    "times were analysed.",
             solution="Use 'ProfileGPU' (Ctrl+Shift+,) for the per-pass breakdown, or Unreal Insights with the GPU channel."))
     return out
+
+
+def _streaming_measured(means, scan_issues, src):
+    """Texture streaming pool pressure from the CSV, when Unreal recorded it."""
+    low = {k.lower(): v for k, v in means.items()}
+    need = next((v for k, v in low.items() if "texturestreaming" in k and ("requiredpool" in k or "wantedmips" in k)), None)
+    pool = next((v for k, v in low.items() if "texturestreaming" in k and ("poolsize" in k or k.endswith("/streamingpool"))), None)
+    if not need or not pool or need <= pool:
+        return []
+    return [Issue(
+        "gpu_streaming", CAT_GPU, MEDIUM, "Texture streaming over budget: %.0f / %.0f MB" % (need, pool), "TextureStreaming",
+        detail="The textures in view want %.0f MB but the streaming pool is %.0f MB (%s), so some surfaces get blurrier "
+               "mips." % (need, pool, src),
+        solution="Cap oversized textures (Textures findings) or raise r.Streaming.PoolSize if the target hardware has the VRAM.",
+        metric="%.0f MB over" % (need - pool), cost=_score(MEDIUM, min(1.0, (need - pool) / pool)),
+        **_group_kwargs(_related_fixes(scan_issues, [("tex_oversized",), ("tex_never_stream",)]), "texture memory"))]
 
 
 def _csv_complete(path):
@@ -3715,89 +4438,495 @@ def _csv_complete(path):
     return any(line.lstrip().startswith("[") for line in tail.splitlines())
 
 
-def profile_gpu(frames=None, on_done=None, auto_scan=True):
-    """Capture `frames` frames with the CSV profiler (GPU stats on), analyse them and add the result to the
-    last scan. Asynchronous: keep the level viewport visible (Realtime on) while it runs. on_done(issues, error)."""
+# =============================================================================
+# Jobs: multi-step work (captures, screenshots, shot-by-shot profiling) driven by the Slate tick, so the editor
+# keeps rendering while the tool waits. A job is a generator that yields seconds to wait.
+# =============================================================================
+_JOB = {"gen": None, "until": 0.0, "next_poll": 0.0, "on_done": None, "name": "", "cancel": False}
+
+
+def job_busy():
+    return _PROFILE["busy"]
+
+
+def start_job(gen, on_done=None, name="job"):
+    """Run generator `gen` on the Slate tick; on_done(result, error) when it returns, fails or is cancelled."""
     if _PROFILE["busy"]:
-        raise RuntimeError("A GPU profile is already running.")
-    frames = max(10, min(2000, int(frames or CONFIG["profile_frames"])))
-    if auto_scan and not any(i.category != CAT_GPU for i in _STATE["issues"]):
-        _log("No scan yet: scanning the level first so GPU findings get Fix buttons.")
-        scan()
+        raise RuntimeError("%s is already running." % (_JOB["name"] or "Another job"))
+    _JOB.update(gen=gen, until=0.0, next_poll=0.0, on_done=on_done, name=name, cancel=False)
+    _PROFILE["busy"] = True
+    _PROFILE["handle"] = unreal.register_slate_post_tick_callback(_job_tick)
+    _job_step(time.time())        # the first step runs now (console commands, early errors)
+
+
+def cancel_job():
+    if _PROFILE["busy"]:
+        _JOB["cancel"] = True
+
+
+def _job_finish(result, error):
+    if not _PROFILE["busy"]:
+        return
+    _PROFILE["busy"] = False
+    if _PROFILE["handle"] is not None:
+        try:
+            unreal.unregister_slate_post_tick_callback(_PROFILE["handle"])
+        except Exception:
+            pass
+        _PROFILE["handle"] = None
+    gen, _JOB["gen"] = _JOB["gen"], None
+    try:
+        if gen is not None:
+            gen.close()      # runs the generator's finally blocks if it didn't finish (restores settings)
+    except Exception:
+        pass
+    if error == "cancelled":
+        _log("%s stopped." % _JOB["name"])
+    elif error:
+        _warn("%s: %s" % (_JOB["name"], error))
+    if _JOB["on_done"] is not None:
+        try:
+            _JOB["on_done"](result, error)
+        except Exception:
+            _warn("%s callback failed:\n%s" % (_JOB["name"], traceback.format_exc()))
+
+
+def _job_tick(_dt):
+    if not _PROFILE["busy"]:
+        return
+    now = time.time()
+    if now < _JOB["next_poll"]:
+        return
+    _JOB["next_poll"] = now + 0.25            # 4x per second is plenty, and keeps the measured frames clean
+    if _JOB["cancel"]:
+        _job_finish(None, "cancelled")
+        return
+    if now < _JOB["until"]:
+        return
+    _job_step(now)
+
+
+def _job_step(now):
+    gen = _JOB["gen"]
+    if gen is None:
+        return
+    try:
+        wait = gen.send(None)
+    except StopIteration as e:
+        _job_finish(getattr(e, "value", None), None)
+        return
+    except Exception as e:
+        if not isinstance(e, RuntimeError):            # RuntimeErrors are expected failures with a clear message
+            _warn("%s failed:\n%s" % (_JOB["name"], traceback.format_exc()))
+        _job_finish(None, str(e) or e.__class__.__name__)
+        return
+    _JOB["until"] = now + float(wait or 0.0)
+
+
+def _capture_csv(frames):
+    """Job step: capture `frames` frames with the CSV profiler (GPU stats on) and return the analysed result."""
+    frames = max(10, min(2000, int(frames)))
     folder = _csv_dir()
     before = _csv_files(folder)
     old_stats = _cvar_int("r.GPUCsvStatsEnabled", 0)
     world = _editor_world()
-    level = world.get_name() if world else ""
     _run_console("r.GPUCsvStatsEnabled 1")
-    _run_console("csvprofile frames=%d" % frames)
-    _log("GPU profile started: %d frames (keep the viewport visible)." % frames)
-    start = time.time()
-    timeout = 30.0 + frames / 5.0
-    state = {"candidate": None, "size": -1, "since": 0.0, "next_poll": 0.0}
-    _PROFILE["busy"] = True
-
-    def finish(issues, error):
-        if not _PROFILE["busy"]:
-            return
-        _PROFILE["busy"] = False
-        if _PROFILE["handle"] is not None:
+    finished = False
+    try:
+        _run_console("csvprofile frames=%d" % frames)
+        start = time.time()
+        timeout = 30.0 + frames / 5.0
+        cand = {"name": None, "size": -1, "since": 0.0}
+        while True:
+            yield 0.25
+            now_t = time.time()
+            if now_t - start > timeout:
+                raise RuntimeError("the capture didn't finish within %.0f s (folder %s). Is the viewport rendering "
+                                   "(Realtime on)?" % (timeout, folder))
+            now = _csv_files(folder)
+            new = [f for f in now if f not in before or now[f] != before[f]]
+            if not new:
+                continue
+            newest = max(new, key=lambda f: now[f][1])
+            size = now[newest][0]
+            if newest != cand["name"] or size != cand["size"]:
+                cand.update(name=newest, size=size, since=now_t)      # still being written
+                continue
+            path = os.path.join(folder, newest)
+            # finished = size stable for 1 s AND Unreal wrote the closing metadata row
+            if size <= 0 or now_t - cand["since"] < 1.0 or not _csv_complete(path):
+                continue
             try:
-                unreal.unregister_slate_post_tick_callback(_PROFILE["handle"])
+                result = analyse_csv(path)
+            except Exception as e:
+                raise RuntimeError("could not analyse %s: %s" % (newest, e))
+            now_dt = datetime.datetime.now()
+            result.update(level=world.get_name() if world else "", time=now_dt.strftime("%H:%M:%S"),
+                          time_iso=now_dt.isoformat())
+            finished = True
+            return result
+    finally:
+        if not finished:
+            try:
+                _run_console("csvprofile stop")     # cancelled / timed out: don't leave a capture running
             except Exception:
                 pass
-            _PROFILE["handle"] = None
         try:
             _run_console("r.GPUCsvStatsEnabled %d" % (old_stats or 0))
         except Exception:
             pass
-        if error:
-            _warn("GPU profile: %s" % error)
-        else:
-            keep = [i for i in _STATE["issues"] if i.category != CAT_GPU]
-            _STATE["issues"] = sorted(keep + issues, key=lambda i: (-i.cost, -i.severity, i.title))
-            _log("GPU profile done: %d finding(s)." % len(issues))
-        if on_done is not None:
+
+
+def _finish_profile(result):
+    """Store the profile (keeping the previous one of the same level for comparison) and build its findings."""
+    prev = _STATE.get("gpu_profile")
+    if prev and prev.get("level") == result.get("level"):
+        prev = dict(prev)
+        prev.pop("prev", None)                 # keep exactly one step of history
+        result["prev"] = prev
+    issues = gpu_profile_issues(result, _STATE["issues"])
+    _STATE["gpu_profile"] = result
+    keep = [i for i in _STATE["issues"] if i.category != CAT_GPU]
+    _STATE["issues"] = _sorted_issues(keep + issues)
+    _refresh_all_groups()
+    _log("GPU profile done: %d finding(s)." % len(issues))
+    return issues
+
+
+def _sorted_issues(issues):
+    return sorted(issues, key=lambda i: (not i.pinned, -i.cost, -i.severity, i.title))
+
+
+def profile_gpu(frames=None, on_done=None, auto_scan=True):
+    """Capture `frames` frames with the CSV profiler (GPU stats on), analyse them and add the result to the
+    last scan, compared with the previous profile of the same level. Asynchronous: keep the level viewport visible
+    (Realtime on) while it runs. on_done(issues, error)."""
+    if _PROFILE["busy"]:
+        raise RuntimeError("A GPU profile is already running.")
+    frames = max(10, min(2000, int(frames or CONFIG["profile_frames"])))
+    if auto_scan and not any(i.category not in (CAT_GPU, CAT_SEQ) for i in _STATE["issues"]):
+        _log("No scan yet: scanning the level first so GPU findings get Fix buttons.")
+        scan()
+    _log("GPU profile started: %d frames (keep the viewport visible)." % frames)
+
+    def done(result, error):
+        issues = []
+        if error is None:
             try:
-                on_done(issues, error)
-            except Exception:
-                _warn("GPU profile callback failed:\n%s" % traceback.format_exc())
+                issues = _finish_profile(result)
+            except Exception as e:
+                error = "could not analyse the capture: %s" % e
+                _warn(traceback.format_exc())
+        if on_done is not None:
+            on_done(issues, error)
 
-    def tick(_dt):
-        if not _PROFILE["busy"]:
-            return
-        now_t = time.time()
-        if now_t < state["next_poll"]:
-            return
-        state["next_poll"] = now_t + 0.25            # poll 4x per second, not every frame
-        if now_t - start > timeout:
-            finish([], "the capture didn't finish within %.0f s (folder %s). Is the viewport rendering "
-                       "(Realtime on)?" % (timeout, folder))
-            return
-        now = _csv_files(folder)
-        new = [f for f in now if f not in before or now[f] != before[f]]
-        if not new:
-            return
-        newest = max(new, key=lambda f: now[f][1])
-        size = now[newest][0]
-        if newest != state["candidate"] or size != state["size"]:
-            state.update(candidate=newest, size=size, since=now_t)   # still being written
-            return
-        path = os.path.join(folder, newest)
-        # finished = size stable for 1 s AND Unreal wrote the closing metadata row
-        if size <= 0 or now_t - state["since"] < 1.0 or not _csv_complete(path):
-            return
+    start_job(_capture_csv(frames), done, "GPU profile")
+
+
+# =============================================================================
+# Before/after screenshots for visual fixes
+# =============================================================================
+def _shots_dir():
+    folder = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), "PerfAudit", "Shots")
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+    return folder
+
+
+def _png_files(root):
+    out = {}
+    for base, _dirs, files in os.walk(root):
+        for f in files:
+            if f.lower().endswith(".png"):
+                p = os.path.join(base, f)
+                try:
+                    st = os.stat(p)
+                    out[p] = (st.st_size, st.st_mtime)
+                except Exception:
+                    pass
+    return out
+
+
+def _capture_shot(tag):
+    """Job step: screenshot of the active level viewport; returns the PNG path (None when it couldn't be taken)."""
+    name = "PerfAudit_%s_%s" % (datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"), tag)
+    target = os.path.join(_shots_dir(), name + ".png")
+    root = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), "Screenshots")
+    before = _png_files(root)
+    w, h = int(CONFIG["shot_width"]), int(CONFIG["shot_height"])
+    requested = False
+    lib = _ucls("AutomationLibrary")
+    if lib is not None:
         try:
-            result = analyse_csv(path)
-            result.update(level=level, time=datetime.datetime.now().strftime("%H:%M:%S"))
-            issues = gpu_profile_issues(result, _STATE["issues"])
-        except Exception as e:
-            finish([], "could not analyse %s: %s" % (newest, e))
-            return
-        _STATE["gpu_profile"] = result
-        finish(issues, None)
+            lib.take_high_res_screenshot(w, h, name + ".png")
+            requested = True
+        except Exception:
+            requested = False
+    if not requested:
+        try:
+            _run_console("HighResShot %dx%d" % (w, h))
+        except Exception:
+            return None
+    start = time.time()
+    seen = {}
+    while time.time() - start < CONFIG["shot_timeout_seconds"]:
+        yield 0.25
+        now = _png_files(root)
+        new = [p for p in now if p not in before or now[p] != before[p]]
+        if os.path.exists(target):
+            new.append(target)
+        mine = [p for p in new if os.path.basename(p).startswith(name)] or new
+        if not mine:
+            continue
+        path = max(mine, key=lambda p: os.path.getmtime(p))
+        size = os.path.getsize(path)
+        if size > 0 and seen.get(path) == size:           # written completely (same size twice in a row)
+            if path != target:
+                shutil.copyfile(path, target)
+            return target
+        seen[path] = size
+    _warn("Screenshot '%s' didn't appear within %.0f s." % (tag, CONFIG["shot_timeout_seconds"]))
+    return None
 
-    _PROFILE["handle"] = unreal.register_slate_post_tick_callback(tick)
+
+def fix_with_screenshots(issues, on_done=None):
+    """Job: viewport screenshot -> apply the fixes -> let it settle -> screenshot. Shots are attached to the issues
+    (issue.shots) for the before/after comparison. on_done((fixed, failed, before, after), error)."""
+    todo = [i for i in issues if i.fixable]
+
+    def flow():
+        before = yield from _capture_shot("before")
+        fixed, failed = apply_fixes(todo, "World Perf Audit: Fix %d issue(s)" % len(todo))
+        yield float(CONFIG["shot_settle_seconds"])        # shaders / mesh rebuilds / streaming catch up
+        after = (yield from _capture_shot("after")) if before else None
+        if before and after:
+            for i in todo:
+                for x in [i] + list(i.children):
+                    x.shots = {"before": before, "after": after}
+        return fixed, failed, before, after
+
+    start_job(flow(), on_done, "Fix with before/after screenshots")
+
+
+# =============================================================================
+# Sequencer: shot-by-shot profiling and spawnable templates
+# =============================================================================
+def _seq_lib():
+    return _ucls("LevelSequenceEditorBlueprintLibrary")
+
+
+def current_sequence():
+    lib = _seq_lib()
+    try:
+        return lib.get_current_level_sequence() if lib is not None else None
+    except Exception:
+        return None
+
+
+def _find_tracks(seq, class_name):
+    cls = _ucls(class_name)
+    if cls is None or seq is None:
+        return []
+    for fn in ("find_tracks_by_type", "find_master_tracks_by_type"):
+        try:
+            return list(getattr(seq, fn)(cls) or [])
+        except Exception:
+            continue
+    return []
+
+
+def _sub_sequences(seq):
+    out = []
+    for track in _find_tracks(seq, "MovieSceneCinematicShotTrack") + _find_tracks(seq, "MovieSceneSubTrack"):
+        try:
+            for sec in track.get_sections() or []:
+                sub = sec.get_sequence()
+                if sub is not None:
+                    out.append(sub)
+        except Exception:
+            pass
+    return out
+
+
+def sequence_spawnable_templates(seq=None, depth=0):
+    """Template actors of the spawnables in the open Level Sequence (and its shots). They live in the sequence
+    asset, so fixes on them stick - unlike the temporary actors Sequencer spawns into the level."""
+    seq = seq if seq is not None else current_sequence()
+    if seq is None or depth > 3:
+        return []
+    out = []
+    try:
+        bindings = seq.get_spawnables() or []
+    except Exception:
+        bindings = []
+    for b in bindings:
+        try:
+            t = b.get_object_template()
+        except Exception:
+            t = None
+        if t is not None and isinstance(t, unreal.Actor):
+            out.append(t)
+    for sub in _sub_sequences(seq):
+        out += sequence_spawnable_templates(sub, depth + 1)
+    return out
+
+
+def sequence_shots(seq):
+    """[{name, start, end, mid}] in display-rate frames: cinematic shots, else camera cuts, else equal chunks."""
+    shots = []
+    for track in _find_tracks(seq, "MovieSceneCinematicShotTrack"):
+        for sec in (track.get_sections() or []):
+            try:
+                name = _call_first(lambda: sec.get_shot_display_name(), lambda: sec.get_sequence().get_name(),
+                                   lambda: sec.get_name())
+                shots.append({"name": str(name), "start": int(sec.get_start_frame()), "end": int(sec.get_end_frame())})
+            except Exception:
+                pass
+    if not shots:
+        for track in _find_tracks(seq, "MovieSceneCameraCutTrack"):
+            for n, sec in enumerate(track.get_sections() or []):
+                try:
+                    shots.append({"name": "Camera cut %d" % (n + 1), "start": int(sec.get_start_frame()),
+                                  "end": int(sec.get_end_frame())})
+                except Exception:
+                    pass
+    if not shots:
+        try:
+            a, b = int(seq.get_playback_start()), int(seq.get_playback_end())
+        except Exception:
+            a, b = 0, 0
+        n = max(1, int(CONFIG["sequence_segments"]))
+        step = max(1, (b - a) // n)
+        shots = [{"name": "Frames %d-%d" % (a + k * step, a + (k + 1) * step), "start": a + k * step,
+                  "end": a + (k + 1) * step} for k in range(n) if b > a]
+    shots = sorted(shots, key=lambda s: s["start"])[:int(CONFIG["max_shots"])]
+    for s in shots:
+        s["mid"] = (s["start"] + max(s["start"], s["end"] - 1)) // 2
+    return shots
+
+
+def sequence_issues(profile, scan_issues):
+    """One finding per profiled shot, with the fixes that reduce that shot's most expensive passes."""
+    out = []
+    budget = 1000.0 / float(CONFIG["target_fps"])
+    for r in profile.get("results", []):
+        means, shot = r["means"], r["shot"]
+        frame = _mean(means, "FrameTime")
+        if not frame:
+            continue
+        gt, rt, gpu = _mean(means, "GameThreadTime"), _mean(means, "RenderThreadTime"), _mean(means, "GPUTime", "GPU/Total")
+        bound = max([(gpu or 0, "GPU"), (gt or 0, "game thread"), (rt or 0, "render thread")])[1]
+        passes = sorted([(k, v) for k, v in means.items() if k.lower().startswith("gpu/")
+                         and k.lower() not in ("gpu/total", "gpu/unaccounted") and v > 0], key=lambda kv: -kv[1])[:5]
+        spec = []
+        for col, _ms in passes:
+            rule = _rule_for_column(col)
+            if rule is not None:
+                spec += [e for e in rule[5] if e not in spec]
+        if bound == "render thread":
+            spec += [e for e in _DRAWCALL_FIXES if e not in spec]
+        ratio = frame / budget
+        sev = HIGH if ratio >= 1.5 else (MEDIUM if ratio >= 1.1 else (LOW if ratio >= 0.9 else INFO))
+        lines = ["Frames %d-%d of %s, profiled at frame %d (%d frames averaged)." % (
+            shot["start"], shot["end"], profile.get("sequence", "?"), shot["mid"], r["frames"]),
+            "Frame %.2f ms - GPU %s, render thread %s, game thread %s." % (
+                frame, ("%.2f ms" % gpu) if gpu else "n/a", ("%.2f ms" % rt) if rt else "n/a",
+                ("%.2f ms" % gt) if gt else "n/a"),
+            "Most expensive GPU passes:"] + ["  %s: %.2f ms" % (k.split("/", 1)[1], v) for k, v in passes]
+        issue = Issue(
+            "seq_shot", CAT_SEQ, sev, "Shot '%s': %.1f ms (%s-bound)" % (shot["name"], frame, bound),
+            "%s  [frames %d-%d]" % (profile.get("sequence", "?"), shot["start"], shot["end"]),
+            detail="\n".join(lines),
+            solution=("Go To jumps Sequencer to this shot (camera locked to the viewport). Fix applies the scan fixes "
+                      "behind this shot's most expensive passes; spawnables are fixed on their template in the "
+                      "sequence, so the fix sticks."),
+            metric="%.1f ms" % frame, cost=_score(sev, min(1.0, max(0.0, ratio - 1.0))),
+            **_group_kwargs(_related_fixes(scan_issues, spec), "this shot's cost"))
+        issue.extra = {"shot": shot, "sequence": profile.get("sequence")}
+        out.append(issue)
+    return out
+
+
+def goto_shot(shot, sequence_name=None):
+    """Jump the open Level Sequence to the middle of a profiled shot (camera cut locked to the viewport)."""
+    lib, seq = _seq_lib(), current_sequence()
+    if lib is None or seq is None:
+        raise RuntimeError("Open the Level Sequence in Sequencer to jump to its shots.")
+    if sequence_name and seq.get_name() != sequence_name:
+        raise RuntimeError("Sequencer shows '%s', but this shot belongs to '%s'." % (seq.get_name(), sequence_name))
+    try:
+        lib.set_lock_camera_cut_to_viewport(True)
+    except Exception:
+        pass
+    lib.set_current_time(int(shot["mid"]))
+
+
+def profile_sequence(frames=None, on_done=None, progress=None):
+    """Job: step through the open Level Sequence shot by shot (camera cut locked to the viewport), capture each shot,
+    then park on the worst shot and scan there (so its spawnables are included). on_done(issues, error)."""
+    lib = _seq_lib()
+    seq = current_sequence()
+    if seq is None:
+        raise RuntimeError("Open a Level Sequence in Sequencer first.")
+    if _PROFILE["busy"]:
+        raise RuntimeError("Another capture is running.")
+    shots = sequence_shots(seq)
+    if not shots:
+        raise RuntimeError("The open sequence has no playback range to profile.")
+    frames = int(frames or CONFIG["shot_profile_frames"])
+
+    def flow():
+        old_time = _call_first(lambda: lib.get_current_time(), lambda: None)
+        old_lock = _call_first(lambda: lib.is_camera_cut_locked_to_viewport(), lambda: None)
+        results = []
+        try:
+            try:
+                lib.pause()
+            except Exception:
+                pass
+            try:
+                lib.set_lock_camera_cut_to_viewport(True)
+            except Exception:
+                pass
+            for n, shot in enumerate(shots):
+                if progress is not None:
+                    progress("Shot %d/%d: %s" % (n + 1, len(shots), shot["name"]))
+                lib.set_current_time(shot["mid"])
+                yield float(CONFIG["shot_warmup_seconds"])         # spawnables, streaming, Level Visibility tracks
+                r = yield from _capture_csv(frames)
+                r["shot"] = shot
+                results.append(r)
+            return results
+        finally:
+            if old_lock is not None:
+                try:
+                    lib.set_lock_camera_cut_to_viewport(bool(old_lock))
+                except Exception:
+                    pass
+            if len(results) < len(shots) and old_time is not None:      # cancelled / failed: put the playhead back
+                try:
+                    lib.set_current_time(int(old_time))
+                except Exception:
+                    pass
+
+    def done(results, error):
+        issues = []
+        if error is None and results:
+            try:
+                worst = max(results, key=lambda r: _mean(r["means"], "FrameTime") or 0.0)
+                lib.set_current_time(worst["shot"]["mid"])
+                _STATE["sequence_profile"] = {"sequence": seq.get_name(), "level": worst.get("level", ""),
+                                              "results": results}
+                scan()                                    # at the worst shot: its spawnables + templates included
+                issues = [i for i in _STATE["issues"] if i.category == CAT_SEQ]
+            except Exception as e:
+                error = "could not analyse the sequence: %s" % e
+                _warn(traceback.format_exc())
+        if on_done is not None:
+            on_done(issues, error)
+
+    _log("Sequence profile started: %d shot(s) of %s, %d frames each." % (len(shots), seq.get_name(), frames))
+    start_job(flow(), done, "Sequence profile")
 
 
 # =============================================================================
@@ -3936,6 +5065,20 @@ _STATUS_COLORS = {"fixed": "#22c55e", "reverted": "#a1a1aa", "failed": "#ef4444"
 _IMPACT_ORDER = {SAFE: 0, LOOK: 1, GAMEPLAY: 2}
 
 
+def _can_revert(issue):
+    """Revert button state: a fixed issue, or the profile comparison while it still holds fixes to take back."""
+    return issue.revertable and (issue.status == "fixed" or issue.check == "gpu_compare")
+
+
+def _shots_of(issue):
+    """Before/after screenshots of an issue (or of one of its applied fixes), when both files still exist."""
+    for x in [issue] + list(issue.children):
+        sh = x.shots
+        if sh and all(sh.get(k) and os.path.isfile(sh[k]) for k in ("before", "after")):
+            return sh
+    return None
+
+
 def _qexec(obj, *args):
     """exec() on Qt6 / exec_() on older bindings."""
     fn = getattr(obj, "exec", None) or getattr(obj, "exec_")
@@ -3948,6 +5091,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
     SORT_ROLE = USER + 1
     COLOR_ROLE = USER + 2
     SUB_ROLE = USER + 3
+    PIN_ROLE = USER + 4
     esc = lambda t: html.escape(str(t)).replace("\n", "<br>")
 
     def _tip(text):
@@ -3957,6 +5101,10 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
     class _Row(QtWidgets.QTreeWidgetItem):
         def __lt__(self, other):
             tree = self.treeWidget()
+            pa, pb = bool(self.data(0, PIN_ROLE)), bool(other.data(0, PIN_ROLE))
+            if pa != pb:          # pinned rows (profile comparison) stay on top in either sort order
+                asc = tree is None or tree.header().sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+                return pa if asc else pb
             col = tree.sortColumn() if tree is not None else 0
             a, b = self.data(col, SORT_ROLE), other.data(col, SORT_ROLE)
             if a is None or b is None:
@@ -4078,6 +5226,117 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             _icons[color] = pm
         return _icons[color]
 
+    class _DetailBrowser(QtWidgets.QTextBrowser):
+        """Details panel; serves the before/after thumbnails from memory ('shot:' URLs)."""
+
+        def __init__(self, *a):
+            super(_DetailBrowser, self).__init__(*a)
+            self.images = {}
+
+        def loadResource(self, rtype, url):
+            img = self.images.get(url.toString())
+            if img is not None:
+                return img
+            return super(_DetailBrowser, self).loadResource(rtype, url)
+
+    def _changed_share(a, b):
+        """Share of pixels that visibly differ between two screenshots (compared at 160x90)."""
+        size = QtCore.QSize(160, 90)
+        sa = a.scaled(size, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        sb = b.scaled(size, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        sa = sa.convertToFormat(QtGui.QImage.Format.Format_RGB32)
+        sb = sb.convertToFormat(QtGui.QImage.Format.Format_RGB32)
+        changed = 0
+        for y in range(size.height()):
+            for x in range(size.width()):
+                pa, pb = sa.pixel(x, y), sb.pixel(x, y)
+                if max(abs(((pa >> s_) & 255) - ((pb >> s_) & 255)) for s_ in (16, 8, 0)) > 24:
+                    changed += 1
+        return changed / float(size.width() * size.height())
+
+    def _diff_image(a, b):
+        """|after - before| per pixel, brightened 4x so small changes show."""
+        base = a.convertToFormat(QtGui.QImage.Format.Format_RGB32)
+        other = b.scaled(base.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        diff = base.copy()
+        p = QtGui.QPainter(diff)
+        p.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_Difference)
+        p.drawImage(0, 0, other)
+        p.end()
+        out = diff.copy()
+        p = QtGui.QPainter(out)
+        p.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_Plus)
+        for _ in range(3):
+            p.drawImage(0, 0, diff)
+        p.end()
+        return out
+
+    class _CompareView(QtWidgets.QWidget):
+        """Before | after wipe (drag to move the split), or one of: before, after, difference."""
+
+        def __init__(self, before, after, parent=None):
+            super(_CompareView, self).__init__(parent)
+            self.before, self.after = before, after
+            self.diff = None
+            self.mode = "wipe"
+            self.split = 0.5
+            self.setMinimumSize(640, 360)
+            self.setCursor(QtGui.QCursor(Qt.CursorShape.SplitHCursor))
+
+        def set_mode(self, mode):
+            if mode == "diff" and self.diff is None:
+                self.diff = _diff_image(self.before, self.after)
+            self.mode = mode
+            self.update()
+
+        def _target(self):
+            img = self.before
+            if img.isNull() or not img.width() or not img.height():
+                return QtCore.QRectF(self.rect())
+            k = min(self.width() / float(img.width()), self.height() / float(img.height()))
+            w, h = img.width() * k, img.height() * k
+            return QtCore.QRectF((self.width() - w) / 2.0, (self.height() - h) / 2.0, w, h)
+
+        def paintEvent(self, _e):
+            p = QtGui.QPainter(self)
+            p.fillRect(self.rect(), QtGui.QColor("#0b0b0d"))
+            p.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+            r = self._target()
+            img = {"before": self.before, "after": self.after, "diff": self.diff}.get(self.mode)
+            if img is not None:
+                p.drawImage(r, img)
+            else:
+                x = r.x() + r.width() * self.split
+                p.drawImage(r, self.after)
+                p.save()
+                p.setClipRect(QtCore.QRectF(r.x(), r.y(), x - r.x(), r.height()))
+                p.drawImage(r, self.before)
+                p.restore()
+                p.setPen(QtGui.QPen(QtGui.QColor("#fafafa"), 2))
+                p.drawLine(QtCore.QPointF(x, r.y()), QtCore.QPointF(x, r.bottom()))
+                f = QtGui.QFont(self.font())
+                f.setBold(True)
+                p.setFont(f)
+                for text, left in (("BEFORE", True), ("AFTER", False)):
+                    box = QtCore.QRectF(r.x() + 10 if left else r.right() - 80, r.y() + 10, 70, 22)
+                    p.fillRect(box, QtGui.QColor(0, 0, 0, 150))
+                    p.drawText(box, int(Qt.AlignmentFlag.AlignCenter), text)
+            p.end()
+
+        def _drag(self, e):
+            r = self._target()
+            pos = e.position().x() if hasattr(e, "position") else e.x()
+            self.split = max(0.0, min(1.0, (pos - r.x()) / max(1.0, r.width())))
+            if self.mode != "wipe":
+                self.mode = "wipe"
+            self.update()
+
+        def mousePressEvent(self, e):
+            self._drag(e)
+
+        def mouseMoveEvent(self, e):
+            self._drag(e)
+
     class AuditWindow(QtWidgets.QWidget):
         COLS = ["Severity", "Cost", "Issue", "Measured", "Fix impact", "Status", ""]
         C_SEV, C_COST, C_TITLE, C_METRIC, C_IMPACT, C_STATUS, C_ACTION = range(7)
@@ -4168,6 +5427,12 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             tb.setSpacing(8)
             self.btn_scan = self._btn("Scan Level", self.on_scan, "Primary", "Run all enabled checks on the loaded actors")
             self.chk_selected = QtWidgets.QCheckBox("Selected actors only")
+            self.chk_shots = QtWidgets.QCheckBox("Before/after shots")
+            self.chk_shots.setChecked(bool(CONFIG["before_after_shots"]))
+            self.chk_shots.setToolTip(
+                "For fixes that might change the look: take a viewport screenshot before and after the fix\n"
+                "(Saved/PerfAudit/Shots), then compare them with a wipe / difference view:\n"
+                "select the fixed row > Before / After. Takes a few seconds per Fix click.")
             self.btn_checks = QtWidgets.QToolButton()
             self.btn_checks.setText("Checks  \u25be")
             self.btn_checks.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -4193,11 +5458,19 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                                          "Measure the real frame: captures %d frames with Unreal's CSV profiler\n"
                                          "(per-pass GPU stats) and lists the expensive passes + the bottleneck.\n"
                                          "Keep the level viewport visible with Realtime on. Scan first so the\n"
-                                         "results can point at the related scene issues." % CONFIG["profile_frames"])
-            for w in (self.btn_scan, self.btn_profile, self.chk_selected, self.btn_checks):
+                                         "results can point at the related scene issues.\n"
+                                         "Profile again after fixing: the comparison row shows what each fix bought." % CONFIG["profile_frames"])
+            self.btn_profile_seq = self._btn("Profile Sequence", self.on_profile_sequence, None,
+                                             "Profile the Level Sequence open in Sequencer shot by shot (camera cut\n"
+                                             "locked to the viewport, %d frames per shot), then park on the worst\n"
+                                             "shot and scan there. Spawnables are fixed on their template in the\n"
+                                             "sequence, so the fixes stick." % CONFIG["shot_profile_frames"])
+            self._job_btn = None
+            for w in (self.btn_scan, self.btn_profile, self.btn_profile_seq, self.chk_selected, self.btn_checks):
                 tb.addWidget(w)
             tb.addStretch(1)
-            for w in (self.btn_fix_sel, self.btn_fix_safe, self.btn_fix_all, self.btn_revert, self.btn_save, self.btn_export):
+            for w in (self.chk_shots, self.btn_fix_sel, self.btn_fix_safe, self.btn_fix_all, self.btn_revert,
+                      self.btn_save, self.btn_export):
                 tb.addWidget(w)
             bl.addLayout(tb)
 
@@ -4312,7 +5585,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             dcap = QtWidgets.QLabel("DETAILS")
             dcap.setObjectName("SectionTitle")
             dl.addWidget(dcap)
-            self.detail = QtWidgets.QTextBrowser()
+            self.detail = _DetailBrowser()
             self.detail.setOpenLinks(False)
             self.detail.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
             dl.addWidget(self.detail, 1)
@@ -4321,13 +5594,17 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             actions.setVerticalSpacing(6)
             self.d_fix = self._btn("Fix", lambda: self.fix_issues(self._selected() or ([self._current] if self._current else [])), "Primary")
             self.d_revert = self._btn("Revert", lambda: self.revert(self._selected() or ([self._current] if self._current else [])))
-            self.d_goto = self._btn("Go To", lambda: go_to_many(self._selected() or ([self._current] if self._current else [])), None,
-                                    "Select and frame the actors, show the assets in the Content Browser")
+            self.d_goto = self._btn("Go To", lambda: self._goto(self._selected() or ([self._current] if self._current else [])), None,
+                                    "Select and frame the actors, show the assets in the Content Browser\n"
+                                    "(Sequencer shot: jump to that shot)")
             self.d_open = self._btn("Open Asset", lambda: self._current and open_assets(self._current))
+            self.d_compare = self._btn("Before / After", lambda: self._current and self.compare_shots(self._current), None,
+                                       "Compare the viewport screenshots taken before and after this fix")
             actions.addWidget(self.d_fix, 0, 0)
             actions.addWidget(self.d_revert, 0, 1)
             actions.addWidget(self.d_goto, 1, 0)
             actions.addWidget(self.d_open, 1, 1)
+            actions.addWidget(self.d_compare, 2, 0, 1, 2)
             dl.addLayout(actions)
             detail.setMinimumWidth(320)
 
@@ -4417,6 +5694,10 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             it.setToolTip(self.C_METRIC, _tip(issue.metric))
             it.setForeground(self.C_METRIC, QtGui.QBrush(QtGui.QColor("#a1a1aa")))
             it.setSizeHint(0, QtCore.QSize(0, 42))
+            if issue.pinned:
+                it.setData(0, PIN_ROLE, True)
+                for col in range(len(self.COLS)):
+                    it.setBackground(col, QtGui.QBrush(QtGui.QColor("#1c2340")))
             self.tree.addTopLevelItem(it)
             cell = QtWidgets.QWidget()
             cell.setObjectName("Cell")
@@ -4441,7 +5722,9 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             if not row:
                 return
             it, b = row
-            if issue.fix is None:
+            if issue.check == "gpu_compare":
+                imp, imp_color = "Compare", "#818cf8"
+            elif issue.fix is None:
                 imp, imp_color = "Manual", "#71717a"
             else:
                 imp, imp_color = IMPACT_SHORT[issue.impact], IMPACT_COLORS[issue.impact]
@@ -4455,12 +5738,18 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             it.setData(self.C_STATUS, SORT_ROLE, status)
             it.setData(self.C_STATUS, COLOR_ROLE, _STATUS_COLORS.get(issue.status))
             it.setToolTip(self.C_STATUS, _tip(issue.message))
-            it.setData(self.C_TITLE, COLOR_ROLE, "#8b8b93" if issue.status == "fixed" else "#f4f4f5")
-            if issue.revertable and issue.status == "fixed":
+            it.setData(self.C_TITLE, COLOR_ROLE, "#8b8b93" if issue.status == "fixed" else (
+                "#a5b4fc" if issue.pinned else "#f4f4f5"))
+            if _can_revert(issue):
                 b.setText("Revert")
                 b.setObjectName("RowRevert")
                 b.setEnabled(True)
-                b.setToolTip("Put the old values back")
+                b.setToolTip(_tip(issue.fix_label if issue.check == "gpu_compare" else "Put the old values back"))
+            elif issue.check == "gpu_compare":
+                b.setText("Info")
+                b.setObjectName("RowFix")
+                b.setEnabled(False)
+                b.setToolTip("Nothing to take back: every fix since the last profile got faster or stayed within noise")
             else:
                 b.setText("Fix" if issue.fix else "Manual")
                 b.setObjectName("RowFix")
@@ -4566,7 +5855,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
         # ================================================================ detail
         def _show_detail(self, issue):
             self._current = issue
-            for b in (self.d_fix, self.d_revert, self.d_goto, self.d_open):
+            for b in (self.d_fix, self.d_revert, self.d_goto, self.d_open, self.d_compare):
                 b.setEnabled(False)
             if issue is None:
                 self.detail.setHtml(self._welcome_html())
@@ -4574,7 +5863,9 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.d_fix.setText("Fix")
             self.d_revert.setText("Revert")
             self.d_fix.setEnabled(issue.fixable)
-            self.d_revert.setEnabled(issue.revertable and issue.status == "fixed")
+            self.d_revert.setEnabled(_can_revert(issue))
+            shots = _shots_of(issue)
+            self.d_compare.setEnabled(bool(shots))
             self.d_goto.setEnabled(bool(issue.targets or issue.assets or issue.children))
             self.d_open.setEnabled(bool(issue.assets or any(c.assets for c in issue.children)))
             sev_c = _SEV_PILL[issue.severity]
@@ -4584,8 +5875,11 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                         % (color, esc(text)))
 
             badges = badge(issue.severity_name.upper(), sev_c) + "&nbsp;&nbsp;"
-            badges += badge(("FIX: " + IMPACT_SHORT[issue.impact].upper()) if issue.fix else "MANUAL",
-                            IMPACT_COLORS[issue.impact] if issue.fix else "#a1a1aa")
+            if issue.check == "gpu_compare":
+                badges += badge("PROFILE COMPARISON", "#818cf8")
+            else:
+                badges += badge(("FIX: " + IMPACT_SHORT[issue.impact].upper()) if issue.fix else "MANUAL",
+                                IMPACT_COLORS[issue.impact] if issue.fix else "#a1a1aa")
             if issue.status in _STATUS_COLORS:
                 badges += "&nbsp;&nbsp;" + badge(issue.status.upper(), _STATUS_COLORS[issue.status])
 
@@ -4593,7 +5887,11 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 return ("<p style='margin:14px 0 3px 0; color:#8e8e96; font-size:8pt; font-weight:700;'>%s</p>"
                         "<p style='margin:0; color:%s; line-height:140%%;'>%s</p>" % (title, color, body))
 
-            if issue.fix:
+            if issue.check == "gpu_compare":
+                fix_html = ("<b>%s</b><br><span style='color:#8e8e96'>Revert takes back only those fixes; everything "
+                            "else stays.</span>" % esc(issue.fix_label) if issue.children else
+                            "<span style='color:#a1a1aa'>Nothing to take back.</span>")
+            elif issue.fix:
                 fix_html = "<b>%s</b><br><span style='color:%s'>%s</span>%s" % (
                     esc(issue.fix_label), IMPACT_COLORS[issue.impact], esc(IMPACT_LABELS[issue.impact]),
                     (": " + esc(issue.impact_note)) if issue.impact_note else "")
@@ -4603,6 +5901,21 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             status_html = ""
             if issue.status in ("fixed", "failed", "reverted") and issue.message:
                 status_html = section("RESULT", esc(issue.message), _STATUS_COLORS.get(issue.status, "#e4e4e7"))
+            shots_html = ""
+            if shots:
+                self.detail.images = {}
+                cells = []
+                for key in ("before", "after"):
+                    img = QtGui.QImage(shots[key])
+                    if img.isNull():
+                        continue
+                    self.detail.images["shot:" + key] = img.scaledToWidth(168, Qt.TransformationMode.SmoothTransformation)
+                    cells.append("<td style='padding-right:6px;'><img src='shot:%s'><br><span style='color:#8e8e96'>%s</span></td>"
+                                 % (key, key.upper()))
+                if cells:
+                    shots_html = section("BEFORE / AFTER", "<table cellspacing='0'><tr>%s</tr></table>"
+                                         "<span style='color:#8e8e96'>Before / After opens a wipe and a difference view.</span>"
+                                         % "".join(cells))
             self.detail.setHtml(
                 "<div style='font-size:12pt; font-weight:600; color:#fafafa;'>%s</div>"
                 "<p style='margin:8px 0 10px 0;'>%s</p>"
@@ -4610,10 +5923,10 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 "<tr><td style='color:#8e8e96; padding-right:12px;'>Object</td><td style='color:#a5b4fc;'>%s</td></tr>"
                 "<tr><td style='color:#8e8e96; padding-right:12px;'>Measured</td><td>%s</td></tr>"
                 "<tr><td style='color:#8e8e96; padding-right:12px;'>Cost score</td><td>%.0f / 100</td></tr>"
-                "<tr><td style='color:#8e8e96; padding-right:12px;'>Category</td><td>%s</td></tr></table>%s%s%s%s"
+                "<tr><td style='color:#8e8e96; padding-right:12px;'>Category</td><td>%s</td></tr></table>%s%s%s%s%s"
                 % (esc(issue.title), badges, esc(issue.obj), esc(issue.metric), issue.cost, esc(issue.category),
-                   section("PROBLEM", esc(issue.detail)), section("SOLUTION", esc(issue.solution)),
-                   section("AUTOMATIC FIX", fix_html), status_html))
+                   shots_html, section("PROBLEM", esc(issue.detail)), section("SOLUTION", esc(issue.solution)),
+                   section("AUTOMATIC FIX" if issue.check != "gpu_compare" else "TAKE BACK", fix_html), status_html))
 
         def _welcome_html(self):
             n_checks = sum(1 for c in _CHECKS if c["enabled"])
@@ -4632,7 +5945,11 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 "<p style='margin-top:14px; color:#8e8e96; font-size:8pt; font-weight:700;'>MEASURED COST</p>"
                 "<p style='line-height:140%%;'><b>Profile GPU</b> captures real frames (Unreal's CSV profiler with "
                 "per-pass GPU stats), tells you if you're GPU, game-thread or render-thread bound and lists the "
-                "expensive passes, pointing at the related scan findings. Scan first, then profile.</p>"
+                "expensive passes, pointing at the related scan findings. Scan first, then profile. Profile "
+                "again after fixing: a pinned row compares the two and can take back fixes that bought nothing. "
+                "<b>Profile Sequence</b> does the same shot by shot for the sequence open in Sequencer.</p>"
+                "<p style='line-height:140%%;'>Tick <b>Before/after shots</b> to screenshot the viewport around "
+                "visual fixes and compare them (wipe / difference).</p>"
                 "<p style='color:#8e8e96; line-height:140%%;'>Every fix is journaled to Saved/PerfAudit, so "
                 "<b>Revert</b> works even after saving or restarting. Fixes made by the previous version can be "
                 "undone from <b>Revert \u25be &gt; Undo fixes made by the previous version</b>.</p>"
@@ -4671,8 +5988,9 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.lbl_level.setText(_STATE.get("level") or "Level")
             scope = _STATE.get("scope") or {}
             unloaded = scope.get("levels_unloaded") or []
-            self.lbl_scanned.setText("%s%d actors \u00b7 %d level(s) loaded%s \u00b7 scanned %s" % (
+            self.lbl_scanned.setText("%s%d actors%s \u00b7 %d level(s) loaded%s \u00b7 scanned %s" % (
                 "selection \u00b7 " if _STATE.get("selected_only") else "", scope.get("actors", 0),
+                (" + %d spawnable template(s)" % scope["templates"]) if scope.get("templates") else "",
                 max(1, len(scope.get("levels_loaded") or [])),
                 (" \u00b7 <span style='color:%s'>%d NOT loaded</span>" % (IMPACT_COLORS[LOOK], len(unloaded))) if unloaded else "",
                 datetime.datetime.now().strftime("%H:%M:%S")))
@@ -4773,20 +6091,119 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             todo = [i for i in issues if i.fixable]
             if not todo:
                 return
+            if self.chk_shots.isChecked() and any(i.impact != SAFE for i in todo):
+                if _PROFILE["busy"]:
+                    self._set_status("Wait for the running %s to finish (or untick Before/after shots)." % (
+                        _JOB["name"] or "job"))
+                    return
+                self._set_status("Screenshot before the fix\u2026 keep the level viewport visible.")
+                try:
+                    fix_with_screenshots(todo, lambda res, err, todo=todo: self._on_shots_done(todo, res, err))
+                except Exception as e:
+                    self._set_status("Before/after shots failed: %s" % e)
+                return
             fixed, failed = apply_fixes(todo, "World Perf Audit: Fix %d issue(s)" % len(todo))
+            self._after_fix(todo, fixed, failed)
+
+        def _after_fix(self, todo, fixed, failed, extra=""):
             self._after_change(todo)
             visual = sum(1 for i in todo if i.impact != SAFE and i.status == "fixed")
-            self._set_status("Fixed %d%s%s. Not saved yet \u2013 check the viewport, then Save or Revert." % (
+            self._set_status("Fixed %d%s%s. Not saved yet \u2013 check the viewport, then Save or Revert.%s" % (
                 fixed, (" (%d may change the look)" % visual) if visual else "",
-                (", %d failed: see Output Log" % failed) if failed else ""))
+                (", %d failed: see Output Log" % failed) if failed else "", extra))
+
+        def _on_shots_done(self, todo, result, error):
+            if error or not result:
+                self._after_change(todo)
+                self._set_status("Before/after shots stopped (%s). Fixes applied so far are listed as Fixed." % (
+                    error or "no result"))
+                return
+            fixed, failed, before, after = result
+            self._after_fix(todo, fixed, failed, " Before/after shots: select a fixed row > Before / After." if after
+                            else " (The screenshots couldn't be taken: is the level viewport visible?)")
+            if after and self._current is not None:
+                self._show_detail(self._current)
+
+        def compare_shots(self, issue):
+            shots = _shots_of(issue)
+            if not shots:
+                return
+            before, after = QtGui.QImage(shots["before"]), QtGui.QImage(shots["after"])
+            if before.isNull() or after.isNull():
+                self._set_status("Screenshot files are missing: %s" % os.path.dirname(shots["before"]))
+                return
+            dlg = QtWidgets.QDialog(self)
+            dlg.setObjectName("Dialog")
+            dlg.setWindowTitle("%s \u2013 before / after" % TOOL_NAME)
+            dlg.setStyleSheet(_STYLE)
+            dlg.resize(1180, 760)
+            v = QtWidgets.QVBoxLayout(dlg)
+            v.setContentsMargins(18, 16, 18, 14)
+            v.setSpacing(10)
+            head = QtWidgets.QLabel("%s \u2013 %s" % (issue.title, issue.obj))
+            head.setObjectName("DialogHeading")
+            head.setTextFormat(Qt.TextFormat.PlainText)
+            head.setWordWrap(True)
+            v.addWidget(head)
+            share = _changed_share(before, after)
+            info = QtWidgets.QLabel("~%.1f%% of the image changed visibly%s.   Drag on the image to move the split." % (
+                share * 100.0, " (nothing you'd notice)" if share < 0.005 else ""))
+            info.setObjectName("Muted")
+            v.addWidget(info)
+            view = _CompareView(before, after, dlg)
+            v.addWidget(view, 1)
+            row = QtWidgets.QHBoxLayout()
+            group = QtWidgets.QButtonGroup(dlg)
+            for n, (mode, text) in enumerate((("wipe", "Wipe"), ("before", "Before"), ("after", "After"),
+                                              ("diff", "Difference x4"))):
+                b = QtWidgets.QPushButton(text)
+                b.setCheckable(True)
+                b.setChecked(n == 0)
+                b.clicked.connect(lambda *_a, m=mode: view.set_mode(m))
+                group.addButton(b)
+                row.addWidget(b)
+            row.addStretch(1)
+            folder = self._btn("Open folder", lambda: QtGui.QDesktopServices.openUrl(
+                QtCore.QUrl.fromLocalFile(os.path.dirname(shots["before"]))))
+            close = self._btn("Close", dlg.accept, "Primary")
+            row.addWidget(folder)
+            row.addWidget(close)
+            v.addLayout(row)
+            self._compare_dialog = dlg            # kept for tests / so it isn't garbage-collected
+            if getattr(self, "_no_modal", False):
+                dlg.show()
+            else:
+                _qexec(dlg)
+
+        def _goto(self, issues):
+            try:
+                go_to_many(issues)
+            except Exception as e:
+                self._set_status("Go To: %s" % e)
+
+        # --- jobs: GPU profile, sequence profile ------------------------------------------------------
+        def _job_started(self, btn):
+            self._job_btn = btn
+            for b in (self.btn_profile, self.btn_profile_seq):
+                b.setEnabled(b is btn)
+            btn.setText("Stop")
+
+        def _job_ended(self):
+            self._job_btn = None
+            self.btn_profile.setText("Profile GPU")
+            self.btn_profile_seq.setText("Profile Sequence")
+            for b in (self.btn_profile, self.btn_profile_seq):
+                b.setEnabled(True)
 
         def on_profile_gpu(self):
             if _PROFILE["busy"]:
+                if self._job_btn is self.btn_profile:
+                    cancel_job()
+                    self._set_status("Stopping the GPU profile\u2026")
                 return
-            if not any(i.category != CAT_GPU for i in self.issues):
+            if not any(i.category not in (CAT_GPU, CAT_SEQ) for i in self.issues):
                 self.on_scan()      # Fix buttons on GPU findings come from the scan (once, honours the selection)
-            self.btn_profile.setEnabled(False)
-            self.btn_profile.setText("Profiling\u2026")
+            self._job_started(self.btn_profile)
             self._set_status("Capturing %d frames\u2026 keep the level viewport visible with Realtime on (Ctrl+R) "
                              "and don't minimise Unreal." % CONFIG["profile_frames"])
             try:
@@ -4795,10 +6212,9 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 self._on_profile_done([], str(e))
 
         def _on_profile_done(self, issues, error):
-            self.btn_profile.setEnabled(True)
-            self.btn_profile.setText("Profile GPU")
+            self._job_ended()
             if error:
-                self._set_status("GPU profile failed: %s" % error)
+                self._set_status("GPU profile %s" % ("stopped." if error == "cancelled" else "failed: %s" % error))
                 return
             self.issues = list(_STATE["issues"])
             self._category = CAT_GPU
@@ -4806,8 +6222,43 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self._populate()
             self._refresh_all()
             frame = next((i for i in issues if i.check == "gpu_frame"), None)
-            self._set_status("GPU profile: %s \u2013 %d finding(s) in '%s'." % (
-                frame.title if frame else "done", len(issues), CAT_GPU))
+            cmp_ = next((i for i in issues if i.check == "gpu_compare"), None)
+            self._set_status("GPU profile: %s \u2013 %d finding(s) in '%s'.%s" % (
+                frame.title if frame else "done", len(issues), CAT_GPU,
+                (" %s (pinned on top)." % cmp_.title) if cmp_ else ""))
+
+        def on_profile_sequence(self):
+            if _PROFILE["busy"]:
+                if self._job_btn is self.btn_profile_seq:
+                    cancel_job()
+                    self._set_status("Stopping the sequence profile\u2026")
+                return
+            if current_sequence() is None:
+                self._set_status("Open a Level Sequence in Sequencer first, then click Profile Sequence.")
+                return
+            if not any(i.category not in (CAT_GPU, CAT_SEQ) for i in self.issues):
+                self.on_scan()
+            self._job_started(self.btn_profile_seq)
+            self._set_status("Profiling the sequence shot by shot\u2026 keep the level viewport visible.")
+            try:
+                profile_sequence(on_done=self._on_sequence_done, progress=self._set_status)
+            except Exception as e:
+                self._on_sequence_done([], str(e))
+
+        def _on_sequence_done(self, issues, error):
+            self._job_ended()
+            if error:
+                self._set_status("Sequence profile %s" % ("stopped." if error == "cancelled" else "failed: %s" % error))
+                return
+            self.issues = list(_STATE["issues"])
+            self._category = CAT_SEQ
+            self._current = None
+            self._populate()
+            self._refresh_all()
+            worst = max(issues, key=lambda i: i.cost) if issues else None
+            self._set_status("Sequence profile: %d shot(s) in '%s'.%s" % (
+                len(issues), CAT_SEQ, (" Worst: %s \u2013 Sequencer is parked there and the scan ran at that "
+                                       "moment." % worst.title) if worst else ""))
 
         def on_fix_safe(self):
             self.fix_issues(self._safe_visible())
@@ -4833,7 +6284,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self._set_status("Reverted %d fix(es)%s." % (done, (", %d problem(s): see Output Log" % len(errors)) if errors else ""))
 
         def _row_action(self, issue):
-            if issue.status == "fixed" and issue.revertable:
+            if _can_revert(issue):
                 self.revert([issue])
             else:
                 self.fix_issues([issue])
@@ -4844,7 +6295,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 return
             def changes_of(e):
                 parts = []
-                for ch in e.get("changes", [])[:3]:
+                for ch in [c for c in e.get("changes", []) if isinstance(c, dict)][:3]:
                     what = ch.get("prop") or ch.get("setter") or ch.get("field") or ch.get("name") or ch.get("key") or ch.get("k")
                     parts.append("%s: %s" % (ch.get("label", ""), what))
                 more = len(e.get("changes", [])) - 3
@@ -4920,7 +6371,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             """Several rows selected: summary + Fix N / Revert N buttons."""
             self._current = sel[0]
             n_fix = [i for i in sel if i.fixable]
-            n_rev = [i for i in sel if i.revertable and i.status == "fixed"]
+            n_rev = [i for i in sel if _can_revert(i)]
             n_vis = [i for i in n_fix if i.impact != SAFE]
             self.d_fix.setText("Fix %d selected" % len(n_fix))
             self.d_fix.setEnabled(bool(n_fix))
@@ -4928,6 +6379,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.d_revert.setEnabled(bool(n_rev))
             self.d_goto.setEnabled(True)
             self.d_open.setEnabled(any(i.assets for i in sel))
+            self.d_compare.setEnabled(bool(_shots_of(sel[0])))
             by_cat = OrderedDict()
             for i in sel:
                 by_cat[i.category] = by_cat.get(i.category, 0) + 1
@@ -4950,7 +6402,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             v = item.data(0, USER)
             for i in self.issues:
                 if v is not None and i.id == int(v):
-                    go_to(i)
+                    self._goto([i])
 
         def _context_menu(self, pos):
             sel = self._selected()
@@ -4958,7 +6410,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 return
             menu = QtWidgets.QMenu(self)
             fixable = [i for i in sel if i.fixable]
-            revertable = [i for i in sel if i.revertable and i.status == "fixed"]
+            revertable = [i for i in sel if _can_revert(i)]
             a = menu.addAction("Fix selected (%d)" % len(fixable))
             a.setEnabled(bool(fixable))
             a.triggered.connect(lambda *_: self.fix_issues(fixable))
@@ -4966,7 +6418,10 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             r.setEnabled(bool(revertable))
             r.triggered.connect(lambda *_: self.revert(revertable))
             menu.addSeparator()
-            menu.addAction("Go To").triggered.connect(lambda *_: go_to(sel[0]))
+            menu.addAction("Go To").triggered.connect(lambda *_: self._goto(sel[:1]))
+            c = menu.addAction("Compare before / after")
+            c.setEnabled(bool(_shots_of(sel[0])))
+            c.triggered.connect(lambda *_: self.compare_shots(sel[0]))
             o = menu.addAction("Open asset editor")
             o.setEnabled(bool(sel[0].assets))
             o.triggered.connect(lambda *_: open_assets(sel[0]))
@@ -4977,6 +6432,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             _qexec(menu, self.tree.viewport().mapToGlobal(pos))
 
         def closeEvent(self, event):
+            if _PROFILE["busy"]:
+                cancel_job()          # don't leave a capture or Sequencer lock behind a closed window
             _stop_qt_tick()
             super(AuditWindow, self).closeEvent(event)
 

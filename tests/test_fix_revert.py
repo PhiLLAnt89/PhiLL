@@ -72,7 +72,8 @@ diff = {k: (before.get(k), after.get(k)) for k in set(before) | set(after)
         if before.get(k) != after.get(k) and not (k[0].startswith("/Game/Mock/Crate_Dup_B"))}
 for k, v in sorted(diff.items(), key=str):
     print("  DIFF", k, v)
-expected_diff_ok = {k for k in diff if "nanite_settings" in k or k == ("/Game/Mock/SK_Crowd.SK_Crowd", "lods")}  # skeletal LODs: Ctrl+Z only (by design)
+expected_diff_ok = {k for k in diff if "nanite_settings" in k or k == ("/Game/Mock/SK_Crowd.SK_Crowd", "lods")  # skeletal LODs: Ctrl+Z only (by design)
+                    or k[0].startswith("/Game/PerfAudit/ET_PerfAudit_DistanceCull.")}   # the created Effect Type stays
 assert SM_statue.get_editor_property("nanite_settings").enabled is False
 assert not [k for k in diff if k not in expected_diff_ok], "values not restored"
 assert open(ini_path).read() == ini_before, "ini not restored"

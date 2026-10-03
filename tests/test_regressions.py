@@ -51,10 +51,17 @@ assert len(fogs) == 2, [i.title for i in gi]
 ids = [{c.id for c in f.children if c.check == "gpu_cvar"} for f in fogs]
 assert ids[0] == ids[1] and ids[0], "cvar child must be shared"
 W._STATE["issues"] = [i for i in W._STATE["issues"] if i.category != W.CAT_GPU] + gi
+child = [c for c in fogs[0].children if c.obj == "r.VolumetricFog.GridPixelSize"][0]
+assert "for High quality" in child.fix_label, child.fix_label     # Low: fog off, Medium: already 16
+U.SystemLibrary.CVARS["sg.ShadowQuality"] = 2                    # editor at High: applied live too
 W.apply_fixes(fogs)
 assert U.SystemLibrary.CVARS["r.VolumetricFog.GridPixelSize"] == 16
+scal = open(os.path.join(U._TMP, "Config", "DefaultScalability.ini")).read()
+assert "[ShadowQuality@2]\nr.VolumetricFog.GridPixelSize=16\nr.VolumetricFog.GridSizeZ=64" in scal, scal
 W.revert_issues(fogs)
 assert U.SystemLibrary.CVARS["r.VolumetricFog.GridPixelSize"] == 8, U.SystemLibrary.CVARS
+assert "GridPixelSize" not in open(os.path.join(U._TMP, "Config", "DefaultScalability.ini")).read()
+U.SystemLibrary.CVARS["sg.ShadowQuality"] = 3
 print("5 shared cvar child: OK")
 
 # --- 6: shared scan child reverted once ------------------------------------------------------------

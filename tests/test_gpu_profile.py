@@ -41,5 +41,9 @@ import time as _t; _t.sleep(1.1)        # new capture written a moment later (sa
 win.on_profile_gpu()
 clock.run_ticks(U)
 assert not W._PROFILE["busy"], "second capture not detected"
-assert len([i for i in win.issues if i.category == W.CAT_GPU]) == len(gpu)
+gpu2 = [i for i in win.issues if i.category == W.CAT_GPU]
+cmp_ = [i for i in gpu2 if i.check == "gpu_compare"]
+assert len(gpu2) == len(gpu) + 1 and len(cmp_) == 1, [i.title for i in gpu2]
+assert win.issues[0] is cmp_[0] and cmp_[0].pinned, "comparison is pinned to the top"
+print("compare:", cmp_[0].title)
 print("GPU PROFILE OK")

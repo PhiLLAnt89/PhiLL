@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.1.0
+
+### Before/after proof
+- **Profile comparison:** every Profile GPU on the same level is compared with the previous one. A row pinned at the top shows the frame, GPU, game- and render-thread times and the GPU passes that changed most, and lists the fixes applied in between.
+- **Take back what didn't help:** fixes whose GPU pass got no faster are listed on that row, and its **Revert** button undoes just those. Fixes made before a re-scan are still found, because the list comes from the fix journal.
+- **Before/after screenshots:** tick **Before/after shots** and every batch of fixes that might change the look is wrapped in two viewport screenshots (`Saved/PerfAudit/Shots`). Select the fixed row to see thumbnails; **Before / After** opens a wipe view, single images, and a 4x difference image with the share of pixels that changed.
+- GPU findings show the change since the previous profile next to each measurement.
+
+### Game thread / render thread
+- Profile GPU reads the CSV profiler's `Exclusive/GameThread/*` and `Exclusive/RenderThread/*` stats. The biggest items (animation, physics, visibility, shadow setup, draw submission, FX...) become findings, each with a Fix that applies the related scan fixes. Wait/idle stats are skipped.
+- When the render thread is busy, a "what drives it" finding lists this level's primitive, instance, non-Nanite, movable, shadow-caster and scene-capture counts, with the fixes that reduce them.
+
+### Sequencer
+- **Profile Sequence:** profiles the Level Sequence open in Sequencer shot by shot (cinematic shots, else camera cuts, else equal parts). It locks the camera cut to the viewport, profiles the middle frame of each shot and adds one finding per shot under *Sequencer Shots (measured)*, linked to the fixes for that shot's most expensive passes. It then parks on the worst shot and scans there. **Stop** cancels it and puts the playhead, camera lock and profiler settings back. **Go To** on a shot jumps Sequencer to it.
+- **Spawnable templates:** the open sequence's spawnable templates, including those in its shots, are scanned. Fixes on light, WPO, overlap, capture, decal and animation settings are applied to the template inside the sequence asset, so they stick on the next spawn.
+
+### Quality-level-aware console variables
+- The volumetric fog and translucency console-variable fixes are now written to `Config/DefaultScalability.ini`, only for the quality levels in `CONFIG["scalability_fix_levels"]` (default Low/Medium/High). Epic and Cinematic stay untouched.
+- Levels that are already cheap enough, or where the feature is off (e.g. volumetric fog at Low), are skipped. The change is applied live only when the editor runs at one of those levels.
+- Revert restores the old per-level values. Fixes made by 1.0.0 (`DefaultEngine.ini [SystemSettings]`) can still be reverted.
+
+### New checks (48 in total)
+- **WPO re-renders shadow pages every frame:** with Virtual Shadow Maps on, WPO shadow casters invalidate their cached pages every frame. Fix: *Shadow Cache Invalidation Behavior = Rigid*.
+- **Nanite on the programmable raster path:** Nanite meshes with masked or WPO materials. Advice only.
+- **Textures far exceed the streaming pool:** the level's textures at full resolution vs. `r.Streaming.PoolSize`. Fix applies the related texture fixes (oversized, Never Stream).
+- **Dense foliage traced by Lumen:** instanced foliage with *Affect Distance Field Lighting* on while Lumen GI is used. Fix turns it off on the components and their project Foliage Types.
+- **High distance-field resolution:** meshes with *Distance Field Resolution Scale* above 2. Fix sets it to 1 (rebuild, revertable).
+- **No Effect Type** now has a Fix: it creates (once) `/Game/PerfAudit/ET_PerfAudit_DistanceCull` and assigns it. The Effect Type culls at 150 m, re-checks distance continuously, and culled FX resume when you come closer. Revert unassigns it; the asset stays.
+- **MegaLights hint** on the direct-lighting finding when the level has many shadowed lights.
+
+### Fixes and hardening
+- Profiling runs as a cancellable job. A stopped or failed capture stops the CSV profiler and restores `r.GPUCsvStatsEnabled`. Closing the window stops a running job.
+- Console allowlist: added `csvprofile stop` and `HighResShot <w>x<h>` only.
+- Ini writes: only `DefaultEngine.ini` and `DefaultScalability.ini`. Journal entries for quality levels and distance-field scale are validated (section names, console variable, numbers).
+- A journal with malformed entries no longer breaks the Revert menu.
+
 ## 1.0.0 – first production release
 
 ### Features
