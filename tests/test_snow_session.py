@@ -142,7 +142,11 @@ assert top2 > top + 10 and len(U.GeometryScript_SceneUtils.copies) == copies, "n
 win._slider("max_slope", 10.0)
 win._apply_params()
 assert snow_tris(snow) > 0, "a flat top holds snow even at 10 degrees"
-S.set_params(max_slope=55.0, depth=12.0)
+assert "slope_scale" in win._sliders
+win._slider("slope_scale", 60.0)
+win._apply_params()
+assert S.CONFIG["slope_scale"] == 60.0 and snow_tris(snow) > 0
+S.set_params(max_slope=55.0, depth=12.0, slope_scale=30.0)
 U.EditorUtilityLibrary.selected_assets = [U.Material("M_MySnow", path="/Game/FX/M_MySnow")]
 win.on_use_material()
 win._apply_params()

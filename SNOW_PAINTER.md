@@ -38,6 +38,7 @@ Unreal's Python can't capture mouse drags in the level viewport, so the brush is
    | Depth | Thickness on flat ground, in cm |
    | Soft edges | Rounder edges (they also spread a little beyond the paint) |
    | Max slope | Faces steeper than this hold no snow |
+   | Slope over | The distance the slope is measured over (30 cm by default). Bumps smaller than this don't count as steep, so raise it on rough scans |
    | Pile up | 0 = grow along the surface, 1 = pile up vertically |
    | Clumps / Clump size | Thickness variation |
    | Edge sink | How far the thin edge dips under the surface, to hide the seam |
@@ -77,6 +78,11 @@ Defaults are in `CONFIG` at the top of the script, for example `canvas_detail`, 
 - **Testing:** the tests run the whole tool against a fake of the Unreal API, so do one pass in the editor first. The calls most likely to differ between engine versions are the Geometry Script copy options and the vertex color read-back. If one fails, the Output Log says which.
 
 ## Changes
+- **1.2.1:** rough scans no longer count as "too steep".
+  - **What was wrong:** the slope was measured between canvas points 10 cm apart. On a rough scan, such as a Megascans cliff, small bumps made fairly flat ground look steeper than Max slope, so much of the paint made no snow.
+  - **Now:** the slope comes from a plane fitted over about 30 cm of surface. Points across a drop are left out, so a cliff doesn't tilt the ground at its lip.
+  - **New slider, Slope over:** sets that distance.
+  - **Rebuilds:** the slope is cached between rebuilds, which makes them faster.
 - **1.2.0:**
   - **Fix:** the canvas and the snow were wound the opposite way to Unreal's convention, so they faced down and were hidden when seen from above: snow was built but invisible, and the paint glow didn't show. This also caused 1.0's fragmented canvas, which kept the undersides of the mesh. To fix a canvas from an older version, click **Clear paint** once.
   - **Add selected meshes:** while a session runs, Start painting becomes this button, which adds more meshes without ending the session.

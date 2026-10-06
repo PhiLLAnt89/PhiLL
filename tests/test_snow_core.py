@@ -105,6 +105,18 @@ for angle, expect in ((30.0, True), (70.0, False)):
     assert bool(out["triangles"]) == expect, (angle, len(out["triangles"]))
 print("slope limit: OK")
 
+# --- a rough scan that is flat overall: its 10 cm bumps don't make it "too steep" ---------------------------------------
+def rough(x, y):
+    h = (int(x // 10) * 73856093) ^ (int(y // 10) * 19349663)
+    return ((h & 0xFFFF) / 65535.0 - 0.5) * 60.0          # +-30 cm noise from one 10 cm cell to the next
+sfn = surface(rough, 0, 0, 10, 2)
+p5, t5, i5 = S.make_canvas_grid(sfn, 41, 41, params)
+pts5 = set(i5)
+all5 = {p: 1.0 for p in pts5 if 5 <= p[0] <= 35 and 5 <= p[1] <= 35}
+out5 = S.build_snow_grid(sfn, pts5, all5, params)
+assert out5["steep_points"] == 0 and out5["triangles"], out5["steep_points"]
+print("rough flat scan: %d painted, none too steep" % len(all5))
+
 # --- painted across a cliff: snow on both levels, nothing hanging over the drop, thin at the lip --------------------
 cliff = lambda x, y: 100.0 if x < 200 else 0.0
 sfc = surface(cliff, 0, 0, 10, 2)
@@ -118,7 +130,15 @@ for t in out["triangles"]:
 lip = [p for p in out["positions"] if 185 <= p[0] < 200 and abs(p[1] - 200) < 40]
 assert lip and min(p[2] for p in lip) < 100.0, "the snow thins out at the lip"
 assert any(p[2] > 105 for p in out["positions"]) and any(5 < p[2] < 30 for p in out["positions"])
+assert out["steep_points"] == 0, "the drop tilts the slope measured next to it: %d" % out["steep_points"]
 print("cliff: OK")
+
+# slope normals are cached on the surface: a slider change reuses them, a new canvas recomputes them
+memo = sfc.memo["canvas"]
+S.build_snow_grid(sfc, pts, paint, dict(params, max_slope=40.0, depth=20.0))
+assert sfc.memo["canvas"] is memo
+S.build_snow_grid(sfc, set(pts), paint, params)
+assert sfc.memo["canvas"] is not memo
 
 # --- a huge painted area: coarser snow (stride), still from the cached rays --------------------------------------------
 sf4 = surface(flat(0.0), 0, 0, 16, 4)

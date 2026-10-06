@@ -56,7 +56,7 @@ try:
 except ImportError:          # the geometry core below also works outside Unreal (tests)
     unreal = None
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 TOOL_NAME = "Snow Painter"
 WINDOW_OBJECT_NAME = "SnowPainterWindow"
 
@@ -69,6 +69,7 @@ CONFIG = {
     "softness": 3,                # edge softening passes (rounder, softer snow edges)
     "max_slope": 55.0,            # degrees: steeper faces hold no snow
     "slope_fade": 25.0,           # degrees over which snow thins out towards max_slope
+    "slope_scale": 30.0,          # cm: the slope is measured over this distance (scan bumps don't count)
     "pile_up": 0.6,               # 0 = grow along the surface normal, 1 = pile up vertically
     "clumps": 0.35,               # 0..1 thickness variation
     "clump_size": 80.0,           # cm, size of the thickness variation
@@ -187,6 +188,7 @@ class Surface(object):
         self.k = max(1, int(k))
         self.fine = self.step / self.k
         self.cache = {}
+        self.memo = {}              # derived from the rays (canvas heights, slope normals), reused between rebuilds
         self.rays = 0
 
     def xy(self, I, J):
@@ -303,35 +305,60 @@ def build_snow_grid(surface, points, paint, params=None, up=(0.0, 0.0, 1.0)):
     s, k = surface.step, surface.k
     max_angle = float(cfg["canvas_max_angle"])
     limit = s * math.tan(math.radians(max_angle))
-
-    def cz(p):
-        return surface.cz(p[0], p[1]) if p in points else None
+    memo = surface.memo.get("canvas")
+    if memo is None or memo[0] is not points:            # heights and normals only change with the canvas
+        memo = surface.memo["canvas"] = (points, {p: surface.cz(p[0], p[1]) for p in points}, {})
+    cz = memo[1].get
 
     def linked(p, q, diag=False):
         a, b = cz(p), cz(q)
         return a is not None and b is not None and abs(a - b) <= limit * (1.42 if diag else 1.0)
 
-    normals = {}
+    reach = max(1, int(round(float(cfg["slope_scale"]) / s)))
+    normals = memo[2].setdefault((reach, limit), {})
 
     def normal(p):
+        """Surface normal from a plane fitted through the canvas points within slope_scale: the slope snow sees,
+        not the 10 cm bumps of a scan. Only points reached from p through linked steps count: nothing across a drop."""
         n = normals.get(p)
         if n is None:
             i, j = p
             z0 = cz(p)
-            g = []
-            for (d1, d2) in (((1, 0), (-1, 0)), ((0, 1), (0, -1))):
-                qa, qb = (i + d1[0], j + d1[1]), (i + d2[0], j + d2[1])
-                za = cz(qa) if linked(p, qa) else None
-                zb = cz(qb) if linked(p, qb) else None
-                if za is not None and zb is not None:
-                    g.append((za - zb) / (2 * s))
-                elif za is not None:
-                    g.append((za - z0) / s)
-                elif zb is not None:
-                    g.append((z0 - zb) / s)
-                else:
-                    g.append(0.0)
-            n = normals[p] = _normalize((-g[0], -g[1], 1.0))
+            sxx = sxy = syy = sxz = syz = 0.0
+            ok = {(0, 0)}
+            for r in range(1, reach + 1):
+                for di in range(-r, r + 1):
+                    for dj in range(-r, r + 1):
+                        if max(abs(di), abs(dj)) != r:
+                            continue
+                        # one step back toward p (the ring closer in): q only counts if that step is linked
+                        bi, bj = di - (di > 0) + (di < 0), dj - (dj > 0) + (dj < 0)
+                        if abs(di) != r:
+                            bi = di
+                        if abs(dj) != r:
+                            bj = dj
+                        if (bi, bj) in ok and linked((i + bi, j + bj), (i + di, j + dj), bi != di and bj != dj):
+                            ok.add((di, dj))
+            sx = sy = sz = 0.0
+            for di, dj in ok:
+                dx, dy, dz = di * s, dj * s, cz((i + di, j + dj)) - z0
+                sx += dx
+                sy += dy
+                sz += dz
+                sxx += dx * dx
+                sxy += dx * dy
+                syy += dy * dy
+                sxz += dx * dz
+                syz += dy * dz
+            c = 1.0 / len(ok)                   # centred: the plane doesn't have to pass through p (a bump itself)
+            sxx, sxy, syy = sxx - sx * sx * c, sxy - sx * sy * c, syy - sy * sy * c
+            sxz, syz = sxz - sx * sz * c, syz - sy * sz * c
+            det = sxx * syy - sxy * sxy
+            if det > 1e-9:
+                a, b = (sxz * syy - syz * sxy) / det, (syz * sxx - sxz * sxy) / det
+            else:
+                a = b = 0.0
+            n = normals[p] = _normalize((-a, -b, 1.0))
         return n
 
     up = _normalize(up)
@@ -1198,12 +1225,12 @@ def paint_report():
             if not d["painted"]:
                 line += " - is Mesh Paint painting this canvas, in white, with Red ticked?"
             elif t.stats.get("steep"):
-                line += " - but all of it is steeper than Max slope (%.0f deg): no snow. Raise Max slope." % (
+                line += " - but all of it is steeper than Max slope (%.0f deg): no snow. Raise Max slope or Slope over." % (
                     CONFIG["max_slope"])
             else:
                 line += " -> snow: %s triangles (actor %s)%s" % (
                     "{:,}".format(t.stats.get("snow_triangles", 0)), t.snow.get_actor_label() if _alive(t.snow) else "?",
-                    (", %d painted points too steep for snow" % t.stats["steep_points"])
+                    (", %d painted points steeper than Max slope (%.0f deg)" % (t.stats["steep_points"], CONFIG["max_slope"]))
                     if t.stats.get("steep_points") else "")
             out.append(line)
     return out
@@ -1454,6 +1481,8 @@ _SLIDERS = [
     ("depth", "Depth (cm)", 1.0, 60.0, 0.5, "Snow thickness where fully painted, on flat ground."),
     ("softness", "Soft edges", 0, 8, 1, "Edge softening passes: rounder, softer snow edges (also spreads a little)."),
     ("max_slope", "Max slope (\u00b0)", 10.0, 85.0, 1.0, "Faces steeper than this hold no snow."),
+    ("slope_scale", "Slope over (cm)", 10.0, 60.0, 5.0,
+     "The slope is measured over this distance, so bumps smaller than it don't count as steep. Raise it on rough scans."),
     ("pile_up", "Pile up", 0.0, 1.0, 0.05, "0: snow grows along the surface. 1: it piles up vertically."),
     ("clumps", "Clumps", 0.0, 1.0, 0.05, "Thickness variation."),
     ("clump_size", "Clump size (cm)", 10.0, 400.0, 5.0, "Size of the thickness variation."),
