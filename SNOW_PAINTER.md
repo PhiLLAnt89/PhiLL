@@ -15,7 +15,7 @@ Unreal's Python can't capture mouse drags in the level viewport, so the brush is
 4. **Bake:** creates a Static Mesh asset in `/Game/SnowPainter/Baked` (Nanite optional, with collision) and an actor using it. The canvas and the preview are then removed.
 
 ## Requirements
-- Unreal Engine 5.6 with these plugins enabled: **Python Editor Script Plugin**, **Geometry Script** and **Mesh Paint** (on by default).
+- Unreal Engine 5.6 with these plugins enabled: **Python Editor Script Plugin**, **Geometry Script** and **Mesh Paint**. If **Mesh Paint** is missing from the mode dropdown, the plugin is off: *Edit → Plugins*, search "Mesh Paint", enable it and restart.
 - PySide6 for the panel. It uses the same per-user install as World Performance Audit (offered on first run). Without it, use the Python functions below.
 
 ## Run it

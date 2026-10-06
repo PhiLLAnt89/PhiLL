@@ -24,7 +24,8 @@ is Unreal's own Mesh Paint mode:
 4. "Bake" turns it into a Static Mesh asset + actor (Nanite optional) and
    removes the canvas.
 
-HOW TO RUN  (enable "Python Editor Script Plugin" + "Geometry Script" plugins)
+HOW TO RUN  (enable the "Python Editor Script Plugin", "Geometry Script" and "Mesh
+            Paint" plugins - Mesh Paint is missing from the mode dropdown when it's off)
 ----------
 A) Paste: Window > Output Log, set the dropdown left of the input box to
    "Python", paste this whole script, press Enter.
@@ -1323,7 +1324,8 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             c2 = self._card(bl, "STEP 2", "Paint in the viewport")
             howto = QtWidgets.QLabel(
                 "1. Open the mode dropdown at the top left of the editor (it says e.g. <i>Selection Mode</i> or "
-                "<i>Modeling Mode</i>) and pick <b>Mesh Paint</b>.<br>"
+                "<i>Modeling Mode</i>) and pick <b>Mesh Paint</b>. Not in the list? Edit &gt; Plugins, search "
+                "<i>Mesh Paint</i>, enable it and restart the editor.<br>"
                 "2. Pick <b>Colors</b> (<i>Vertex Color</i>) &gt; <b>Paint</b>, keep the paint color white, and paint "
                 "with the left mouse button; hold Shift to erase. Nothing happens? Select <b>SnowCanvas_...</b> in "
                 "the Outliner (folder SnowPainter).<br>"
