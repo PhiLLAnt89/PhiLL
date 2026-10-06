@@ -14,8 +14,10 @@ is Unreal's own Mesh Paint mode:
 1. Select one or more mesh actors and click "Start painting". The tool lays a
    fine, invisible "paint canvas" over their upward-facing surfaces (your
    meshes are never modified).
-2. Switch to Mesh Paint mode (mode dropdown > Mesh Paint, or Shift+4), pick
-   Colors > Paint and paint with the left mouse button (Shift+LMB erases).
+2. Switch to Mesh Paint mode (the mode dropdown at the top left, e.g. "Selection
+   Mode" or "Modeling Mode" > Mesh Paint), pick Colors (Vertex Color) > Paint,
+   keep the paint color white and paint with the left mouse button (Shift+LMB
+   erases). If nothing reacts, select SnowCanvas_<mesh> in the Outliner.
    Painted areas glow light blue.
 3. Each time you release the mouse, the snow is rebuilt with Geometry Script.
    Shape it with the sliders (depth, soft edges, max slope, clumps...).
@@ -852,8 +854,8 @@ def start(actors=None):
     _actor_sub().set_selected_level_actors([t.canvas for t in done])
     _start_tick()
     coarse = [t.label for t in done if t.stats.get("coarsened")]
-    _notify("Painting %d mesh(es). Switch to Mesh Paint mode (Shift+4) > Colors > Paint, paint with the left "
-            "mouse button (Shift = erase).%s" % (len(done), (" Canvas detail was coarsened to stay fast on: %s."
+    _notify("Painting %d mesh(es). Mode dropdown (top left) > Mesh Paint > Colors > Paint, then paint with the "
+            "left mouse button in white (Shift = erase).%s" % (len(done), (" Canvas detail was coarsened to stay fast on: %s."
                                                              % ", ".join(coarse)) if coarse else ""))
     return done
 
@@ -1320,8 +1322,11 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
 
             c2 = self._card(bl, "STEP 2", "Paint in the viewport")
             howto = QtWidgets.QLabel(
-                "1. Switch to <b>Mesh Paint</b> mode (mode dropdown, or Shift+4).<br>"
-                "2. Pick <b>Colors &gt; Paint</b>. Paint with the left mouse button; hold Shift to erase.<br>"
+                "1. Open the mode dropdown at the top left of the editor (it says e.g. <i>Selection Mode</i> or "
+                "<i>Modeling Mode</i>) and pick <b>Mesh Paint</b>.<br>"
+                "2. Pick <b>Colors</b> (<i>Vertex Color</i>) &gt; <b>Paint</b>, keep the paint color white, and paint "
+                "with the left mouse button; hold Shift to erase. Nothing happens? Select <b>SnowCanvas_...</b> in "
+                "the Outliner (folder SnowPainter).<br>"
                 "3. Painted areas glow light blue. The snow appears when you release the mouse.")
             howto.setWordWrap(True)
             howto.setTextFormat(Qt.TextFormat.RichText)

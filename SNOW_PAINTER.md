@@ -25,7 +25,10 @@ Unreal's Python can't capture mouse drags in the level viewport, so the brush is
 
 ## Workflow
 1. Select the meshes (rocks, roofs, ledges…) and click **Start painting**.
-2. Switch to **Mesh Paint** mode: the mode dropdown in the toolbar, or Shift+4. Pick **Colors → Paint** and paint with the default white. The canvas is already selected.
+2. Switch to **Mesh Paint** mode: open the mode dropdown at the top left of the editor (it reads *Selection Mode*, *Modeling Mode*…) and pick **Mesh Paint**. Not Modeling Mode: its Mesh tools are something else.
+   - Pick **Colors** (*Vertex Color* in some versions), then the **Paint** tool.
+   - Keep **Paint Color** white with the **Red** channel ticked, and paint with the left mouse button.
+   - **Start painting** has already selected the canvas. If painting does nothing, select **SnowCanvas_<mesh>** in the Outliner (folder *SnowPainter*).
 3. Shape the snow:
 
    | Slider | What it does |
