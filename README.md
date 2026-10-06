@@ -11,6 +11,8 @@ A single-file Python tool for **Unreal Engine 5.6**. It scans the open level for
 - **Fix / Fix Selected / Fix Safe / Fix All Shown:** no popups. A ⚠ next to Fix means *this might change the look* (amber) or *behaviour* (purple).
 - **Revert:** every fix records the old values in `Saved/PerfAudit/fix_journal.json`, so you can revert one fix or all of them at any time, even after saving or restarting.
 
+Also in this repo: **[Snow Painter](SNOW_PAINTER.md)** (`snow_painter.py`): paint snow onto meshes with the mouse; Geometry Script builds the snow mesh.
+
 ## Requirements
 - Unreal Engine 5.6, with the **Python Editor Script Plugin** and **Editor Scripting Utilities** plugins enabled.
 - Qt for Python for the UI. On first launch the tool offers to install **PySide6-Essentials** into a per-user folder outside your project: `%LOCALAPPDATA%\UnrealWorldPerfAudit\py311\site-packages`. That needs internet access. PyQt6, PySide2 and PyQt5 also work if one is already installed. Without Qt the tool runs in text mode (Output Log + HTML report).

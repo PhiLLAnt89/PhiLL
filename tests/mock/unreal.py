@@ -36,7 +36,8 @@ def _enum(name, *members):
 BlendMode = _enum("BlendMode", "BLEND_OPAQUE", "BLEND_MASKED", "BLEND_TRANSLUCENT", "BLEND_ADDITIVE")
 ComponentMobility = _enum("ComponentMobility", "STATIC", "STATIONARY", "MOVABLE")
 NiagaraRendererMotionVectorSetting = _enum("NiagaraRendererMotionVectorSetting", "AUTO_DETECT", "PRECISE", "APPROXIMATE", "DISABLE")
-MaterialProperty = _enum("MaterialProperty", "MP_WORLD_POSITION_OFFSET", "MP_BASE_COLOR")
+MaterialProperty = _enum("MaterialProperty", "MP_WORLD_POSITION_OFFSET", "MP_BASE_COLOR", "MP_OPACITY",
+                         "MP_EMISSIVE_COLOR", "MP_ROUGHNESS")
 TranslucencyLightingMode = _enum("TranslucencyLightingMode", "TLM_VOLUMETRIC_NON_DIRECTIONAL", "TLM_VOLUMETRIC_PER_VERTEX_DIRECTIONAL", "TLM_SURFACE_PER_PIXEL_LIGHTING")
 MaterialShadingModel = _enum("MaterialShadingModel", "MSM_UNLIT", "MSM_DEFAULT_LIT")
 TextureMipGenSettings = _enum("TextureMipGenSettings", "TMGS_FROM_TEXTURE_GROUP", "TMGS_NO_MIPMAPS")
@@ -164,7 +165,10 @@ class _Package(object):
 
 
 class Actor(Object):
-    _defaults = {"hidden": False}
+    _defaults = {"hidden": False, "tags": []}
+    destroyed = False
+    folder = ""
+    hidden_in_game = False
 
     def __init__(self, label="Actor", loc=None, rot=None, scale=None, **kw):
         Object.__init__(self, label, **kw)
@@ -179,7 +183,11 @@ class Actor(Object):
         return comp
 
     def get_actor_label(self): return self.label
+    def set_actor_label(self, label): self.label = label
+    def set_folder_path(self, p): self.folder = p
+    def set_actor_hidden_in_game(self, b): self.hidden_in_game = b
     def get_components_by_class(self, cls): return [c for c in self.comps if isinstance(c, cls)]
+    def get_component_by_class(self, cls): return next(iter(self.get_components_by_class(cls)), None)
     def get_actor_location(self): return self.loc
     def get_actor_rotation(self): return self.rot
     def get_actor_scale3d(self): return self.scale
@@ -218,12 +226,15 @@ class PrimitiveComponent(SceneComponent):
     def get_generate_overlap_events(self): return self.overlap
     def set_generate_overlap_events(self, b): self.overlap = b
     def get_collision_enabled(self): return CollisionEnabled.QUERY_AND_PHYSICS
+    def set_material(self, i, m):
+        self.__dict__.setdefault("override_materials", {})[i] = m
 
 
 class MeshComponent(PrimitiveComponent): pass
 
 
 class StaticMeshComponent(MeshComponent):
+    instance_colors = None    # what Mesh Paint writes: (r, g, b, a) per asset vertex
     _defaults = {"static_mesh": None, "evaluate_world_position_offset": True,
                  "world_position_offset_disable_distance": 0}
     def set_world_position_offset_disable_distance(self, d):
@@ -347,6 +358,10 @@ class StaticMesh(Object):
     _defaults = {"static_materials": [], "body_setup": None}
     tris = 1000
     lods = 1
+    geo = ([], [])          # (positions, triangles) for Geometry Script copies
+    colors = None           # asset vertex colors (r, g, b, a) per vertex
+    def set_material(self, i, m):
+        self.__dict__.setdefault("materials", {})[i] = m
     def get_num_triangles(self, lod): return self.tris
     def get_num_lods(self): return self.lods
 
@@ -472,6 +487,9 @@ class SystemLibrary(object):
     @staticmethod
     def get_component_bounds(c): return (Vector(), Vector(), c.radius)
 
+    @staticmethod
+    def is_valid(obj): return obj is not None and not getattr(obj, "destroyed", False)
+
     CSV_TEXT = None
     pending_shots = []      # screenshots requested, written on the next tick (like the engine's next frame)
 
@@ -495,6 +513,23 @@ class SystemLibrary(object):
 
 class MaterialEditingLibrary(object):
     recompiled = []
+    connections = []
+
+    @staticmethod
+    def create_material_expression(mat, cls, x=0, y=0):
+        e = cls(cls.__name__, outer=mat)
+        mat.__dict__.setdefault("expressions", []).append(e)
+        return e
+
+    @staticmethod
+    def connect_material_expressions(a, out, b, inp):
+        MaterialEditingLibrary.connections.append((a, out, b, inp))
+        return True
+
+    @staticmethod
+    def connect_material_property(e, out, prop):
+        MaterialEditingLibrary.connections.append((e, out, prop))
+        return True
 
     @staticmethod
     def get_material_property_input_node(m, prop): return object() if m.wpo else None
@@ -616,6 +651,23 @@ class EditorActorSubsystem(object):
         for x in a:
             EditorActorSubsystem.actors.remove(x)
         return True
+
+    def destroy_actor(self, a):
+        a.destroyed = True
+        if a in EditorActorSubsystem.actors:
+            EditorActorSubsystem.actors.remove(a)
+        EditorActorSubsystem.destroyed.append(a)
+        return True
+
+    def spawn_actor_from_object(self, obj, loc, rot=None):
+        a = StaticMeshActor(obj.get_name(), obj, loc=Vector(loc.x, loc.y, loc.z))
+        EditorActorSubsystem.actors.append(a)
+        return a
+
+    def spawn_actor_from_class(self, cls, loc, rot=None):
+        a = cls(cls.__name__, loc=Vector(loc.x, loc.y, loc.z))
+        EditorActorSubsystem.actors.append(a)
+        return a
 
 
 class _World(object):
@@ -840,3 +892,202 @@ def unregister_slate_post_tick_callback(h):
 
 
 class WorldSettings(Actor): pass
+
+
+# ---------------------------------------------------------------- Geometry Script (Snow Painter)
+class Name(str): pass
+
+
+class IntVector(object):
+    def __init__(self, x=0, y=0, z=0): self.x, self.y, self.z = x, y, z
+
+
+class Vector2D(object):
+    def __init__(self, x=0.0, y=0.0): self.x, self.y = x, y
+
+
+class LinearColor(object):
+    def __init__(self, r=0.0, g=0.0, b=0.0, a=1.0): self.r, self.g, self.b, self.a = r, g, b, a
+
+
+GeometryScriptOutcomePins = _enum("GeometryScriptOutcomePins", "FAILURE", "SUCCESS")
+GeometryScriptLODType = _enum("GeometryScriptLODType", "MAX_AVAILABLE", "HI_RES_SOURCE_MODEL", "SOURCE_MODEL", "RENDER_DATA")
+
+
+class GeometryScriptMeshReadLOD(_Struct):
+    _defaults = {"lod_type": GeometryScriptLODType.MAX_AVAILABLE, "lod_index": 0}
+
+
+class GeometryScriptCopyMeshFromComponentOptions(_Struct):
+    _defaults = {"want_normals": True, "want_tangents": False, "want_instance_colors": False, "requested_lod": None}
+
+
+class GeometryScriptSimpleMeshBuffers(_Struct):
+    _defaults = {"vertices": [], "normals": [], "uv0": [], "vertex_colors": [], "triangles": [], "tri_group_i_ds": []}
+
+
+class GeometryScriptSimplifyMeshOptions(_Struct): pass
+class GeometryScriptUniqueAssetNameOptions(_Struct): pass
+
+
+class GeometryScriptCreateNewStaticMeshAssetOptions(_Struct):
+    _defaults = {"enable_nanite": False, "enable_collision": True}
+
+
+class _GSList(object):
+    def __init__(self, items): self.items = list(items)
+
+
+class GeometryScriptVectorList(_GSList): pass
+class GeometryScriptTriangleList(_GSList): pass
+class GeometryScriptColorList(_GSList): pass
+
+
+class DynamicMesh(Object):
+    def __init__(self, *a, **kw):
+        Object.__init__(self, "DynamicMesh")
+        self.positions, self.tris, self.colors, self.normals, self.uvs = [], [], None, [], []
+
+    def reset_mesh(self):
+        self.positions, self.tris, self.colors, self.normals, self.uvs = [], [], None, [], []
+        return self
+
+    def get_triangle_count(self): return len(self.tris)
+
+
+class DynamicMeshComponent(PrimitiveComponent):
+    def __init__(self, *a, **kw):
+        PrimitiveComponent.__init__(self, *a, **kw)
+        self.mesh = DynamicMesh()
+        self.updates = 0
+    def get_dynamic_mesh(self): return self.mesh
+    def notify_mesh_updated(self): self.updates += 1
+
+
+class DynamicMeshActor(Actor):
+    def __init__(self, label="DynamicMeshActor", **kw):
+        Actor.__init__(self, label, **kw)
+        comp = self.add(DynamicMeshComponent("DynamicMeshComponent"))
+        self._p["dynamic_mesh_component"] = comp
+
+
+class GeometryScript_List(object):
+    @staticmethod
+    def convert_vector_list_to_array(lst): return list(lst.items)
+    @staticmethod
+    def convert_triangle_list_to_array(lst): return list(lst.items)
+    @staticmethod
+    def convert_color_list_to_array(lst): return list(lst.items)
+
+
+class GeometryScript_SceneUtils(object):
+    copies = []
+
+    @staticmethod
+    def copy_mesh_from_component(comp, mesh, opts, to_world):
+        sm = comp.get_editor_property("static_mesh")
+        pos, tris = sm.geo
+        lod = opts.requested_lod.lod_type if opts.requested_lod is not None else GeometryScriptLODType.MAX_AVAILABLE
+        colors = list(sm.colors) if sm.colors else None
+        if opts.want_instance_colors and lod == GeometryScriptLODType.RENDER_DATA and comp.instance_colors is not None:
+            colors = list(comp.instance_colors)
+        GeometryScript_SceneUtils.copies.append((comp, lod))
+        o = comp.get_owner().loc if (to_world and comp.get_owner() is not None) else Vector()
+        world = [(p[0] + o.x, p[1] + o.y, p[2] + o.z) for p in pos]
+        if lod == GeometryScriptLODType.RENDER_DATA:      # render data: vertices split per triangle (seams)
+            mesh.positions, mesh.tris, mc = [], [], []
+            for t in tris:
+                base = len(mesh.positions)
+                for v in t:
+                    mesh.positions.append(world[v])
+                    if colors is not None:
+                        mc.append(colors[v])
+                mesh.tris.append((base, base + 1, base + 2))
+            mesh.colors = mc if colors is not None else None
+        else:
+            mesh.positions, mesh.tris, mesh.colors = world, list(tris), colors
+        return (mesh, object(), GeometryScriptOutcomePins.SUCCESS)
+
+
+class GeometryScript_MeshQueries(object):
+    @staticmethod
+    def get_all_vertex_positions(mesh, skip_gaps=False):
+        return (GeometryScriptVectorList([Vector(*p) for p in mesh.positions]), False)
+
+    @staticmethod
+    def get_all_triangle_indices(mesh, skip_gaps=False):
+        return (GeometryScriptTriangleList([IntVector(*t) for t in mesh.tris]), False)
+
+
+class GeometryScript_VertexColors(object):
+    @staticmethod
+    def get_mesh_per_vertex_colors(mesh, blend=True):
+        cols = mesh.colors or []
+        return (mesh, GeometryScriptColorList([LinearColor(*c) for c in cols]), mesh.colors is not None, False)
+
+
+class GeometryScript_MeshEdits(object):
+    @staticmethod
+    def append_buffers_to_mesh(mesh, buf, material_id=0, defer=False):
+        base = len(mesh.positions)
+        mesh.positions += [(v.x, v.y, v.z) for v in buf.vertices]
+        mesh.normals += [(v.x, v.y, v.z) for v in buf.normals]
+        mesh.uvs += [(v.x, v.y) for v in buf.uv0]
+        if buf.vertex_colors:
+            mesh.colors = (mesh.colors or []) + [(c.r, c.g, c.b, c.a) for c in buf.vertex_colors]
+        mesh.tris += [(t.x + base, t.y + base, t.z + base) for t in buf.triangles]
+        return mesh
+
+
+class GeometryScript_MeshSimplification(object):
+    calls = []
+    @staticmethod
+    def apply_simplify_to_triangle_count(mesh, count, options=None):
+        GeometryScript_MeshSimplification.calls.append(count)
+        mesh.tris = mesh.tris[:count]
+        return mesh
+
+
+class GeometryScript_NewAssetUtils(object):
+    @staticmethod
+    def create_unique_new_asset_path_name(folder, base, opts=None):
+        name, i = base, 0
+        while EditorAssetLibrary.load_asset(folder + "/" + name) is not None:
+            i += 1
+            name = "%s_%d" % (base, i)
+        return (folder + "/" + name, name, GeometryScriptOutcomePins.SUCCESS)
+
+    @staticmethod
+    def create_new_static_mesh_asset_from_mesh(mesh, path, opts):
+        sm = StaticMesh(path.rsplit("/", 1)[1], path=path,
+                        nanite_settings=MeshNaniteSettings(enabled=opts.enable_nanite))
+        sm.geo = (list(mesh.positions), list(mesh.tris))
+        sm.colors = list(mesh.colors) if mesh.colors else None
+        sm.collision = opts.enable_collision
+        return (sm, GeometryScriptOutcomePins.SUCCESS)
+
+
+class MaterialFactoryNew(Object): pass
+class MaterialExpressionVertexColor(Object): pass
+
+
+class MaterialExpressionMultiply(Object):
+    _defaults = {"const_b": 1.0}
+
+
+class MaterialExpressionAdd(Object):
+    _defaults = {"const_b": 1.0}
+
+
+class MaterialExpressionConstant3Vector(Object):
+    _defaults = {"constant": None}
+
+
+class MaterialExpressionConstant(Object):
+    _defaults = {"r": 0.0}
+
+
+class EditorUtilityLibrary(object):
+    selected_assets = []
+    @staticmethod
+    def get_selected_assets(): return list(EditorUtilityLibrary.selected_assets)
