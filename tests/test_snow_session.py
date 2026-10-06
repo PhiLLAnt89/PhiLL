@@ -59,6 +59,17 @@ def paint(canvas, cx, cy, r, value=1.0, keep=True):
     comp.instance_colors = cols
 
 
+def ue_front_up(positions, tris):
+    """Unreal's outward normal of a triangle (a, b, c) is (c - a) x (b - a): seen from above it must point up."""
+    for a, b, c in tris:
+        pa, pb, pc = positions[a], positions[b], positions[c]
+        e1 = (pc[0] - pa[0], pc[1] - pa[1])
+        e2 = (pb[0] - pa[0], pb[1] - pa[1])
+        if e1[0] * e2[1] - e1[1] * e2[0] <= 0:
+            return False
+    return True
+
+
 def snow_tris(actor):
     return len(actor.get_editor_property("dynamic_mesh_component").get_dynamic_mesh().tris)
 
@@ -86,7 +97,7 @@ assert canvas.folder == "SnowPainter" and canvas.hidden_in_game
 assert U.EditorActorSubsystem.selected == [canvas], "the canvas is selected so Mesh Paint paints it"
 csm = canvas.get_component_by_class(U.StaticMeshComponent).get_editor_property("static_mesh")
 assert csm.get_path_name().startswith("/Game/SnowPainter/Canvas/SM_SnowCanvas_Rock")
-assert csm.materials[0].get_name() == "M_SnowPainter_Canvas" and csm.materials[0].blend_mode == U.BlendMode.BLEND_TRANSLUCENT
+assert csm.materials[0].get_name() == "M_SnowPainter_Canvas3" and csm.materials[0].blend_mode == U.BlendMode.BLEND_TRANSLUCENT
 assert all(c == (0.0, 0.0, 0.0, 1.0) for c in csm.colors), "the canvas starts unpainted (black)"
 world_z = {round(p[2] + canvas.loc.z, 3) for p in csm.geo[0]}
 assert world_z == {50.0 + S.CONFIG["canvas_offset"]}, "only the top, floating just above it"
@@ -94,10 +105,10 @@ assert max(math.dist(csm.geo[0][a], csm.geo[0][b]) for t in csm.geo[1] for a, b 
 xs = sorted({round(p[0] + canvas.loc.x, 4) for p in csm.geo[0]})
 assert all(abs((b - a) - 10.0) < 1e-6 for a, b in zip(xs, xs[1:])), "a regular 10 cm paint grid"
 assert min(xs) >= 1000 - 150 - 1e-6 and max(xs) <= 1000 + 150 + 1e-6, "draped over the rock, not elsewhere"
-assert canvas.get_component_by_class(U.StaticMeshComponent).override_materials[0].get_name() == "M_SnowPainter_Canvas"
+assert canvas.get_component_by_class(U.StaticMeshComponent).override_materials[0].get_name() == "M_SnowPainter_Canvas3"
 assert any(str(t).startswith(S.TAG_GRID) for t in canvas.get_editor_property("tags"))
 assert snow_tris(snow) == 0
-assert "Painting:" in win.lbl_targets.text() and not win.btn_start.isEnabled() and win.btn_bake.isEnabled()
+assert "Painting:" in win.lbl_targets.text() and win.btn_start.text() == "Add selected meshes" and win.btn_bake.isEnabled()
 print("start: canvas %d tris" % len(csm.geo[1]))
 
 # --- a stroke: no rebuild while painting, rebuild once it stops ------------------------------------------------
@@ -112,9 +123,11 @@ n1 = snow_tris(snow)
 assert n1 > 0 and "snow rebuilt" in win.lbl_status.text(), win.lbl_status.text()
 mesh = snow.get_editor_property("dynamic_mesh_component").get_dynamic_mesh()
 top = max(p[2] for p in mesh.positions) + snow.loc.z
+assert ue_front_up(mesh.positions, mesh.tris), "snow front faces must face up in Unreal's winding"
+assert ue_front_up(csm.geo[0], csm.geo[1]), "canvas front faces must face up in Unreal's winding"
 assert 50.0 + 5.0 < top <= 50.0 + S.CONFIG["depth"] * (1 + S.CONFIG["clumps"]) + 1e-6, top
 assert mesh.normals and mesh.uvs and mesh.colors
-assert snow.get_editor_property("dynamic_mesh_component").override_materials[0].get_name() == "M_SnowPainter_Snow"
+assert snow.get_editor_property("dynamic_mesh_component").override_materials[0].get_name() == "M_SnowPainter_Snow2"
 copies = len(U.GeometryScript_SceneUtils.copies)
 clock.run_ticks(U, n=4, step=0.6)
 assert snow_tris(snow) == n1 and len(U.GeometryScript_SceneUtils.copies) > copies, "idle: polled, not rebuilt"
@@ -149,6 +162,12 @@ win.on_update()
 assert snow_tris(snow) > 0, "Update now still works"
 assert "canvas points painted" in win.lbl_status.text() and "brightest red 1.00" in win.lbl_status.text(), \
     win.lbl_status.text()
+assert "-> snow:" in win.lbl_status.text() and "Snow_Rock" in win.lbl_status.text(), win.lbl_status.text()
+real_write = S.write_mesh
+S.write_mesh = lambda *a, **k: (_ for _ in ()).throw(AttributeError("no such method"))
+win.on_update()
+assert "ERROR AttributeError: no such method" in win.lbl_status.text(), win.lbl_status.text()
+S.write_mesh = real_write
 win.chk_live.setChecked(True)
 print("erase / live off / update now: OK")
 
@@ -180,6 +199,15 @@ S._stop_tick()
 win = S.show(reuse=False)
 assert S.active() and "Resumed" in win.lbl_status.text() and snow_tris(snow) > 0
 assert len(actors_tagged(S.TAG_SNOW)) == 1, "the existing snow actor is reused"
+assert "older version" not in win.lbl_status.text()
+# a canvas made by 1.1.x (old winding): resumed, with a hint to rebuild it
+c0 = actors_tagged(S.TAG_CANVAS)[0]
+c0.set_editor_property("tags", [t for t in c0.get_editor_property("tags") if str(t) != S.TAG_WINDING])
+win.close()
+S._S["targets"] = []
+S._stop_tick()
+win = S.show(reuse=False)
+assert S.active() and "older version" in win.lbl_status.text() and "Clear paint" in win.lbl_status.text()
 print("resume: OK")
 
 # --- a canvas deleted by hand: dropped cleanly --------------------------------------------------------------------
@@ -188,19 +216,33 @@ win.resize(470, 900)
 QtWidgets.QApplication.processEvents()
 win.grab().save(os.path.join(OUT, "ui_snow.png"))
 
+# --- add another mesh to the running session ------------------------------------------------------------------------
+assert win.btn_start.text() == "Add selected meshes" and win.btn_start.isEnabled()
+rock2 = U.StaticMeshActor("Rock2", plane_mesh("SM_Rock2", 200.0, 20.0), loc=U.Vector(-800.0, 0.0, 0.0))
+U.EditorActorSubsystem.actors.append(rock2)
+U.EditorActorSubsystem.selected = [rock2, rock]          # rock is already being painted: skipped
+win.on_start()
+assert len(S._S["targets"]) == 2 and [t.label for t in S._S["targets"]] == ["Rock", "Rock2"]
+assert len(actors_tagged(S.TAG_CANVAS)) == 2 and set(U.EditorActorSubsystem.selected) == set(actors_tagged(S.TAG_CANVAS))
+U.EditorActorSubsystem.selected = [rock]
+win.on_start()
+assert "not already being painted" in win.lbl_status.text() and len(S._S["targets"]) == 2
+print("add meshes: OK")
+
 # --- bake: static mesh (Nanite), actor, canvas + live snow removed -----------------------------------------------
 win.chk_nanite.setChecked(True)
 win.on_bake()
 assert not S.active() and win.btn_start.isEnabled() and not win.btn_bake.isEnabled()
 baked = [a for a in U.EditorActorSubsystem.actors if a.get_actor_label() == "Snow_Rock" and isinstance(a, U.StaticMeshActor)]
 assert len(baked) == 1, [a.get_actor_label() for a in U.EditorActorSubsystem.actors]
+assert ue_front_up(*baked[0].get_component_by_class(U.StaticMeshComponent).get_editor_property("static_mesh").geo)
 bsm = baked[0].get_component_by_class(U.StaticMeshComponent).get_editor_property("static_mesh")
 assert bsm.get_path_name().startswith("/Game/SnowPainter/Baked/SM_Snow_Rock")
 assert bsm.get_editor_property("nanite_settings").enabled and bsm.collision
 assert bsm.materials[0].get_name() == "M_MySnow" and len(bsm.geo[1]) > 0
 assert not actors_tagged(S.TAG_CANVAS) and not actors_tagged(S.TAG_SNOW)
 assert not [o for o in U._ALL if isinstance(o, U.StaticMesh) and "SnowCanvas" in o.get_name()], "canvas assets deleted"
-assert U.EditorActorSubsystem.selected == baked
+assert set(U.EditorActorSubsystem.selected) == set(baked)
 assert "Baked 1" in win.lbl_status.text()
 print("bake: %d tris -> %s" % (len(bsm.geo[1]), bsm.get_path_name()))
 

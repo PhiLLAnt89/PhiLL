@@ -18,7 +18,7 @@ is Unreal's own Mesh Paint mode:
    Mode" or "Modeling Mode" > Mesh Paint), pick Colors (Vertex Color) > Paint,
    keep the paint color white and paint with the left mouse button (Shift+LMB
    erases). If nothing reacts, select SnowCanvas_<mesh> in the Outliner.
-   Painted areas glow light blue.
+   Painted areas glow orange.
 3. Each time you release the mouse, the snow is rebuilt with Geometry Script.
    Shape it with the sliders (depth, soft edges, max slope, clumps...).
 4. "Bake" turns it into a Static Mesh asset + actor (Nanite optional) and
@@ -56,7 +56,7 @@ try:
 except ImportError:          # the geometry core below also works outside Unreal (tests)
     unreal = None
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 TOOL_NAME = "Snow Painter"
 WINDOW_OBJECT_NAME = "SnowPainterWindow"
 
@@ -343,6 +343,8 @@ def build_snow_grid(surface, points, paint, params=None, up=(0.0, 0.0, 1.0)):
 
     m = {p: w * slope(p) for p, w in painted.items()}
     m = {p: v for p, v in m.items() if v > 0.0}
+    if not m:
+        return dict(empty, painted=len(painted), steep=True)    # all of it steeper than max_slope
     nb8 = ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1))
     for _ in range(int(cfg["softness"])):
         region = set(m)
@@ -456,7 +458,8 @@ def build_snow_grid(surface, points, paint, params=None, up=(0.0, 0.0, 1.0)):
     us = float(cfg["uv_scale"]) or 1.0
     return {"positions": out_pos, "normals": vertex_normals(out_pos, out_tris),
             "uvs": [(p[0] / us, p[1] / us) for p in out_pos], "colors": out_col, "triangles": out_tris,
-            "painted": len(painted), "stride": stride}
+            "painted": len(painted), "stride": stride, "steep": False,
+            "steep_points": sum(1 for p in painted if slope(p) <= 0.0)}
 
 
 def bounds_center(positions):
@@ -587,6 +590,7 @@ def _set_tags(actor, tags):
 
 TAG_CANVAS, TAG_SNOW, TAG_TARGET = "SnowPainterCanvas", "SnowPainterSnow", "SnowPainterTarget:"
 TAG_GRID = "SnowPainterGrid:"           # x0;y0;step;k of the canvas grid, so a session can be resumed
+TAG_WINDING = "SnowPainterWinding2"     # canvases built with Unreal's triangle winding (1.2.0+)
 
 
 def _is_ours(actor):
@@ -717,7 +721,10 @@ def write_mesh(mesh, data, center=(0.0, 0.0, 0.0)):
     _set(buf, ("uv0", "u_v0"), [unreal.Vector2D(u, v) for u, v in data["uvs"]])
     if data.get("colors"):
         buf.set_editor_property("vertex_colors", [unreal.LinearColor(*c) for c in data["colors"]])
-    _set(buf, ("triangles", "triangle_indices"), [unreal.IntVector(a, b, c) for a, b, c in data["triangles"]])
+    # This script winds triangles so that (b - a) x (c - a) points to the front side. Unreal's meshes use the
+    # opposite order (its outward normal is (c - a) x (b - a)), so the order is flipped here, where meshes are
+    # handed to Unreal - otherwise the canvas and the snow face down and are culled when seen from above.
+    _set(buf, ("triangles", "triangle_indices"), [unreal.IntVector(a, c, b) for a, b, c in data["triangles"]])
     edits = _gs("GeometryScript_MeshEdits", "GeometryScript_MeshBasicEdits")
     edits.append_buffers_to_mesh(mesh, buf, 0, False)
     return mesh
@@ -743,30 +750,32 @@ def _canvas_material():
         mel = unreal.MaterialEditingLibrary
         mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
         mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+        _call_first(lambda: mat.set_editor_property("two_sided", True), lambda: None)
         vc = mel.create_material_expression(mat, unreal.MaterialExpressionVertexColor, -600, 0)
         mul = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -400, 0)
-        mul.set_editor_property("const_b", 0.5)
+        mul.set_editor_property("const_b", 0.65)
         add = mel.create_material_expression(mat, unreal.MaterialExpressionAdd, -250, 0)
         add.set_editor_property("const_b", 0.03)         # a faint tint shows where you can paint
         col = mel.create_material_expression(mat, unreal.MaterialExpressionConstant3Vector, -400, -200)
-        col.set_editor_property("constant", unreal.LinearColor(0.35, 0.75, 1.0, 1.0))
+        col.set_editor_property("constant", unreal.LinearColor(1.0, 0.32, 0.02, 1.0))
         mel.connect_material_expressions(vc, "R", mul, "A")
         mel.connect_material_expressions(mul, "", add, "A")
         mel.connect_material_property(add, "", unreal.MaterialProperty.MP_OPACITY)
         mel.connect_material_property(col, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
-    return _material("M_SnowPainter_Canvas", build)
+    return _material("M_SnowPainter_Canvas3", build)        # 3: orange, two-sided
 
 
 def _default_snow_material():
     def build(mat):
         mel = unreal.MaterialEditingLibrary
+        _call_first(lambda: mat.set_editor_property("two_sided", True), lambda: None)
         col = mel.create_material_expression(mat, unreal.MaterialExpressionConstant3Vector, -400, -100)
         col.set_editor_property("constant", unreal.LinearColor(0.92, 0.94, 0.97, 1.0))
         rough = mel.create_material_expression(mat, unreal.MaterialExpressionConstant, -400, 100)
         rough.set_editor_property("r", 0.55)
         mel.connect_material_property(col, "", unreal.MaterialProperty.MP_BASE_COLOR)
         mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
-    return _material("M_SnowPainter_Snow", build)
+    return _material("M_SnowPainter_Snow2", build)          # 2: two-sided
 
 
 def snow_material():
@@ -876,6 +885,7 @@ class Target(object):
         self.sample = None          # cheap paint signature (every Nth vertex)
         self.changed_at = None
         self.diag = None            # what the last paint read found (see paint_report)
+        self.error = None           # last rebuild error
         self.stats = {}
 
 
@@ -958,7 +968,7 @@ def _make_canvas(t):
     actor.set_actor_label("SnowCanvas_%s" % t.label)
     x0, y0, step, k = t.grid
     _set_tags(actor, [TAG_CANVAS, TAG_TARGET + t.actor.get_path_name(),
-                      TAG_GRID + "%.4f;%.4f;%.4f;%d" % (x0, y0, step, k)])
+                      TAG_GRID + "%.4f;%.4f;%.4f;%d" % (x0, y0, step, k), TAG_WINDING])
     _call_first(lambda: actor.set_folder_path("SnowPainter"), lambda: None)
     _call_first(lambda: actor.set_actor_hidden_in_game(True), lambda: None)
     comp = _mesh_component(actor)
@@ -996,12 +1006,13 @@ def _selection():
 
 
 def start(actors=None):
-    """Lay paint canvases over the given (default: selected) mesh actors and start the live snow."""
-    if _S["targets"]:
-        raise RuntimeError("A painting session is already running (Bake or Cancel it first).")
-    actors = [a for a in (actors if actors is not None else _selection()) if not _is_ours(a) and _mesh_component(a)]
+    """Lay paint canvases over the given (default: selected) mesh actors and start the live snow. While a session
+    runs, this adds the meshes to it."""
+    taken = {t.actor.get_path_name() for t in _S["targets"] if _alive(t.actor)}
+    actors = [a for a in (actors if actors is not None else _selection())
+              if not _is_ours(a) and _mesh_component(a) and a.get_path_name() not in taken]
     if not actors:
-        raise RuntimeError("Select one or more Static Mesh actors first.")
+        raise RuntimeError("Select one or more Static Mesh actors (not already being painted) first.")
     done = []
     with unreal.ScopedSlowTask(len(actors), "Snow Painter: preparing paint canvases...") as task:
         task.make_dialog(True)
@@ -1019,8 +1030,8 @@ def start(actors=None):
                     _warn(traceback.format_exc())
     if not done:
         raise RuntimeError("No paint canvas could be made (see the Output Log).")
-    _S["targets"] = done
-    _actor_sub().set_selected_level_actors([t.canvas for t in done])
+    _S["targets"] = _S["targets"] + done
+    _actor_sub().set_selected_level_actors([t.canvas for t in _S["targets"]])
     _start_tick()
     coarse = ["%s (%.0f cm)" % (t.label, t.stats["canvas_detail"]) for t in done if t.stats.get("coarsened")]
     _notify("Painting %d mesh(es). Mode dropdown (top left) > Mesh Paint > Colors > Paint, then paint with the "
@@ -1068,8 +1079,14 @@ def resume():
         t.canvas_mesh = _call_first(lambda: comp.get_editor_property("static_mesh"), lambda: None) if comp else None
         loc = t.canvas.get_actor_location()
         t.center = (loc.x, loc.y, loc.z)
+        if t.canvas_mesh is not None:
+            try:
+                _set_mesh_material(t.canvas_mesh, _canvas_material(), t.canvas)     # current paint colour
+            except Exception as ex:
+                _warn("Canvas material: %s" % ex)
         if e.get("snow") is not None:
             t.snow = e["snow"]
+            _call_first(lambda: _snow_component(t.snow).set_material(0, snow_material()), lambda: None)
         else:
             _make_snow_actor(t)
         found.append(t)
@@ -1077,7 +1094,10 @@ def resume():
         _S["targets"] = found
         _start_tick()
         refresh(force=True)
-        _notify("Resumed painting on %d mesh(es)." % len(found))
+        old = [t.label for t in found if TAG_WINDING not in _tags(t.canvas)]
+        _notify("Resumed painting on %d mesh(es).%s" % (len(found), (
+            " The canvas of %s is from an older version and faces down, so its paint glow is hidden: click Clear "
+            "paint once to rebuild it (the snow itself is fine)." % ", ".join(old)) if old else ""))
     return found
 
 
@@ -1122,6 +1142,8 @@ def _rebuild(t):
     write_mesh(dm, data, (loc.x, loc.y, loc.z))
     _call_first(lambda: comp.notify_mesh_updated(), lambda: None)
     t.stats["snow_triangles"] = len(data["triangles"])
+    t.stats["steep"] = bool(data.get("steep"))
+    t.stats["steep_points"] = data.get("steep_points", 0)
     return data
 
 
@@ -1150,8 +1172,10 @@ def refresh(force=False):
         try:
             _read_paint(t, full=True) if force else _read_paint(t)
             _rebuild(t)
+            t.error = None
             n += 1
         except Exception as e:
+            t.error = "%s: %s" % (type(e).__name__, e)
             _warn("%s: %s\n%s" % (t.label, e, traceback.format_exc()))
     return n
 
@@ -1161,15 +1185,27 @@ def paint_report():
     out = []
     for t in _S["targets"]:
         d = getattr(t, "diag", None)
-        if d is None:
+        if getattr(t, "error", None):
+            out.append("%s: ERROR %s (details in the Output Log)" % (t.label, t.error))
+        elif d is None:
             out.append("%s: paint not read yet" % t.label)
         elif not d["colors"]:
             out.append("%s: the canvas has no readable vertex colors (Mesh Paint may be painting a texture, or "
                        "another mesh)" % t.label)
         else:
-            out.append("%s: %d of %d canvas points painted (brightest red %.2f)%s" % (
-                t.label, d["painted"], d["points"], d["brightest"],
-                "" if d["painted"] else " - is Mesh Paint painting this canvas, in white, with Red ticked?"))
+            line = "%s: %d of %d canvas points painted (brightest red %.2f)" % (
+                t.label, d["painted"], d["points"], d["brightest"])
+            if not d["painted"]:
+                line += " - is Mesh Paint painting this canvas, in white, with Red ticked?"
+            elif t.stats.get("steep"):
+                line += " - but all of it is steeper than Max slope (%.0f deg): no snow. Raise Max slope." % (
+                    CONFIG["max_slope"])
+            else:
+                line += " -> snow: %s triangles (actor %s)%s" % (
+                    "{:,}".format(t.stats.get("snow_triangles", 0)), t.snow.get_actor_label() if _alive(t.snow) else "?",
+                    (", %d painted points too steep for snow" % t.stats["steep_points"])
+                    if t.stats.get("steep_points") else "")
+            out.append(line)
     return out
 
 
@@ -1541,7 +1577,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 "2. Pick <b>Colors</b> (<i>Vertex Color</i>) &gt; <b>Paint</b>, keep the paint color white, and paint "
                 "with the left mouse button; hold Shift to erase. Nothing happens? Select <b>SnowCanvas_...</b> in "
                 "the Outliner (folder SnowPainter).<br>"
-                "3. Painted areas glow light blue. The snow appears when you release the mouse.")
+                "3. Painted areas glow orange. The snow appears when you release the mouse.")
             howto.setWordWrap(True)
             howto.setTextFormat(Qt.TextFormat.RichText)
             c2.addWidget(howto)
@@ -1667,11 +1703,14 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
 
         def _refresh(self):
             on = active()
+            self.btn_start.setText("Add selected meshes" if on else "Start painting")
+            self.btn_start.setToolTip("Add the selected Static Mesh actors to this painting session." if on else
+                                      "Lays a paint canvas over the selected Static Mesh actors (they aren't changed).")
             if self.chk_live.isChecked() != bool(_S["live"]):
                 self.chk_live.blockSignals(True)
                 self.chk_live.setChecked(bool(_S["live"]))
                 self.chk_live.blockSignals(False)
-            self.btn_start.setEnabled(not on)
+            self.btn_start.setEnabled(True)
             for b in (self.btn_update, self.btn_clear, self.btn_bake, self.btn_cancel):
                 b.setEnabled(on)
             if on:

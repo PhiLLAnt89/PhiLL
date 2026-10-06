@@ -9,7 +9,7 @@ Unreal's Python can't capture mouse drags in the level viewport, so the brush is
    - The canvas is a regular grid placed by casting rays straight down onto your mesh's full-detail surface. For Nanite meshes, that's the high-resolution source.
    - It floats just above the surface, a bit more where the surface is bumpy between grid points, and it never bridges cliffs.
    - It doesn't depend on how your mesh is triangulated. Your meshes are never modified.
-2. **Paint:** in Mesh Paint mode, paint the canvas with the left mouse button; Shift erases. Painted areas glow light blue.
+2. **Paint:** in Mesh Paint mode, paint the canvas with the left mouse button; Shift erases. Painted areas glow orange, which shows on white snow and blue ice alike.
 3. **Snow:** about half a second after you release the mouse, the snow is rebuilt into a Dynamic Mesh actor.
    - It's built on the real surface, with its own detail (5 cm by default) where you painted, so it stays fine even when a big mesh needs a coarser paint grid.
    - It thins out to nothing at cliff lips and mesh edges.
@@ -42,6 +42,7 @@ Unreal's Python can't capture mouse drags in the level viewport, so the brush is
    | Clumps / Clump size | Thickness variation |
    | Edge sink | How far the thin edge dips under the surface, to hide the seam |
 
+   - To add more meshes, select them and click **Add selected meshes**. This is the same button as Start painting, renamed while a session runs.
 4. Optionally pick your own snow material: type its path, or select it in the Content Browser and click **Use selected**. The built-in one is plain white. The snow gets top-down UVs (one tile per 2 m) and the paint amount in vertex color red, which a material can use for edge blending.
 5. Use **Bake to Static Mesh**, then **Save**.
    - **Clear paint** starts over.
@@ -76,6 +77,14 @@ Defaults are in `CONFIG` at the top of the script, for example `canvas_detail`, 
 - **Testing:** the tests run the whole tool against a fake of the Unreal API, so do one pass in the editor first. The calls most likely to differ between engine versions are the Geometry Script copy options and the vertex color read-back. If one fails, the Output Log says which.
 
 ## Changes
+- **1.2.0:**
+  - **Fix:** the canvas and the snow were wound the opposite way to Unreal's convention, so they faced down and were hidden when seen from above: snow was built but invisible, and the paint glow didn't show. This also caused 1.0's fragmented canvas, which kept the undersides of the mesh. To fix a canvas from an older version, click **Clear paint** once.
+  - **Add selected meshes:** while a session runs, Start painting becomes this button, which adds more meshes without ending the session.
+  - **Errors:** Update now shows rebuild errors in the status line.
+  - The default canvas and snow materials are two-sided.
+- **1.1.1:**
+  - Painted areas glow orange instead of light blue, which was invisible on icy, bluish-white meshes.
+  - **Update now** reports how much paint was read, how many snow triangles were built, and whether the painted area is too steep for snow.
 - **1.1.0:** the paint canvas is now a grid draped over the mesh by casting rays straight down onto its full-detail surface.
   - **What was wrong:** 1.0 built the canvas from a simplified copy of the mesh. On big or dense scans it ended up mostly buried inside the mesh, leaving scattered fragments.
   - **Snow:** now built on the real surface with its own detail, and it tapers off at cliff lips and mesh edges.
