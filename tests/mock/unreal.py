@@ -1073,6 +1073,7 @@ class GeometryScript_NewAssetUtils(object):
                         nanite_settings=MeshNaniteSettings(enabled=opts.enable_nanite))
         sm.geo = (list(mesh.positions), list(mesh.tris))
         sm.colors = list(mesh.colors) if mesh.colors else None
+        sm._p["static_materials"] = [StaticMaterial(material_interface=None, material_slot_name="Slot0")]
         sm.collision = opts.enable_collision
         return (sm, GeometryScriptOutcomePins.SUCCESS)
 
@@ -1109,3 +1110,77 @@ class GeometryScript_UVs(object):
         if n > 0 and not mesh.uvs:
             mesh.uvs = [(0.0, 0.0)] * len(mesh.positions)
         return mesh
+
+
+# ---------------------------------------------------------------- Geometry Script spatial queries (vertical rays)
+GeometryScriptSearchOutcomePins = _enum("GeometryScriptSearchOutcomePins", "FOUND", "NOT_FOUND")
+
+
+class Box(object):
+    def __init__(self, lo, hi): self.min, self.max = lo, hi
+
+
+class GeometryScriptSpatialQueryOptions(_Struct):
+    _defaults = {"max_distance": 0.0, "allow_unsafe_modified_queries": False, "winding_iso_threshold": 0.5}
+
+
+class GeometryScriptRayHitResult(_Struct):
+    _defaults = {"hit": False, "ray_parameter": 0.0, "hit_triangle_id": -1, "hit_position": None}
+
+
+class GeometryScriptDynamicMeshBVH(object):
+    """Buckets the triangles by XY cell: the tool only casts rays straight down."""
+    CELL = 25.0
+
+    def __init__(self, mesh):
+        self.mesh, self.buckets = mesh, {}
+        c = self.CELL
+        for t, tri in enumerate(mesh.tris):
+            ps = [mesh.positions[v] for v in tri]
+            for i in range(int(min(p[0] for p in ps) // c), int(max(p[0] for p in ps) // c) + 1):
+                for j in range(int(min(p[1] for p in ps) // c), int(max(p[1] for p in ps) // c) + 1):
+                    self.buckets.setdefault((i, j), []).append(t)
+
+
+class GeometryScript_MeshSpatial(object):
+    rays = 0
+
+    @staticmethod
+    def build_bvh_for_mesh(mesh, debug=None):
+        return (GeometryScriptDynamicMeshBVH(mesh),)
+
+    @staticmethod
+    def find_nearest_ray_intersection_with_mesh(mesh, bvh, origin, direction, options, debug=None):
+        assert abs(direction.x) < 1e-9 and abs(direction.y) < 1e-9 and direction.z < 0, "mock: vertical rays only"
+        GeometryScript_MeshSpatial.rays += 1
+        x, y, best = origin.x, origin.y, None
+        c = GeometryScriptDynamicMeshBVH.CELL
+        for t in bvh.buckets.get((int(x // c), int(y // c)), []):
+            (ax, ay, az), (bx, by, bz), (cx, cy, cz) = [mesh.positions[v] for v in mesh.tris[t]]
+            d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+            if abs(d) < 1e-12:
+                continue                                  # vertical triangle: a vertical ray can't hit it
+            l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / d
+            l2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / d
+            l3 = 1.0 - l1 - l2
+            if min(l1, l2, l3) < -1e-9:
+                continue
+            z = l1 * az + l2 * bz + l3 * cz
+            if z <= origin.z and (best is None or z > best):
+                best = z
+        hit = GeometryScriptRayHitResult()
+        if best is None:
+            return (hit, GeometryScriptSearchOutcomePins.NOT_FOUND)
+        hit.set_editor_property("hit", True)
+        hit.set_editor_property("ray_parameter", origin.z - best)
+        hit.set_editor_property("hit_position", Vector(x, y, best))
+        return (hit, GeometryScriptSearchOutcomePins.FOUND)
+
+
+def _mesh_bbox(mesh):
+    ps = mesh.positions
+    return Box(Vector(min(p[0] for p in ps), min(p[1] for p in ps), min(p[2] for p in ps)),
+               Vector(max(p[0] for p in ps), max(p[1] for p in ps), max(p[2] for p in ps)))
+
+
+GeometryScript_MeshQueries.get_mesh_bounding_box = staticmethod(lambda mesh: (_mesh_bbox(mesh),))

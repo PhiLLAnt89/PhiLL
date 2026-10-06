@@ -11,9 +11,9 @@ HOW IT WORKS
 ------------
 Unreal's Python can't capture mouse drags in the level viewport, so the brush
 is Unreal's own Mesh Paint mode:
-1. Select one or more mesh actors and click "Start painting". The tool lays a
-   fine, invisible "paint canvas" over their upward-facing surfaces (your
-   meshes are never modified).
+1. Select one or more mesh actors and click "Start painting". The tool drapes
+   an invisible "paint canvas" over their top surface, found by casting rays
+   straight down onto the full-detail mesh (your meshes are never modified).
 2. Switch to Mesh Paint mode (the mode dropdown at the top left, e.g. "Selection
    Mode" or "Modeling Mode" > Mesh Paint), pick Colors (Vertex Color) > Paint,
    keep the paint color white and paint with the left mouse button (Shift+LMB
@@ -56,7 +56,7 @@ try:
 except ImportError:          # the geometry core below also works outside Unreal (tests)
     unreal = None
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 TOOL_NAME = "Snow Painter"
 WINDOW_OBJECT_NAME = "SnowPainterWindow"
 
@@ -75,12 +75,14 @@ CONFIG = {
     "edge_sink": 1.5,             # cm the snow edge dips under the surface (no visible seam)
     "uv_scale": 200.0,            # cm per UV tile (top-down projection) for the snow material
     "seed": 7,
-    # --- paint canvas -------------------------------------------------------------------------
-    "canvas_detail": 8.0,         # cm: longest canvas edge (finer = more precise paint, heavier)
-    "canvas_max_tris": 120000,    # per target; the detail is coarsened to stay under it
-    "canvas_source_max_tris": 150000,   # denser source meshes (Nanite scans) are simplified first
-    "canvas_max_angle": 80.0,     # degrees from up: steeper faces get no canvas (can't hold snow)
-    "canvas_offset": 0.4,         # cm the canvas floats above the surface
+    # --- paint canvas + snow detail ----------------------------------------------------------------
+    "canvas_detail": 10.0,        # cm between paint canvas points (coarsened on big meshes, see canvas_max_points)
+    "canvas_max_points": 90000,   # per mesh: the canvas grid is coarsened to stay under this many points
+    "canvas_max_angle": 80.0,     # degrees: drops steeper than this (cliffs) get no canvas across them
+    "canvas_offset": 2.0,         # cm the canvas floats above the surface (plus the local bumpiness)
+    "snow_detail": 5.0,           # cm between snow vertices, independent of the canvas (sampled where painted)
+    "snow_max_points": 250000,    # per rebuild: very large painted areas get a coarser snow mesh
+    "surface_max_tris": 3000000,  # denser source meshes (Nanite scans) are simplified for the ray casts
     "paint_threshold": 0.02,      # painted red value below this counts as no paint
     # --- live update -------------------------------------------------------------------------------
     "poll_seconds": 0.5,          # how often the canvas paint is checked
@@ -129,26 +131,6 @@ def _smoothstep(e0, e1, x):
     return t * t * (3.0 - 2.0 * t)
 
 
-def weld(positions, triangles, tol=0.01):
-    """Merge vertices that sit on the same spot (render data splits them at UV / normal seams; without welding
-    the snow would tear open along those seams). Returns (positions, triangles, remap old -> new)."""
-    inv = 1.0 / tol
-    index, out, remap = {}, [], []
-    for p in positions:
-        key = (int(round(p[0] * inv)), int(round(p[1] * inv)), int(round(p[2] * inv)))
-        i = index.get(key)
-        if i is None:
-            i = index[key] = len(out)
-            out.append((float(p[0]), float(p[1]), float(p[2])))
-        remap.append(i)
-    tris = []
-    for a, b, c in triangles:
-        a, b, c = remap[a], remap[b], remap[c]
-        if a != b and b != c and c != a:
-            tris.append((a, b, c))
-    return out, tris, remap
-
-
 def face_normal(positions, tri):
     """Unnormalised (length = 2 x area)."""
     a, b, c = positions[tri[0]], positions[tri[1]], positions[tri[2]]
@@ -165,120 +147,6 @@ def vertex_normals(positions, triangles):
             a[1] += n[1]
             a[2] += n[2]
     return [_normalize(tuple(a)) for a in acc]
-
-
-def neighbours(count, triangles):
-    nb = [set() for _ in range(count)]
-    for a, b, c in triangles:
-        nb[a].update((b, c))
-        nb[b].update((a, c))
-        nb[c].update((a, b))
-    return [list(s) for s in nb]
-
-
-def compact(positions, triangles):
-    """Drop vertices no triangle uses. Returns (positions, triangles, old index -> new index)."""
-    used = {}
-    out = []
-    tris = []
-    for t in triangles:
-        nt = []
-        for v in t:
-            j = used.get(v)
-            if j is None:
-                j = used[v] = len(out)
-                out.append(positions[v])
-            nt.append(j)
-        tris.append(tuple(nt))
-    return out, tris, used
-
-
-def triangle_area(positions, triangles):
-    return sum(_length(face_normal(positions, t)) * 0.5 for t in triangles)
-
-
-def refine(positions, triangles, max_edge, max_tris=200000):
-    """Split edges longer than max_edge until none is left (or the triangle budget would be exceeded).
-    Conforming: an edge is split for both of its triangles, so no cracks / T-junctions. Shape is unchanged
-    (new vertices are edge midpoints). Returns (positions, triangles, reached_detail)."""
-    pos = list(positions)
-    tris = list(triangles)
-    limit = float(max_edge) ** 2
-    while True:
-        marked = {}
-        for a, b, c in tris:
-            for u, v in ((a, b), (b, c), (c, a)):
-                k = (u, v) if u < v else (v, u)
-                if k not in marked and _dist2(pos[u], pos[v]) > limit:
-                    marked[k] = -1
-        if not marked:
-            return pos, tris, True
-
-        def key(u, v):
-            return (u, v) if u < v else (v, u)
-
-        estimate = 0
-        for a, b, c in tris:
-            estimate += 1 + (key(a, b) in marked) + (key(b, c) in marked) + (key(c, a) in marked)
-        if estimate > max_tris:
-            return pos, tris, False
-        for k in marked:
-            p, q = pos[k[0]], pos[k[1]]
-            marked[k] = len(pos)
-            pos.append(((p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5, (p[2] + q[2]) * 0.5))
-        out = []
-        for a, b, c in tris:
-            mab, mbc, mca = marked.get(key(a, b)), marked.get(key(b, c)), marked.get(key(c, a))
-            n = (mab is not None) + (mbc is not None) + (mca is not None)
-            if n == 0:
-                out.append((a, b, c))
-            elif n == 3:
-                out += [(a, mab, mca), (mab, b, mbc), (mca, mbc, c), (mab, mbc, mca)]
-            elif n == 1:
-                if mab is not None:
-                    out += [(a, mab, c), (mab, b, c)]
-                elif mbc is not None:
-                    out += [(a, b, mbc), (a, mbc, c)]
-                else:
-                    out += [(a, b, mca), (mca, b, c)]
-            else:
-                # rotate so the two split edges are x-y and y-z (z-x stays whole)
-                for x, y, z in ((a, b, c), (b, c, a), (c, a, b)):
-                    m1, m2 = marked.get(key(x, y)), marked.get(key(y, z))
-                    if m1 is not None and m2 is not None:
-                        break
-                out.append((m1, y, m2))
-                if _dist2(pos[x], pos[m2]) <= _dist2(pos[m1], pos[z]):     # shorter diagonal of the quad
-                    out += [(x, m1, m2), (x, m2, z)]
-                else:
-                    out += [(x, m1, z), (m1, m2, z)]
-        tris = out
-
-
-def make_canvas(positions, triangles, params=None, up=(0.0, 0.0, 1.0)):
-    """Paint canvas from a mesh (world space): its faces flat enough to hold snow, refined to an even density,
-    lifted slightly off the surface. Returns (positions, triangles, info)."""
-    cfg = dict(CONFIG)
-    cfg.update(params or {})
-    min_up = math.cos(math.radians(cfg["canvas_max_angle"]))
-    keep = []
-    for t in triangles:
-        n = face_normal(positions, t)
-        length = _length(n)
-        if length > 1e-9 and _dot(n, up) / length >= min_up:
-            keep.append(t)
-    pos, tris, _m = compact(positions, keep)
-    if not tris:
-        return [], [], {"triangles": 0, "detail": cfg["canvas_detail"], "reached": True}
-    budget = int(cfg["canvas_max_tris"])
-    area = triangle_area(pos, tris)
-    # an even mesh of edge L has ~ area / (0.433 L^2) triangles: coarsen the detail to fit the budget
-    detail = max(float(cfg["canvas_detail"]), math.sqrt(area / (0.433 * max(1, budget))) * 1.15)
-    pos, tris, reached = refine(pos, tris, detail, budget)
-    normals = vertex_normals(pos, tris)
-    off = float(cfg["canvas_offset"])
-    pos = [(p[0] + n[0] * off, p[1] + n[1] * off, p[2] + n[2] * off) for p, n in zip(pos, normals)]
-    return pos, tris, {"triangles": len(tris), "detail": detail, "reached": reached, "area": area}
 
 
 def _hash3(ix, iy, iz, seed):
@@ -305,78 +173,290 @@ def value_noise(x, y, z, seed=0):
     return lerp(lerp(x00, x10, sy), lerp(x01, x11, sy), sz)
 
 
-def _topology(positions, triangles, cache):
-    """Welded mesh + normals + neighbours, reused while the painted surface stays the same (only the paint changes
-    between strokes)."""
-    key = (len(positions), len(triangles), tuple(positions[0]) if positions else None,
-           tuple(positions[-1]) if positions else None)
-    if cache is not None and cache.get("key") == key:
-        return cache["topo"]
-    pos, tris, remap = weld(positions, triangles)
-    topo = (pos, tris, remap, vertex_normals(pos, tris), neighbours(len(pos), tris))
-    if cache is not None:
-        cache["key"], cache["topo"] = key, topo
-    return topo
+# --- the surface seen from above ---------------------------------------------------------------------------
+# Snow falls from above, so both the paint canvas and the snow are built from rays cast straight down onto the
+# real (full detail) surface: no dependence on how the mesh is triangulated, its winding or its density.
+class Surface(object):
+    """Top surface of a mesh sampled by downward ray casts on a fine XY lattice (each point cast once, cached).
+    raycast(x, y) -> z of the topmost hit or None. Canvas point (i, j) is lattice point (i * k, j * k); the snow
+    uses the fine lattice (step / k) where it was painted."""
+
+    def __init__(self, raycast, x0, y0, step, k):
+        self.raycast = raycast
+        self.x0, self.y0, self.step = float(x0), float(y0), float(step)
+        self.k = max(1, int(k))
+        self.fine = self.step / self.k
+        self.cache = {}
+        self.rays = 0
+
+    def xy(self, I, J):
+        return self.x0 + I * self.fine, self.y0 + J * self.fine
+
+    def z(self, I, J):
+        key = (I, J)
+        try:
+            return self.cache[key]
+        except KeyError:
+            pass
+        x, y = self.xy(I, J)
+        self.rays += 1
+        v = self.raycast(x, y)
+        self.cache[key] = v
+        return v
+
+    def cz(self, i, j):
+        return self.z(i * self.k, j * self.k)
+
+    def canvas_index(self, x, y):
+        return int(round((x - self.x0) / self.step)), int(round((y - self.y0) / self.step))
 
 
-def build_snow(positions, triangles, weights, params=None, up=(0.0, 0.0, 1.0), base_offset=0.0, cache=None):
-    """Snow surface from a painted mesh.
-    positions/triangles: the painted surface (world space, may contain split vertices), weights: paint per
-    vertex (0..1). base_offset: how far the painted surface floats above the real one (the canvas offset).
-    cache: a dict kept between calls on the same surface (skips welding / normals / neighbours).
-    Returns {"positions", "normals", "uvs", "colors", "triangles", "painted"}; empty lists when nothing is painted."""
+def plan_grid(xmin, ymin, xmax, ymax, params=None):
+    """Canvas grid over an XY box: (x0, y0, step, k, nx, ny). The step is coarsened so the grid stays under
+    canvas_max_points; k (a power of two) subdivides it down to about snow_detail for the snow."""
     cfg = dict(CONFIG)
     cfg.update(params or {})
-    pos, tris, remap, normals, nb = _topology(positions, triangles, cache)
-    n = len(pos)
-    w = [0.0] * n
+    w, h = max(1.0, xmax - xmin), max(1.0, ymax - ymin)
+    step = max(float(cfg["canvas_detail"]), math.sqrt(w * h / max(1.0, float(cfg["canvas_max_points"]))))
+    nx, ny = int(math.floor(w / step)) + 1, int(math.floor(h / step)) + 1
+    x0 = xmin + (w - (nx - 1) * step) * 0.5
+    y0 = ymin + (h - (ny - 1) * step) * 0.5
+    k = 1
+    while k < 16 and step / k > float(cfg["snow_detail"]) * 1.5:
+        k *= 2
+    return x0, y0, step, k, nx, ny
+
+
+def _cliff(zs, span, max_angle):
+    return max(zs) - min(zs) > span * 1.42 * math.tan(math.radians(max_angle))
+
+
+def make_canvas_grid(surface, nx, ny, params=None, progress=None):
+    """Paint canvas: a grid draped over the top surface, lifted a little above it (more where the surface is bumpy
+    between grid points), with no faces across cliffs. Returns (positions, triangles, {(i, j): vertex index})."""
+    cfg = dict(CONFIG)
+    cfg.update(params or {})
+    z = {}
+    for i in range(nx):
+        if progress is not None:
+            progress(i, 2 * nx + 2)
+        for j in range(ny):
+            v = surface.cz(i, j)
+            if v is not None:
+                z[(i, j)] = v
+    cells = []
+    for (i, j), z00 in z.items():
+        others = (z.get((i + 1, j)), z.get((i + 1, j + 1)), z.get((i, j + 1)))
+        if None in others or _cliff((z00,) + others, surface.step, cfg["canvas_max_angle"]):
+            continue
+        cells.append((i, j))
+    k, rough = surface.k, {}
+    chunk = max(1, len(cells) // max(1, nx))
+    for n, (i, j) in enumerate(cells):
+        if progress is not None and n % chunk == 0:
+            progress(nx + n // chunk, 2 * nx + 2)
+        corners = ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))
+        if k >= 2:
+            zc = surface.z(i * k + k // 2, j * k + k // 2)       # on the lattice: the snow reuses it
+        else:
+            x, y = surface.xy(i + 0.5, j + 0.5)
+            surface.rays += 1
+            zc = surface.raycast(x, y)
+        if zc is None:
+            continue
+        bump = zc - sum(z[c] for c in corners) / 4.0
+        if bump > 0:
+            for c in corners:
+                rough[c] = max(rough.get(c, 0.0), bump)
+    off = float(cfg["canvas_offset"])
+    index, pos, tris = {}, [], []
+
+    def vid(p):
+        n = index.get(p)
+        if n is None:
+            n = index[p] = len(pos)
+            x, y = surface.xy(p[0] * k, p[1] * k)
+            pos.append((x, y, z[p] + off + rough.get(p, 0.0)))
+        return n
+
+    for i, j in cells:
+        a, b, c, d = vid((i, j)), vid((i + 1, j)), vid((i + 1, j + 1)), vid((i, j + 1))
+        if abs(z[(i, j)] - z[(i + 1, j + 1)]) <= abs(z[(i + 1, j)] - z[(i, j + 1)]):
+            tris += [(a, b, c), (a, c, d)]
+        else:
+            tris += [(a, b, d), (b, c, d)]
+    return pos, tris, index
+
+
+def build_snow_grid(surface, points, paint, params=None, up=(0.0, 0.0, 1.0)):
+    """Snow from paint on the canvas grid.
+    surface: Surface of the target; points: canvas points (i, j) that exist; paint: {(i, j): 0..1}.
+    Returns {"positions", "normals", "uvs", "colors", "triangles", "painted", "stride"}; empty when nothing is
+    painted. Positions are world space."""
+    cfg = dict(CONFIG)
+    cfg.update(params or {})
+    empty = {"positions": [], "normals": [], "uvs": [], "colors": [], "triangles": [], "painted": 0, "stride": 1}
     thr = float(cfg["paint_threshold"])
-    for i, j in enumerate(remap):
-        v = weights[i] if i < len(weights) else 0.0
-        v = 0.0 if v < thr else min(1.0, float(v))
-        if v > w[j]:
-            w[j] = v
-    empty = {"positions": [], "normals": [], "uvs": [], "colors": [], "triangles": [], "painted": 0}
-    if not any(v > 0.0 for v in w):
+    painted = {p: min(1.0, float(w)) for p, w in paint.items() if p in points and w >= thr}
+    if not painted or surface is None:
         return empty
+    s, k = surface.step, surface.k
+    max_angle = float(cfg["canvas_max_angle"])
+    limit = s * math.tan(math.radians(max_angle))
+
+    def cz(p):
+        return surface.cz(p[0], p[1]) if p in points else None
+
+    def linked(p, q, diag=False):
+        a, b = cz(p), cz(q)
+        return a is not None and b is not None and abs(a - b) <= limit * (1.42 if diag else 1.0)
+
+    normals = {}
+
+    def normal(p):
+        n = normals.get(p)
+        if n is None:
+            i, j = p
+            z0 = cz(p)
+            g = []
+            for (d1, d2) in (((1, 0), (-1, 0)), ((0, 1), (0, -1))):
+                qa, qb = (i + d1[0], j + d1[1]), (i + d2[0], j + d2[1])
+                za = cz(qa) if linked(p, qa) else None
+                zb = cz(qb) if linked(p, qb) else None
+                if za is not None and zb is not None:
+                    g.append((za - zb) / (2 * s))
+                elif za is not None:
+                    g.append((za - z0) / s)
+                elif zb is not None:
+                    g.append((z0 - zb) / s)
+                else:
+                    g.append(0.0)
+            n = normals[p] = _normalize((-g[0], -g[1], 1.0))
+        return n
+
     up = _normalize(up)
     c_max = math.cos(math.radians(cfg["max_slope"]))
     c_full = math.cos(math.radians(max(0.0, cfg["max_slope"] - cfg["slope_fade"])))
-    m = [w[i] * _smoothstep(c_max, c_full, _dot(normals[i], up)) for i in range(n)]
+
+    def slope(p):
+        return _smoothstep(c_max, c_full, _dot(normal(p), up))
+
+    m = {p: w * slope(p) for p, w in painted.items()}
+    m = {p: v for p, v in m.items() if v > 0.0}
+    nb8 = ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1))
     for _ in range(int(cfg["softness"])):
-        m = [0.5 * m[i] + 0.5 * (sum(m[j] for j in nb[i]) / len(nb[i])) if nb[i] else m[i] for i in range(n)]
-    eps = 0.01
-    keep = [t for t in tris if max(m[t[0]], m[t[1]], m[t[2]]) > eps]
-    if not keep:
+        region = set(m)
+        for (i, j) in list(m):
+            for di, dj in nb8:
+                q = (i + di, j + dj)
+                if q in points and linked((i, j), q, di and dj):
+                    region.add(q)
+        new = {}
+        for p in region:
+            qs = [(p[0] + di, p[1] + dj) for di, dj in nb8]
+            qs = [q for q, (di, dj) in zip(qs, nb8) if q in points and linked(p, q, di and dj)]
+            avg = sum(m.get(q, 0.0) for q in qs) / len(qs) if qs else 0.0
+            v = (0.5 * m.get(p, 0.0) + 0.5 * avg) * slope(p)
+            if v > 1e-4:
+                new[p] = v
+        m = new
+    # next to a drop or the edge of the mesh, the snow thins out to nothing (instead of ending in a wall)
+    for p in list(m):
+        for di, dj in nb8:
+            q = (p[0] + di, p[1] + dj)
+            if q not in points or not linked(p, q, di and dj):
+                m[p] = 0.0
+                break
+    if not any(v > 0.0 for v in m.values()):
         return empty
+    eps = 0.01
+
+    def corners(c):
+        i, j = c
+        return ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))
+
+    cells = set()
+    for (i, j) in m:
+        for c in ((i - 1, j - 1), (i, j - 1), (i - 1, j), (i, j)):
+            cs = corners(c)
+            if all(q in points for q in cs) and not _cliff([cz(q) for q in cs], s, max_angle) \
+                    and max(m.get(q, 0.0) for q in cs) > eps:
+                cells.add(c)
+    if not cells:
+        return empty
+    stride = 1
+    while stride < k and len(cells) * (k // stride + 1) ** 2 > float(cfg["snow_max_points"]):
+        stride *= 2                                   # huge painted area: coarser snow, same cached rays
+    kk = k // stride
+    span = s / kk
+    verts, quads = {}, []
+    for c in sorted(cells):
+        i, j = c
+        cs = corners(c)
+        mc = [m.get(q, 0.0) for q in cs]
+        nc = [normal(q) for q in cs]
+        for a in range(kk + 1):
+            for b in range(kk + 1):
+                key = (i * k + a * stride, j * k + b * stride)
+                if key in verts:
+                    continue
+                z = surface.z(*key)
+                if z is None:
+                    verts[key] = None
+                    continue
+                u, v = a / float(kk), b / float(kk)
+                w4 = ((1 - u) * (1 - v), u * (1 - v), u * v, (1 - u) * v)
+                mm = sum(wt * x for wt, x in zip(w4, mc))
+                nrm = _normalize(tuple(sum(wt * n[t] for wt, n in zip(w4, nc)) for t in range(3)))
+                x, y = surface.xy(*key)
+                verts[key] = [x, y, z, mm, nrm, False]
+        for a in range(kk):
+            for b in range(kk):
+                q = ((i * k + a * stride, j * k + b * stride), (i * k + (a + 1) * stride, j * k + b * stride),
+                     (i * k + (a + 1) * stride, j * k + (b + 1) * stride), (i * k + a * stride, j * k + (b + 1) * stride))
+                vs = [verts.get(p) for p in q]
+                if any(v is None for v in vs) or _cliff([v[2] for v in vs], span, max_angle):
+                    for v in vs:
+                        if v is not None:
+                            v[5] = True                # surface edge or a drop: the snow tapers off here
+                    continue
+                if max(v[3] for v in vs) > eps:
+                    quads.append(q)
+    tri_keys = []
+    for q in quads:
+        z0, z1, z2, z3 = (verts[p][2] for p in q)
+        if abs(z0 - z2) <= abs(z1 - z3):
+            tri_keys += [(q[0], q[1], q[2]), (q[0], q[2], q[3])]
+        else:
+            tri_keys += [(q[0], q[1], q[3]), (q[1], q[2], q[3])]
     depth, pile = float(cfg["depth"]), max(0.0, min(1.0, float(cfg["pile_up"])))
     clumps, csize = max(0.0, float(cfg["clumps"])), max(1.0, float(cfg["clump_size"]))
-    sink, seed, off = float(cfg["edge_sink"]), int(cfg["seed"]), float(base_offset)
-    used = sorted({v for t in keep for v in t})
-    new_pos = {}
-    for i in used:
-        p, nrm, mi = pos[i], normals[i], m[i]
-        base = (p[0] - nrm[0] * off, p[1] - nrm[1] * off, p[2] - nrm[2] * off)
-        if mi > 0.0:
-            x, y, z = base[0] / csize, base[1] / csize, base[2] / csize
-            noise = 0.65 * value_noise(x, y, z, seed) + 0.35 * value_noise(x * 2.03, y * 2.03, z * 2.03, seed + 1)
-            thick = depth * (mi ** 0.7) * max(0.0, 1.0 + clumps * (2.0 * noise - 1.0))
-        else:
-            thick = 0.0
-        d = _normalize((nrm[0] * (1 - pile) + up[0] * pile, nrm[1] * (1 - pile) + up[1] * pile,
-                        nrm[2] * (1 - pile) + up[2] * pile), nrm)
-        dip = sink * (1.0 - _smoothstep(0.0, 0.3, mi))         # thin edges dip under the surface: no seam
-        new_pos[i] = (base[0] + d[0] * thick - nrm[0] * dip, base[1] + d[1] * thick - nrm[1] * dip,
-                      base[2] + d[2] * thick - nrm[2] * dip)
-    order = {v: k for k, v in enumerate(used)}
-    out_pos = [new_pos[v] for v in used]
-    out_tris = [(order[a], order[b], order[c]) for a, b, c in keep]
-    out_n = vertex_normals(out_pos, out_tris)
-    s = float(cfg["uv_scale"]) or 1.0
-    return {"positions": out_pos, "normals": out_n,
-            "uvs": [(p[0] / s, p[1] / s) for p in out_pos],
-            "colors": [(m[v], 0.0, 0.0, 1.0) for v in used],
-            "triangles": out_tris, "painted": sum(1 for v in w if v > 0.0)}
+    sink, seed = float(cfg["edge_sink"]), int(cfg["seed"])
+    order, out_pos, out_col = {}, [], []
+    for t in tri_keys:
+        for key in t:
+            if key in order:
+                continue
+            x, y, z, mm, nrm, edge = verts[key]
+            mm = 0.0 if edge else mm
+            if mm > 0.0:
+                px, py, pz = x / csize, y / csize, z / csize
+                noise = 0.65 * value_noise(px, py, pz, seed) + 0.35 * value_noise(px * 2.03, py * 2.03, pz * 2.03, seed + 1)
+                thick = depth * (mm ** 0.7) * max(0.0, 1.0 + clumps * (2.0 * noise - 1.0))
+            else:
+                thick = 0.0
+            d = _normalize((nrm[0] * (1 - pile) + up[0] * pile, nrm[1] * (1 - pile) + up[1] * pile,
+                            nrm[2] * (1 - pile) + up[2] * pile), nrm)
+            dip = sink * (1.0 - _smoothstep(0.0, 0.3, mm))       # thin edges dip under the surface: no seam
+            order[key] = len(out_pos)
+            out_pos.append((x + d[0] * thick - nrm[0] * dip, y + d[1] * thick - nrm[1] * dip,
+                            z + d[2] * thick - nrm[2] * dip))
+            out_col.append((mm, 0.0, 0.0, 1.0))
+    out_tris = [(order[a], order[b], order[c]) for a, b, c in tri_keys]
+    us = float(cfg["uv_scale"]) or 1.0
+    return {"positions": out_pos, "normals": vertex_normals(out_pos, out_tris),
+            "uvs": [(p[0] / us, p[1] / us) for p in out_pos], "colors": out_col, "triangles": out_tris,
+            "painted": len(painted), "stride": stride}
 
 
 def bounds_center(positions):
@@ -506,6 +586,7 @@ def _set_tags(actor, tags):
 
 
 TAG_CANVAS, TAG_SNOW, TAG_TARGET = "SnowPainterCanvas", "SnowPainterSnow", "SnowPainterTarget:"
+TAG_GRID = "SnowPainterGrid:"           # x0;y0;step;k of the canvas grid, so a session can be resumed
 
 
 def _is_ours(actor):
@@ -558,6 +639,49 @@ def mesh_geometry(mesh):
         if a >= 0 and b >= 0 and c >= 0:
             tris.append((a, b, c))
     return positions, tris
+
+
+def mesh_bounds(mesh):
+    """((xmin, ymin, zmin), (xmax, ymax, zmax)) of a DynamicMesh."""
+    q = _gs("GeometryScript_MeshQueries")
+    box = next((x for x in _outs(q.get_mesh_bounding_box(mesh)) if hasattr(x, "min") or hasattr(x, "get_editor_property")),
+               None)
+    lo = _call_first(lambda: box.get_editor_property("min"), lambda: box.min)
+    hi = _call_first(lambda: box.get_editor_property("max"), lambda: box.max)
+    return (lo.x, lo.y, lo.z), (hi.x, hi.y, hi.z)
+
+
+def make_raycaster(mesh, z_top, length):
+    """raycast(x, y) -> z of the topmost surface of `mesh` below (x, y, z_top), or None (Geometry Script BVH)."""
+    sp = _gs("GeometryScript_MeshSpatial")
+    bvh = _find(sp.build_bvh_for_mesh(mesh), "GeometryScriptDynamicMeshBVH")
+    if bvh is None:
+        raise RuntimeError("Could not build the ray-query structure (Geometry Script BVH)")
+    opts = unreal.GeometryScriptSpatialQueryOptions()
+    try:
+        opts.set_editor_property("max_distance", float(length))
+    except Exception:
+        pass
+    down = unreal.Vector(0.0, 0.0, -1.0)
+    pins = getattr(unreal, "GeometryScriptSearchOutcomePins", None)
+    found = getattr(pins, "FOUND", None) if pins is not None else None
+
+    def raycast(x, y):
+        res = sp.find_nearest_ray_intersection_with_mesh(mesh, bvh, unreal.Vector(x, y, z_top), down, opts)
+        hit = _find(res, "GeometryScriptRayHitResult")
+        if hit is None:
+            return None
+        oc = _find(res, "GeometryScriptSearchOutcomePins")
+        if oc is not None and found is not None:
+            if oc != found:
+                return None
+        else:
+            flag = _call_first(lambda: hit.get_editor_property("hit"), lambda: hit.get_editor_property("b_hit"))
+            if not flag:
+                return None
+        return hit.get_editor_property("hit_position").z
+
+    return raycast
 
 
 def mesh_colors(mesh):
@@ -621,9 +745,9 @@ def _canvas_material():
         mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
         vc = mel.create_material_expression(mat, unreal.MaterialExpressionVertexColor, -600, 0)
         mul = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -400, 0)
-        mul.set_editor_property("const_b", 0.45)
+        mul.set_editor_property("const_b", 0.5)
         add = mel.create_material_expression(mat, unreal.MaterialExpressionAdd, -250, 0)
-        add.set_editor_property("const_b", 0.04)         # a faint tint shows where you can paint
+        add.set_editor_property("const_b", 0.03)         # a faint tint shows where you can paint
         col = mel.create_material_expression(mat, unreal.MaterialExpressionConstant3Vector, -400, -200)
         col.set_editor_property("constant", unreal.LinearColor(0.35, 0.75, 1.0, 1.0))
         mel.connect_material_expressions(vc, "R", mul, "A")
@@ -701,9 +825,20 @@ def _new_static_mesh(mesh, sub, base_name, nanite=False, collision=False):
     return sm
 
 
-def _set_mesh_material(sm, mat):
-    _call_first(lambda: sm.set_material(0, mat),
-                lambda: sm.set_editor_property("static_materials", [unreal.StaticMaterial(material_interface=mat)]))
+def _set_mesh_material(sm, mat, actor=None):
+    """Material on the asset (adding a slot when Geometry Script created none) and on the placed actor."""
+    try:
+        slots = sm.get_editor_property("static_materials")
+    except Exception:
+        slots = None
+    if slots is not None and len(slots) == 0:
+        _call_first(lambda: sm.set_editor_property("static_materials", [
+            unreal.StaticMaterial(material_interface=mat, material_slot_name="Snow")]), lambda: None)
+    else:
+        _call_first(lambda: sm.set_material(0, mat), lambda: None)
+    comp = _mesh_component(actor) if actor is not None else None
+    if comp is not None:
+        _call_first(lambda: comp.set_material(0, mat), lambda: None)
 
 
 def _delete_asset(obj):
@@ -730,12 +865,17 @@ class Target(object):
         self.canvas_mesh = None     # its StaticMesh asset
         self.snow = None            # DynamicMeshActor with the live snow
         self.center = (0.0, 0.0, 0.0)
-        self.geo = None             # (key, positions, triangles) of the canvas render data, world space
-        self.weights = []
+        self.grid = None            # (x0, y0, step, k) of the canvas grid
+        self.nx = self.ny = None    # its size (known when this session laid it out)
+        self.surface = None         # Surface: ray casts onto the target (built lazily after a resume)
+        self.mesh = None            # the target's full-detail DynamicMesh (kept alive for its BVH)
+        self.points = set()         # canvas points (i, j)
+        self.map = None             # canvas render vertex -> (i, j)
+        self.map_key = None
+        self.paint = {}             # (i, j) -> painted value
         self.sample = None          # cheap paint signature (every Nth vertex)
         self.changed_at = None
         self.stats = {}
-        self.cache = {}             # topology of the canvas surface for build_snow
 
 
 _S = {"targets": [], "tick": None, "next_poll": 0.0, "live": True, "listeners": [], "busy": False}
@@ -755,25 +895,50 @@ def active():
 
 
 def _snow_data(t):
-    if t.geo is None:
-        return build_snow([], [], [])
-    _key, pos, tris = t.geo
-    return build_snow(pos, tris, t.weights, CONFIG, base_offset=CONFIG["canvas_offset"], cache=t.cache)
+    if not t.paint:
+        return build_snow_grid(None, set(), {})
+    _ensure_surface(t)
+    return build_snow_grid(t.surface, t.points, t.paint, CONFIG)
 
 
-def _make_canvas(t):
+def _ensure_surface(t, plan=False):
+    """Ray casts onto the target's full-detail mesh (world space). plan=True also lays out a new canvas grid."""
+    if t.surface is not None and not plan:
+        return t.surface
     comp = _mesh_component(t.actor)
     if comp is None:
         raise RuntimeError("%s has no Static Mesh component" % t.label)
     mesh = read_component(comp)
-    if mesh.get_triangle_count() > CONFIG["canvas_source_max_tris"]:
-        simp = _gs("GeometryScript_MeshSimplification")
-        simp.apply_simplify_to_triangle_count(mesh, int(CONFIG["canvas_source_max_tris"]),
-                                              unreal.GeometryScriptSimplifyMeshOptions())
-    positions, tris = mesh_geometry(mesh)
-    cpos, ctris, info = make_canvas(positions, tris)
+    n = mesh.get_triangle_count()
+    if n <= 0:
+        raise RuntimeError("%s has no triangles" % t.label)
+    if n > CONFIG["surface_max_tris"]:
+        _gs("GeometryScript_MeshSimplification").apply_simplify_to_triangle_count(
+            mesh, int(CONFIG["surface_max_tris"]), unreal.GeometryScriptSimplifyMeshOptions())
+    lo, hi = mesh_bounds(mesh)
+    ray = make_raycaster(mesh, hi[2] + 100.0, (hi[2] - lo[2]) + 200.0)
+    if plan or t.grid is None:
+        x0, y0, step, k, nx, ny = plan_grid(lo[0], lo[1], hi[0], hi[1], CONFIG)
+        t.grid, t.nx, t.ny = (x0, y0, step, k), nx, ny
+    t.surface = Surface(ray, *t.grid)
+    t.mesh = mesh
+    return t.surface
+
+
+def _make_canvas(t):
+    surface = _ensure_surface(t, plan=t.surface is None)
+    with unreal.ScopedSlowTask(2 * t.nx + 2, "Snow Painter: draping the paint canvas over %s..." % t.label) as task:
+        task.make_dialog(True)
+
+        def progress(i, n):
+            if task.should_cancel():
+                raise RuntimeError("Cancelled.")
+            task.enter_progress_frame(1)
+
+        cpos, ctris, index = make_canvas_grid(surface, t.nx, t.ny, CONFIG, progress)
     if not ctris:
-        raise RuntimeError("%s has no faces flat enough to hold snow" % t.label)
+        raise RuntimeError("%s has no surface facing up (seen from above)" % t.label)
+    t.points = set(index)
     t.center = bounds_center(cpos)
     black = [(0.0, 0.0, 0.0, 1.0)] * len(cpos)      # Mesh Paint starts from these colors: unpainted
     canvas_dm = write_mesh(unreal.DynamicMesh(), {"positions": cpos, "normals": vertex_normals(cpos, ctris),
@@ -784,22 +949,24 @@ def _make_canvas(t):
         sm.set_editor_property("allow_cpu_access", True)     # the paint is read back from its render data
     except Exception:
         pass
-    _set_mesh_material(sm, _canvas_material())
     actor = _actor_sub().spawn_actor_from_object(sm, unreal.Vector(*t.center), unreal.Rotator(0.0, 0.0, 0.0))
     if actor is None:
         _delete_asset(sm)
         raise RuntimeError("Could not place the paint canvas for %s" % t.label)
+    _set_mesh_material(sm, _canvas_material(), actor)
     actor.set_actor_label("SnowCanvas_%s" % t.label)
-    _set_tags(actor, [TAG_CANVAS, TAG_TARGET + t.actor.get_path_name()])
+    x0, y0, step, k = t.grid
+    _set_tags(actor, [TAG_CANVAS, TAG_TARGET + t.actor.get_path_name(),
+                      TAG_GRID + "%.4f;%.4f;%.4f;%d" % (x0, y0, step, k)])
     _call_first(lambda: actor.set_folder_path("SnowPainter"), lambda: None)
     _call_first(lambda: actor.set_actor_hidden_in_game(True), lambda: None)
     comp = _mesh_component(actor)
     if comp is not None:
         _call_first(lambda: comp.set_cast_shadow(False), lambda: None)
     t.canvas, t.canvas_mesh = actor, sm
-    t.geo, t.weights, t.sample = None, [], None
-    t.stats = {"canvas_triangles": info["triangles"], "canvas_detail": info["detail"],
-               "coarsened": not info["reached"] or info["detail"] > CONFIG["canvas_detail"] + 1e-6}
+    t.paint, t.map, t.map_key, t.sample = {}, None, None, None
+    t.stats = {"canvas_points": len(cpos), "canvas_detail": step, "snow_detail": surface.fine,
+               "coarsened": step > CONFIG["canvas_detail"] + 1e-6}
 
 
 def _make_snow_actor(t):
@@ -854,9 +1021,10 @@ def start(actors=None):
     _S["targets"] = done
     _actor_sub().set_selected_level_actors([t.canvas for t in done])
     _start_tick()
-    coarse = [t.label for t in done if t.stats.get("coarsened")]
+    coarse = ["%s (%.0f cm)" % (t.label, t.stats["canvas_detail"]) for t in done if t.stats.get("coarsened")]
     _notify("Painting %d mesh(es). Mode dropdown (top left) > Mesh Paint > Colors > Paint, then paint with the "
-            "left mouse button in white (Shift = erase).%s" % (len(done), (" Canvas detail was coarsened to stay fast on: %s."
+            "left mouse button in white (Shift = erase).%s" % (len(done), (" Big mesh: paint grid coarsened on %s (the snow "
+                                                             "itself keeps its detail)."
                                                              % ", ".join(coarse)) if coarse else ""))
     return done
 
@@ -885,7 +1053,15 @@ def resume():
         target = next((a for a in actors if a.get_path_name() == tpath), None)
         if target is None or "canvas" not in e:
             continue
+        grid = next((x[len(TAG_GRID):] for x in _tags(e["canvas"]) if x.startswith(TAG_GRID)), None)
+        try:
+            vals = grid.split(";")
+            grid = (float(vals[0]), float(vals[1]), float(vals[2]), int(vals[3]))
+        except Exception:
+            _warn("%s: canvas from an older version - Cancel it and Start painting again." % e["canvas"].get_name())
+            continue
         t = Target(target)
+        t.grid = grid
         t.canvas = e["canvas"]
         comp = _mesh_component(t.canvas)
         t.canvas_mesh = _call_first(lambda: comp.get_editor_property("static_mesh"), lambda: None) if comp else None
@@ -913,15 +1089,24 @@ def _read_paint(t, full=False):
     key = (len(colors), mesh.get_triangle_count(), round(loc.x, 2), round(loc.y, 2), round(loc.z, 2))
     step = max(1, int(CONFIG["poll_sample_step"]))
     sample = sum(colors[i].r for i in range(0, len(colors), step)) if colors else 0.0
-    if not full and t.geo is not None and t.geo[0] == key and t.sample is not None and abs(sample - t.sample) < 1e-6:
+    if not full and t.map_key == key and t.sample is not None and abs(sample - t.sample) < 1e-6:
         return False
-    if t.geo is None or t.geo[0] != key:
+    if t.map_key != key:
+        x0, y0, gstep, _k = t.grid
         pos, tris = mesh_geometry(mesh)
-        t.geo = (key, pos, tris)
-        t.stats.setdefault("canvas_triangles", len(tris))
-    weights = [c.r for c in colors]
-    changed = weights != t.weights
-    t.weights, t.sample = weights, sample
+        t.map = [(int(round((p[0] - x0) / gstep)), int(round((p[1] - y0) / gstep))) for p in pos]
+        used = {v for tri in tris for v in tri}
+        t.points = {t.map[v] for v in used}
+        t.map_key = key
+        t.stats.setdefault("canvas_points", len(t.points))
+        t.stats.setdefault("canvas_detail", gstep)
+    paint = {}
+    for idx, c in zip(t.map, colors):
+        r = c.r
+        if r > paint.get(idx, 0.0):
+            paint[idx] = r
+    changed = paint != t.paint
+    t.paint, t.sample = paint, sample
     return changed
 
 
@@ -1057,6 +1242,8 @@ def clear_paint():
         return 0
     for t in _S["targets"]:
         _drop(t, keep_snow=True)
+        if t.nx is None:
+            t.surface = None                  # resumed session: re-plan the grid
         _make_canvas(t)
         _rebuild(t)
     _actor_sub().set_selected_level_actors([t.canvas for t in _S["targets"]])
@@ -1083,6 +1270,7 @@ def bake(nanite=None):
         _set_mesh_material(sm, mat)
         actor = _actor_sub().spawn_actor_from_object(sm, unreal.Vector(*t.center), unreal.Rotator(0.0, 0.0, 0.0))
         if actor is not None:
+            _set_mesh_material(sm, mat, actor)
             actor.set_actor_label("Snow_%s" % t.label)
             _call_first(lambda: actor.set_folder_path("SnowPainter"), lambda: None)
             out.append(actor)
@@ -1108,7 +1296,7 @@ def cancel():
 
 
 def stats():
-    return [dict(t.stats, label=t.label, painted=sum(1 for w in t.weights if w >= CONFIG["paint_threshold"]))
+    return [dict(t.stats, label=t.label, painted=sum(1 for w in t.paint.values() if w >= CONFIG["paint_threshold"]))
             for t in _S["targets"]]
 
 
@@ -1378,16 +1566,24 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             mrow.addWidget(use)
             c3.addLayout(mrow)
             drow = QtWidgets.QHBoxLayout()
-            dl = QtWidgets.QLabel("Canvas detail (cm)")
-            dl.setToolTip("Paint precision: the longest canvas edge. Applies to the next Start / Clear paint.")
+            dl = QtWidgets.QLabel("Paint grid / snow detail (cm)")
+            dl.setToolTip("Paint grid: precision of the paint (coarsened automatically on big meshes).\n"
+                          "Snow detail: spacing of the snow vertices where you painted.\nBoth apply to the next "
+                          "Start painting.")
             self.spin_detail = QtWidgets.QDoubleSpinBox()
             self.spin_detail.setRange(2.0, 100.0)
             self.spin_detail.setSingleStep(1.0)
             self.spin_detail.setValue(float(CONFIG["canvas_detail"]))
             self.spin_detail.valueChanged.connect(lambda v: CONFIG.__setitem__("canvas_detail", float(v)))
+            self.spin_snow = QtWidgets.QDoubleSpinBox()
+            self.spin_snow.setRange(1.0, 50.0)
+            self.spin_snow.setSingleStep(1.0)
+            self.spin_snow.setValue(float(CONFIG["snow_detail"]))
+            self.spin_snow.valueChanged.connect(lambda v: CONFIG.__setitem__("snow_detail", float(v)))
             drow.addWidget(dl)
             drow.addStretch(1)
             drow.addWidget(self.spin_detail)
+            drow.addWidget(self.spin_snow)
             c3.addLayout(drow)
 
             c4 = self._card(bl, "STEP 4", "Finish")
@@ -1458,9 +1654,11 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
                 lines = []
                 for s in stats():
                     parts = []
-                    if s.get("canvas_triangles"):
-                        parts.append("canvas %s triangles%s" % ("{:,}".format(s["canvas_triangles"]), (
-                            " (%.1f cm detail)" % s["canvas_detail"]) if s.get("canvas_detail") else ""))
+                    if s.get("canvas_points"):
+                        parts.append("paint grid %s points every %.0f cm" % (
+                            "{:,}".format(s["canvas_points"]), s.get("canvas_detail", 0.0)))
+                    if s.get("snow_detail"):
+                        parts.append("snow detail %.1f cm" % s["snow_detail"])
                     if s.get("snow_triangles"):
                         parts.append("snow %s triangles" % "{:,}".format(s["snow_triangles"]))
                     lines.append("%s%s" % (s["label"], (" \u2013 " + ", ".join(parts)) if parts else ""))

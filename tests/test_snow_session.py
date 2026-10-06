@@ -90,7 +90,12 @@ assert csm.materials[0].get_name() == "M_SnowPainter_Canvas" and csm.materials[0
 assert all(c == (0.0, 0.0, 0.0, 1.0) for c in csm.colors), "the canvas starts unpainted (black)"
 world_z = {round(p[2] + canvas.loc.z, 3) for p in csm.geo[0]}
 assert world_z == {50.0 + S.CONFIG["canvas_offset"]}, "only the top, floating just above it"
-assert max(math.dist(csm.geo[0][a], csm.geo[0][b]) for t in csm.geo[1] for a, b in ((t[0], t[1]), (t[1], t[2]))) <= 10.0 + 1e-6
+assert max(math.dist(csm.geo[0][a], csm.geo[0][b]) for t in csm.geo[1] for a, b in ((t[0], t[1]), (t[1], t[2]))) <= 10.0 * 1.4143
+xs = sorted({round(p[0] + canvas.loc.x, 4) for p in csm.geo[0]})
+assert all(abs((b - a) - 10.0) < 1e-6 for a, b in zip(xs, xs[1:])), "a regular 10 cm paint grid"
+assert min(xs) >= 1000 - 150 - 1e-6 and max(xs) <= 1000 + 150 + 1e-6, "draped over the rock, not elsewhere"
+assert canvas.get_component_by_class(U.StaticMeshComponent).override_materials[0].get_name() == "M_SnowPainter_Canvas"
+assert any(str(t).startswith(S.TAG_GRID) for t in canvas.get_editor_property("tags"))
 assert snow_tris(snow) == 0
 assert "Painting:" in win.lbl_targets.text() and not win.btn_start.isEnabled() and win.btn_bake.isEnabled()
 print("start: canvas %d tris" % len(csm.geo[1]))
@@ -207,7 +212,7 @@ assert not S.active() and "dropped" in win.lbl_status.text() and not actors_tagg
 kept = [a for a in U.EditorActorSubsystem.actors if isinstance(a, U.DynamicMeshActor)]
 assert len(kept) == 1 and not kept[0].destroyed, "the live snow is kept (untagged), nothing is lost"
 sub.destroy_actor(kept[0])
-S.CONFIG["canvas_source_max_tris"] = 4
+S.CONFIG["surface_max_tris"] = 4
 U.EditorActorSubsystem.selected = [rock]
 win.on_start()
 assert U.GeometryScript_MeshSimplification.calls == [4]
@@ -218,7 +223,7 @@ print("cancel / deleted canvas / simplify: OK")
 
 # --- regression: Unreal asserts (editor crash) when a Static Mesh is built without UVs --------------------------------
 U.EditorActorSubsystem.selected = [rock]
-S.CONFIG["canvas_source_max_tris"] = 150000
+S.CONFIG["surface_max_tris"] = 3000000
 win.on_start()
 c = actors_tagged(S.TAG_CANVAS)[0].get_component_by_class(U.StaticMeshComponent).get_editor_property("static_mesh")
 assert c.geo and S.CONFIG  # canvas built

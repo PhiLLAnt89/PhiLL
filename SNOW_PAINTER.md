@@ -5,12 +5,14 @@ A single-file Python tool for **Unreal Engine 5.6**: paint snow onto meshes with
 ## How it works
 Unreal's Python can't capture mouse drags in the level viewport, so the brush is Unreal's own **Mesh Paint** mode. The tool does everything around it:
 
-1. **Start painting:** for each selected Static Mesh actor, the tool builds an invisible *paint canvas*.
-   - The canvas is a copy of the faces that can hold snow, refined to an even 8 cm grid and floating 0.4 cm above the surface.
-   - Your meshes are never modified.
-   - Paint precision doesn't depend on how many vertices your mesh has, and Nanite meshes work too: their full-detail source is used, simplified first if it's very dense.
+1. **Start painting:** the tool drapes an invisible *paint canvas* over each selected Static Mesh actor.
+   - The canvas is a regular grid placed by casting rays straight down onto your mesh's full-detail surface. For Nanite meshes, that's the high-resolution source.
+   - It floats just above the surface, a bit more where the surface is bumpy between grid points, and it never bridges cliffs.
+   - It doesn't depend on how your mesh is triangulated. Your meshes are never modified.
 2. **Paint:** in Mesh Paint mode, paint the canvas with the left mouse button; Shift erases. Painted areas glow light blue.
-3. **Snow:** about half a second after you release the mouse, the snow is rebuilt from the paint into a Dynamic Mesh actor.
+3. **Snow:** about half a second after you release the mouse, the snow is rebuilt into a Dynamic Mesh actor.
+   - It's built on the real surface, with its own detail (5 cm by default) where you painted, so it stays fine even when a big mesh needs a coarser paint grid.
+   - It thins out to nothing at cliff lips and mesh edges.
    - The sliders reshape it instantly, without re-reading the paint.
 4. **Bake:** creates a Static Mesh asset in `/Game/SnowPainter/Baked` (Nanite optional, with collision) and an actor using it. The canvas and the preview are then removed.
 
@@ -55,7 +57,7 @@ sp.update()                       # rebuild now
 sp.bake(nanite=True)              # Static Mesh assets + actors, session ends
 sp.clear_paint(); sp.cancel()
 ```
-Defaults are in `CONFIG` at the top of the script, for example `canvas_detail`, `canvas_max_tris`, `poll_seconds`, `asset_folder` and `snow_material`.
+Defaults are in `CONFIG` at the top of the script, for example `canvas_detail`, `snow_detail`, `canvas_max_points`, `poll_seconds`, `asset_folder` and `snow_material`.
 
 ## What it writes
 - **Assets in `/Game/SnowPainter`:**
@@ -66,12 +68,17 @@ Defaults are in `CONFIG` at the top of the script, for example `canvas_detail`, 
 - Nothing is saved until you save.
 
 ## Limitations
-- **Faces that can hold snow:** the canvas covers faces up to 80° from vertical, so you can't paint walls or undersides. Snow wouldn't stay there anyway.
-- **Paint precision:** set by **Canvas detail**. Very large meshes are coarsened automatically to stay under 120k canvas triangles per mesh.
+- **Snow falls from above:** only what's visible from straight above can be painted, so not walls, undersides or the inside of overhangs.
+- **Paint precision:** the paint grid is 10 cm by default. On big meshes it's coarsened automatically to stay under 90k points, and the panel shows the spacing; the snow keeps its own detail.
+- **Start painting on a big mesh:** casts one or two rays per grid point (a few seconds on a large scan, with a progress bar).
 - **Speed:** the snow is built in Python, so a rebuild on a big canvas takes a few tenths of a second. It runs between strokes, never during one.
 - **Static Mesh actors only:** no skeletal meshes, and no instanced foliage or landscape.
 - **Testing:** the tests run the whole tool against a fake of the Unreal API, so do one pass in the editor first. The calls most likely to differ between engine versions are the Geometry Script copy options and the vertex color read-back. If one fails, the Output Log says which.
 
 ## Changes
+- **1.1.0:** the paint canvas is now a grid draped over the mesh by casting rays straight down onto its full-detail surface.
+  - **What was wrong:** 1.0 built the canvas from a simplified copy of the mesh. On big or dense scans it ended up mostly buried inside the mesh, leaving scattered fragments.
+  - **Snow:** now built on the real surface with its own detail, and it tapers off at cliff lips and mesh edges.
+  - **Canvas material:** set on the actor as well, so the canvas can't fall back to the default gray material.
 - **1.0.1:** fixed an editor crash on **Start painting** (`Assertion failed: NumUVs > 0`). The paint canvas mesh had no UV channel, which Unreal requires to build a Static Mesh. Every mesh the tool creates now gets top-down UVs, and asset creation is refused, with a message instead of a crash, if a mesh somehow has none.
 - **1.0.0:** first version.
