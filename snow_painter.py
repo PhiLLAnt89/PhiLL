@@ -875,6 +875,7 @@ class Target(object):
         self.paint = {}             # (i, j) -> painted value
         self.sample = None          # cheap paint signature (every Nth vertex)
         self.changed_at = None
+        self.diag = None            # what the last paint read found (see paint_report)
         self.stats = {}
 
 
@@ -1105,6 +1106,9 @@ def _read_paint(t, full=False):
         r = c.r
         if r > paint.get(idx, 0.0):
             paint[idx] = r
+    t.diag = {"colors": len(colors), "vertices": len(t.map or []), "points": len(t.points),
+              "painted": sum(1 for v in paint.values() if v >= CONFIG["paint_threshold"]),
+              "brightest": max(paint.values()) if paint else 0.0}
     changed = paint != t.paint
     t.paint, t.sample = paint, sample
     return changed
@@ -1152,11 +1156,31 @@ def refresh(force=False):
     return n
 
 
+def paint_report():
+    """What the last paint read found, per mesh (to tell 'not painted' from 'paint not readable')."""
+    out = []
+    for t in _S["targets"]:
+        d = getattr(t, "diag", None)
+        if d is None:
+            out.append("%s: paint not read yet" % t.label)
+        elif not d["colors"]:
+            out.append("%s: the canvas has no readable vertex colors (Mesh Paint may be painting a texture, or "
+                       "another mesh)" % t.label)
+        else:
+            out.append("%s: %d of %d canvas points painted (brightest red %.2f)%s" % (
+                t.label, d["painted"], d["points"], d["brightest"],
+                "" if d["painted"] else " - is Mesh Paint painting this canvas, in white, with Red ticked?"))
+    return out
+
+
 def update():
     """Rebuild the snow now from the current paint (and resume live updates if an error paused them)."""
     n = refresh(force=True)
     _S["live"] = True
-    _notify("Snow updated on %d mesh(es)." % n)
+    report = paint_report()
+    for line in report:
+        _log(line)
+    _notify("Snow updated. " + " | ".join(report) if report else "Snow updated on %d mesh(es)." % n)
     return n
 
 

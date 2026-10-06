@@ -147,6 +147,8 @@ clock.run_ticks(U, n=4, step=0.6)
 assert snow_tris(snow) == 0, "live update off"
 win.on_update()
 assert snow_tris(snow) > 0, "Update now still works"
+assert "canvas points painted" in win.lbl_status.text() and "brightest red 1.00" in win.lbl_status.text(), \
+    win.lbl_status.text()
 win.chk_live.setChecked(True)
 print("erase / live off / update now: OK")
 
