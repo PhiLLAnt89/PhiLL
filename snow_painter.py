@@ -53,7 +53,7 @@ try:
 except ImportError:          # the geometry core below also works outside Unreal (tests)
     unreal = None
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 TOOL_NAME = "Snow Painter"
 WINDOW_OBJECT_NAME = "SnowPainterWindow"
 
@@ -568,18 +568,26 @@ def mesh_colors(mesh):
     return _list_to_py(cl, "color")
 
 
+def planar_uvs(positions, scale=None):
+    """Top-down UVs (one tile per `scale` cm)."""
+    s = float(scale or CONFIG["uv_scale"]) or 1.0
+    return [(p[0] / s, p[1] / s) for p in positions]
+
+
 def write_mesh(mesh, data, center=(0.0, 0.0, 0.0)):
-    """Replace the contents of a DynamicMesh with `data` (see build_snow), shifted by -center."""
+    """Replace the contents of a DynamicMesh with `data` (see build_snow), shifted by -center.
+    Always writes a UV set: Unreal asserts (crashes the editor) when a Static Mesh is built without UVs."""
     _call_first(lambda: mesh.reset_mesh(), lambda: mesh.reset())
     if not data["triangles"]:
         return mesh
+    if not data.get("uvs") or len(data["uvs"]) != len(data["positions"]):
+        data = dict(data, uvs=planar_uvs(data["positions"]))
     cx, cy, cz = center
     buf = unreal.GeometryScriptSimpleMeshBuffers()
     buf.set_editor_property("vertices", [unreal.Vector(p[0] - cx, p[1] - cy, p[2] - cz) for p in data["positions"]])
     if data.get("normals"):
         buf.set_editor_property("normals", [unreal.Vector(*nv) for nv in data["normals"]])
-    if data.get("uvs"):
-        _set(buf, ("uv0", "u_v0"), [unreal.Vector2D(u, v) for u, v in data["uvs"]])
+    _set(buf, ("uv0", "u_v0"), [unreal.Vector2D(u, v) for u, v in data["uvs"]])
     if data.get("colors"):
         buf.set_editor_property("vertex_colors", [unreal.LinearColor(*c) for c in data["colors"]])
     _set(buf, ("triangles", "triangle_indices"), [unreal.IntVector(a, b, c) for a, b, c in data["triangles"]])
@@ -645,7 +653,32 @@ def snow_material():
 
 
 # --- static mesh assets ------------------------------------------------------------------------------
+def _uv_set_count(mesh):
+    q = getattr(unreal, "GeometryScript_MeshQueries", None)
+    try:
+        res = q.get_num_uv_sets(mesh)
+        return int(next(x for x in _outs(res) if isinstance(x, int) and not isinstance(x, bool)))
+    except Exception:
+        return None
+
+
+def _ensure_uvs(mesh):
+    """Never hand Unreal a mesh without UVs to build a Static Mesh from: that's an engine assertion (editor crash),
+    not an error the script could catch."""
+    n = _uv_set_count(mesh)
+    if n is None or n > 0:
+        return
+    try:
+        _gs("GeometryScript_UVs").set_num_uv_sets(mesh, 1)
+    except Exception:
+        pass
+    if not _uv_set_count(mesh):
+        raise RuntimeError("The generated mesh has no UV set - not creating the Static Mesh (Unreal would crash). "
+                           "Please report this with the Output Log.")
+
+
 def _new_static_mesh(mesh, sub, base_name, nanite=False, collision=False):
+    _ensure_uvs(mesh)
     newu = _gs("GeometryScript_NewAssetUtils", "GeometryScript_AssetUtils")
     res = newu.create_unique_new_asset_path_name(_asset_folder(sub), base_name,
                                                  unreal.GeometryScriptUniqueAssetNameOptions())
@@ -741,8 +774,13 @@ def _make_canvas(t):
     t.center = bounds_center(cpos)
     black = [(0.0, 0.0, 0.0, 1.0)] * len(cpos)      # Mesh Paint starts from these colors: unpainted
     canvas_dm = write_mesh(unreal.DynamicMesh(), {"positions": cpos, "normals": vertex_normals(cpos, ctris),
-                                                  "uvs": [], "colors": black, "triangles": ctris}, t.center)
+                                                  "uvs": planar_uvs(cpos), "colors": black, "triangles": ctris},
+                           t.center)
     sm = _new_static_mesh(canvas_dm, "Canvas", "SM_SnowCanvas_%s" % _safe_name(t.label))
+    try:
+        sm.set_editor_property("allow_cpu_access", True)     # the paint is read back from its render data
+    except Exception:
+        pass
     _set_mesh_material(sm, _canvas_material())
     actor = _actor_sub().spawn_actor_from_object(sm, unreal.Vector(*t.center), unreal.Rotator(0.0, 0.0, 0.0))
     if actor is None:

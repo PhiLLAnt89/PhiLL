@@ -1009,7 +1009,15 @@ class GeometryScript_SceneUtils(object):
         return (mesh, object(), GeometryScriptOutcomePins.SUCCESS)
 
 
+class EngineCrash(BaseException):
+    """An engine assertion: the editor would close. BaseException, so the tool can't swallow it."""
+
+
 class GeometryScript_MeshQueries(object):
+    @staticmethod
+    def get_num_uv_sets(mesh):
+        return 1 if (mesh.uvs and len(mesh.uvs) == len(mesh.positions)) else 0
+
     @staticmethod
     def get_all_vertex_positions(mesh, skip_gaps=False):
         return (GeometryScriptVectorList([Vector(*p) for p in mesh.positions]), False)
@@ -1059,6 +1067,8 @@ class GeometryScript_NewAssetUtils(object):
 
     @staticmethod
     def create_new_static_mesh_asset_from_mesh(mesh, path, opts):
+        if not mesh.uvs or len(mesh.uvs) != len(mesh.positions):
+            raise EngineCrash("Assertion failed: NumUVs > 0 [StaticMesh.cpp]")
         sm = StaticMesh(path.rsplit("/", 1)[1], path=path,
                         nanite_settings=MeshNaniteSettings(enabled=opts.enable_nanite))
         sm.geo = (list(mesh.positions), list(mesh.tris))
@@ -1091,3 +1101,11 @@ class EditorUtilityLibrary(object):
     selected_assets = []
     @staticmethod
     def get_selected_assets(): return list(EditorUtilityLibrary.selected_assets)
+
+
+class GeometryScript_UVs(object):
+    @staticmethod
+    def set_num_uv_sets(mesh, n):
+        if n > 0 and not mesh.uvs:
+            mesh.uvs = [(0.0, 0.0)] * len(mesh.positions)
+        return mesh

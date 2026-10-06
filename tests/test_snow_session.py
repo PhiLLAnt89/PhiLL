@@ -215,4 +215,27 @@ win.on_cancel()
 assert not S.active() and not actors_tagged(S.TAG_CANVAS) and not actors_tagged(S.TAG_SNOW)
 assert "cancelled" in win.lbl_status.text()
 print("cancel / deleted canvas / simplify: OK")
+
+# --- regression: Unreal asserts (editor crash) when a Static Mesh is built without UVs --------------------------------
+U.EditorActorSubsystem.selected = [rock]
+S.CONFIG["canvas_source_max_tris"] = 150000
+win.on_start()
+c = actors_tagged(S.TAG_CANVAS)[0].get_component_by_class(U.StaticMeshComponent).get_editor_property("static_mesh")
+assert c.geo and S.CONFIG  # canvas built
+win.on_cancel()
+bare = U.DynamicMesh()
+bare.positions, bare.tris = [(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)]
+real_uvs = U.GeometryScript_UVs.set_num_uv_sets
+U.GeometryScript_UVs.set_num_uv_sets = staticmethod(lambda m, n: m)      # can't add one either
+try:
+    S._new_static_mesh(bare, "Canvas", "SM_NoUVs")
+    raise AssertionError("must refuse")
+except RuntimeError as e:
+    assert "no UV set" in str(e)
+U.GeometryScript_UVs.set_num_uv_sets = real_uvs
+fixed = S._new_static_mesh(bare, "Canvas", "SM_NoUVs")                  # adds a UV set instead of crashing
+assert fixed is not None
+dm = S.write_mesh(U.DynamicMesh(), {"positions": bare.positions, "triangles": bare.tris})
+assert len(dm.uvs) == 3, "write_mesh always writes UVs"
+print("no-UV crash guard: OK")
 print("SNOW SESSION OK")

@@ -68,3 +68,7 @@ Defaults are in `CONFIG` at the top of the script, for example `canvas_detail`, 
 - **Speed:** the snow is built in Python, so a rebuild on a big canvas takes a few tenths of a second. It runs between strokes, never during one.
 - **Static Mesh actors only:** no skeletal meshes, and no instanced foliage or landscape.
 - **Testing:** the tests run the whole tool against a fake of the Unreal API, so do one pass in the editor first. The calls most likely to differ between engine versions are the Geometry Script copy options and the vertex color read-back. If one fails, the Output Log says which.
+
+## Changes
+- **1.0.1:** fixed an editor crash on **Start painting** (`Assertion failed: NumUVs > 0`). The paint canvas mesh had no UV channel, which Unreal requires to build a Static Mesh. Every mesh the tool creates now gets top-down UVs, and asset creation is refused, with a message instead of a crash, if a mesh somehow has none.
+- **1.0.0:** first version.
