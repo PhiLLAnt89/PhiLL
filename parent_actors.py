@@ -4,8 +4,11 @@ Parent Actors  -  Unreal Engine 5.6 editor tool (single Python script, Qt UI)
 ==============================================================================
 
 Attach actors (meshes, lights, blueprints... anything with a root component)
-under a parent actor: the same as dragging them onto it in the Outliner, for
-many actors at once, with the reasons shown when Unreal can't attach one.
+under a parent actor: like dragging them onto it in the Outliner, for many
+actors at once, with the reasons shown when Unreal can't attach one. (The
+Outliner's refusals are copied: BSP brushes, landscape, Child Actor Component
+actors, loops, other levels. Class-specific editor rules that Python can't see
+are not.)
 
 PANEL
 -----
@@ -35,6 +38,8 @@ Without Qt (PySide6) it runs in text mode (Output Log, Python):
    parent_actors.detach_selected()     # detach the selected actors (they keep their place)
    parent_actors.set_parent(); parent_actors.add_children(); parent_actors.attach_children()
 """
+
+_BEFORE_PASTE = dict(globals())      # pasted into the Output Log: what its shared namespace held before this script
 
 import importlib
 import os
@@ -105,7 +110,7 @@ def alive(a):
 
 def label(a):
     if not alive(a):
-        return "(deleted)"
+        return "(missing)"
     try:
         return str(a.get_actor_label())
     except Exception:
@@ -223,7 +228,7 @@ def sockets_of(a):
 def describe(a):
     """One line for the panel: label, class, mobility and current parent."""
     if not alive(a):
-        return "(deleted)"
+        return "(missing: deleted, or its level was unloaded)"
     try:
         cls = str(a.get_class().get_name())
     except Exception:
@@ -236,14 +241,52 @@ def describe(a):
     return text
 
 
-def check(child, parent, match_mobility=None, socket=""):
+def _cac_owner(a):
+    """The actor whose Child Actor Component spawned a (Unreal re-attaches such actors there), or None."""
+    try:
+        return a.get_parent_actor() if a.is_child_actor() else None
+    except Exception:
+        return None
+
+
+def _editor_refusal(child, parent):
+    """Cases the Outliner refuses (UEditorEngine::CanParentActors) that the attach call itself doesn't check."""
+    brush, volume = getattr(unreal, "Brush", None), getattr(unreal, "Volume", None)
+    if brush is not None:
+        for a, who in ((child, "it is"), (parent, "the parent is")):
+            if isinstance(a, brush) and not (volume is not None and isinstance(a, volume)):
+                return "%s a BSP brush: Unreal doesn't attach BSP brushes (the Outliner refuses it too)" % who
+    for name in ("LandscapeProxy", "LandscapeSplineActor", "LandscapeGizmoActor"):
+        cls = getattr(unreal, name, None)
+        if cls is not None and isinstance(child, cls):
+            return "landscape actors can't be attached to other actors"
+    owner = _cac_owner(child)
+    if owner is not None:
+        return ("it is spawned by a Child Actor Component of %s: Unreal puts it back there "
+                "(change it in that Blueprint)" % label(owner))
+    return ""
+
+
+def _attached_here(child, parent, socket):
+    """Is child already attached to the parent's attach component, at that socket?"""
+    r = root_of(child)
+    try:
+        ap = r.get_attach_parent()
+        here = ap is not None and same(ap, attach_point_of(parent))
+    except Exception:
+        here = same(parent_of(child), parent)
+    return here and _socket_of(child) == (socket or "")
+
+
+def check(child, parent, match_mobility=None, socket="", keep_world=True):
     """Can child be attached under parent? Returns (status, message, new_mobility):
-    status "ok", "skip" (nothing to do) or "error"; new_mobility is the mobility the child will get (or None)."""
+    status "ok", "skip" (nothing to do) or "error"; new_mobility is the mobility the child will get (or None).
+    An "ok" with the message "resnap" means: already attached, but it should snap onto the parent again."""
     match = CONFIG["match_mobility"] if match_mobility is None else match_mobility
     if not alive(child):
-        return "error", "it was deleted", None
+        return "error", "it no longer exists (deleted, or its level was unloaded)", None
     if not alive(parent):
-        return "error", "the parent was deleted", None
+        return "error", "the parent no longer exists (deleted, or its level was unloaded)", None
     if same(child, parent):
         return "skip", "it is the parent itself", None
     croot, proot = root_of(child), attach_point_of(parent)
@@ -251,13 +294,18 @@ def check(child, parent, match_mobility=None, socket=""):
         return "error", "it has no root component, so it can't be attached", None
     if proot is None:
         return "error", "the parent has no root component", None
+    why = _editor_refusal(child, parent)
+    if why:
+        return "error", why, None
     if is_under(parent, child):
         return "error", "the parent is attached under it (that would make a loop)", None
     lc, lp = _level_name(child), _level_name(parent)
     if lc and lp and lc != lp:
         return "error", "it is in a different level than the parent (%s vs %s)" % (_short(lc), _short(lp)), None
-    if same(parent_of(child), parent) and _socket_of(child) == (socket or ""):
-        return "skip", "already attached to it", None
+    if _attached_here(child, parent, socket):
+        if keep_world:
+            return "skip", "already attached to it", None
+        return "ok", "resnap", None          # Unreal ignores an attach to the same place, so detach + attach
     cm, pm = _mobility(croot), _mobility(proot)
     new_mob = None
     if cm is not None and pm is not None and _mobility_rank(cm) == 0 and _mobility_rank(pm) > 0:
@@ -285,6 +333,44 @@ def _unique(actors):
     return out
 
 
+def _below(comp):
+    """Every component attached under comp: the actor's own sub-components and other actors attached to it."""
+    try:
+        return [d for d in (comp.get_children_components(True) or []) if d is not None]
+    except Exception:
+        return []
+
+
+def _raise_mobility(child, root, mob):
+    """Give root (and everything attached under it that is less mobile) the mobility mob, recorded for undo.
+    Returns [(component, old mobility)]. Unreal itself spreads Movable down the hierarchy without recording it,
+    and doesn't spread Stationary at all (a Static component under a Stationary one would drop off on reload)."""
+    rank, saved = _mobility_rank(mob), []
+    for comp in [root] + _below(root):
+        m = _mobility(comp)
+        if m is None or _mobility_rank(m) >= rank:
+            continue
+        comp.modify()
+        try:
+            owner = comp.get_owner()
+            if owner is not None and not same(owner, child):
+                owner.modify()                 # another actor attached under the child: its package gets saved
+        except Exception:
+            pass
+        saved.append((comp, m))
+    for comp, _m in saved:
+        comp.set_mobility(mob)
+    return saved
+
+
+def _restore_mobility(saved):
+    for comp, m in reversed(saved):
+        try:
+            comp.set_mobility(m)
+        except Exception:
+            pass
+
+
 def attach(children, parent, keep_world=None, socket="", match_mobility=None):
     """Attach children under parent, in one undo step. Returns [(actor, status, message)], status "attached",
     "skip" or "error". keep_world False snaps them onto the parent (or socket)."""
@@ -292,13 +378,14 @@ def attach(children, parent, keep_world=None, socket="", match_mobility=None):
     socket = "" if socket in (None, "None", "(none)") else str(socket)
     results, todo = [], []
     for c in _unique(children):
-        status, msg, mob = check(c, parent, match_mobility, socket)
+        status, msg, mob = check(c, parent, match_mobility, socket, keep)
         if status == "ok":
-            todo.append((c, mob))
+            todo.append((c, mob, msg == "resnap"))
         else:
             results.append((c, status, msg))
     if todo:
         lr, rr, sr = _rules(keep)
+        D = unreal.DetachmentRule
         title = "Attach %d actor%s to %s" % (len(todo), "" if len(todo) == 1 else "s", label(parent))
         with unreal.ScopedEditorTransaction(title):
             for obj in (parent, attach_point_of(parent)):
@@ -306,9 +393,10 @@ def attach(children, parent, keep_world=None, socket="", match_mobility=None):
                     obj.modify()
                 except Exception:
                     pass
-            for c, mob in todo:
+            for c, mob, resnap in todo:
                 root = root_of(c)
                 was = parent_of(c)
+                saved = []
                 try:
                     c.modify()
                     root.modify()
@@ -316,15 +404,23 @@ def attach(children, parent, keep_world=None, socket="", match_mobility=None):
                         was.modify()
                     note = ""
                     if mob is not None:
-                        root.set_mobility(mob)
-                        note = " (made %s to match the parent)" % _mobility_name(mob)
+                        saved = _raise_mobility(c, root, mob)
+                        extra = len(saved) - 1
+                        note = " (made %s to match the parent%s)" % (_mobility_name(mob), (
+                            ", with %d component%s attached under it" % (extra, "" if extra == 1 else "s"))
+                            if extra > 0 else "")
+                    if resnap:
+                        c.detach_from_actor(D.KEEP_WORLD, D.KEEP_WORLD, D.KEEP_WORLD)
                     ok = c.attach_to_actor(parent, socket, lr, rr, sr, False)
                     if ok is False or not same(parent_of(c), parent):
+                        _restore_mobility(saved)
                         results.append((c, "error", "Unreal refused the attach (see the warnings above in the Output Log)"))
                     else:
-                        results.append((c, "attached", "under %s%s%s" % (
-                            label(parent), (" at socket %s" % socket) if socket else "", note)))
+                        results.append((c, "attached", "%s %s%s%s" % (
+                            "snapped onto" if resnap else "under", label(parent),
+                            (" at socket %s" % socket) if socket else "", note)))
                 except Exception as exc:
+                    _restore_mobility(saved)
                     results.append((c, "error", "attach failed: %s" % exc))
     for c, status, msg in results:
         line = "%s: %s" % (label(c), msg) if status != "attached" else "%s -> %s" % (label(c), msg)
@@ -337,9 +433,12 @@ def detach(actors):
     results, todo = [], []
     for a in _unique(actors):
         if not alive(a):
-            results.append((a, "error", "it was deleted"))
+            results.append((a, "error", "it no longer exists (deleted, or its level was unloaded)"))
         elif parent_of(a) is None:
             results.append((a, "skip", "not attached to anything"))
+        elif _cac_owner(a) is not None:
+            results.append((a, "error", "it is spawned by a Child Actor Component of %s: Unreal puts it back "
+                                        "there (change it in that Blueprint)" % label(_cac_owner(a))))
         else:
             todo.append(a)
     if todo:
@@ -549,6 +648,7 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             self.setWindowTitle("%s %s" % (TOOL_NAME, __version__))
             self.setStyleSheet(_STYLE)
             self.resize(470, 660)
+            self._row_keys = []
             root = QtWidgets.QWidget(self)
             root.setObjectName("ParentRoot")
             outer = QtWidgets.QVBoxLayout(self)
@@ -636,7 +736,9 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             grid.addWidget(self.cmb_mode, 0, 1)
             grid.addWidget(QtWidgets.QLabel("Socket"), 1, 0)
             self.cmb_socket = QtWidgets.QComboBox()
-            self.cmb_socket.setToolTip("Attach to a socket of the parent's mesh (static mesh sockets, bones...).")
+            self.cmb_socket.setToolTip("Sockets of the parent's root component: a Static Mesh Actor's sockets, a "
+                                       "Skeletal Mesh Actor's bones and sockets.\nSockets on other components of a "
+                                       "Blueprint aren't listed: Unreal attaches actors to the root.")
             grid.addWidget(self.cmb_socket, 1, 1)
             grid.setColumnStretch(1, 1)
             lay.addLayout(grid)
@@ -694,13 +796,13 @@ def _make_window_class(QtCore, QtGui, QtWidgets):
             i = self.cmb_socket.findText(keep)
             self.cmb_socket.setCurrentIndex(i if i >= 0 else 0)
             self.cmb_socket.blockSignals(False)
-            rows = [r.row() for r in self.list.selectedIndexes()]
+            keys = {self._row_keys[i.row()] for i in self.list.selectedIndexes() if i.row() < len(self._row_keys)}
             self.list.clear()
-            for c in STATE["children"]:
+            self._row_keys = [_key(c) for c in STATE["children"]]
+            for i, c in enumerate(STATE["children"]):
                 self.list.addItem(describe(c))
-            for r in rows:
-                if r < self.list.count():
-                    self.list.item(r).setSelected(True)
+                if self._row_keys[i] in keys:
+                    self.list.item(i).setSelected(True)
             has_p, has_c = alive(p), bool(STATE["children"])
             self.btn_select_parent.setEnabled(has_p)
             self.btn_clear_parent.setEnabled(p is not None)
@@ -864,16 +966,20 @@ def show(reuse=True):
             return None
     QtCore, QtGui, QtWidgets = qt
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    for w in app.topLevelWidgets():
-        if w.objectName() == WINDOW_OBJECT_NAME:
-            if reuse:
-                w.refresh()
-                w.show()
-                w.raise_()
-                w.activateWindow()
-                return w
-            w.close()
-            w.deleteLater()
+    keep = sys.__dict__.setdefault("_parent_actors_keep", {})
+    stored = keep.get("window")
+    found = [w for w in app.topLevelWidgets() if w.objectName() == WINDOW_OBJECT_NAME]
+    if reuse and found:
+        w = stored if any(w is stored for w in found) else found[0]
+        w.refresh()
+        w.show()
+        w.raise_()
+        w.activateWindow()
+        _start_qt_tick(QtWidgets)        # closing the panel stopped it
+        return w
+    for w in found:
+        w.close()
+        w.setObjectName("")              # never found again; freed with its last reference (no Qt event loop here)
     win = _make_window_class(QtCore, QtGui, QtWidgets)()
     win.show()
     try:
@@ -881,9 +987,27 @@ def show(reuse=True):
     except Exception:
         pass
     _start_qt_tick(QtWidgets)
-    keep = sys.__dict__.setdefault("_parent_actors_keep", {})
     keep["app"], keep["window"] = app, win
     return win
+
+
+def _move_to_module(console, before, module):
+    """Pasted code runs in the Output Log's namespace, which every pasted script shares. Rebind this script's
+    functions to the module's own namespace (another tool pasted later can't change what they call), then give the
+    console its previous names back (this script doesn't change what other pasted tools call), plus parent_actors."""
+    ns = module.__dict__
+    for k, v in list(ns.items()):
+        if isinstance(v, types.FunctionType) and v.__globals__ is console:
+            f = types.FunctionType(v.__code__, ns, v.__name__, v.__defaults__, v.__closure__)
+            f.__kwdefaults__, f.__doc__ = v.__kwdefaults__, v.__doc__
+            ns[k] = f
+    for k in list(console):
+        if k not in before:
+            del console[k]
+        elif console[k] is not before[k]:
+            console[k] = before[k]
+    console["parent_actors"] = module
+    return module
 
 
 if unreal is not None and not __name__.endswith("parent_actors"):
@@ -899,4 +1023,4 @@ if unreal is not None and not __name__.endswith("parent_actors"):
     _module.__dict__.update(globals())
     _module.__name__ = "parent_actors"
     sys.modules["parent_actors"] = _module
-    show(reuse=False)
+    _move_to_module(globals(), _BEFORE_PASTE, _module).show(reuse=False)

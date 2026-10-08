@@ -130,12 +130,75 @@ plate.destroyed = True
 P.set_parent(table)
 P.add_children([plate, cup])
 win.refresh()
-assert win.list.item(0).text() == "(deleted)"
+assert win.list.item(0).text().startswith("(missing")
 win.on_attach()
-assert cup.get_attach_parent_actor() is table and "1 not: (deleted) - it was deleted" in win.lbl_status.text(), \
+assert cup.get_attach_parent_actor() is table and "1 not: (missing) - it no longer exists" in win.lbl_status.text(), \
     win.lbl_status.text()
 plate.destroyed = False
+
+# what the Outliner refuses but the attach call alone wouldn't: BSP brushes, landscape, Child Actor Component actors
+reset()
+bsp = U.Brush("BSP_Box")
+bsp.add(U.SceneComponent("BrushComponent0", mobility=M.STATIC))
+vol = U.Volume("BlockingVolume")
+vol.add(U.SceneComponent("BrushComponent0", mobility=M.STATIC))
+land = U.LandscapeProxy("Landscape")
+land.add(U.SceneComponent("RootComponent", mobility=M.STATIC))
+spawned = mesh_actor("BP_Door_Child", 50.0)
+spawned._cac = cart
+spawned._attach = (cart, "")
+U.EditorActorSubsystem.actors += [bsp, vol, land, spawned]
+res = dict((r[0].get_actor_label(), r) for r in P.attach([bsp, vol, land, spawned], table))
+assert res["BSP_Box"][1] == "error" and "BSP brush" in res["BSP_Box"][2]
+assert res["BlockingVolume"][1] == "attached", "volumes are brushes the Outliner does attach"
+assert res["Landscape"][1] == "error" and "landscape" in res["Landscape"][2]
+assert res["BP_Door_Child"][1] == "error" and "Child Actor Component of Cart" in res["BP_Door_Child"][2]
+assert "BSP brush" in P.attach([cup], bsp)[0][2], "a BSP brush can't be the parent either"
+r = P.detach([spawned])[0]
+assert r[1] == "error" and spawned.get_attach_parent_actor() is cart, "detaching it would be undone by Unreal"
+for a in (bsp, vol, land, spawned):
+    U.EditorActorSubsystem.actors.remove(a)
 print("refusals: OK")
+
+# --- Match mobility covers what's attached under the child, for undo, and is rolled back if the attach fails ------
+reset()
+for a in (table, cup, plate):
+    a.comps[0].set_editor_property("mobility", M.STATIC)
+assert P.attach([cup, plate], table)[0][1] == "attached"           # cup and plate sit on the table (all Static)
+for a in (table, cup, plate):
+    a.modified = 0
+    a.comps[0].modified = 0
+res = P.attach([table], cart)
+assert res[0][1] == "attached" and "with 2 components attached under it" in res[0][2], res
+assert all(a.comps[0].get_editor_property("mobility") == M.MOVABLE for a in (table, cup, plate))
+assert cup.comps[0].modified and plate.comps[0].modified and cup.modified, "recorded: one Ctrl+Z puts them back"
+table._attach = None
+lamp.comps[0].set_editor_property("mobility", M.STATIONARY)       # Unreal doesn't spread Stationary by itself
+for a in (table, cup, plate):
+    a.comps[0].set_editor_property("mobility", M.STATIC)
+P.attach([table], lamp)
+assert all(a.comps[0].get_editor_property("mobility") == M.STATIONARY for a in (table, cup, plate))
+lamp.comps[0].set_editor_property("mobility", M.MOVABLE)
+table._attach = None
+for a in (table, cup, plate):
+    a.comps[0].set_editor_property("mobility", M.STATIC)
+real_attach = U.Actor.attach_to_actor
+U.Actor.attach_to_actor = lambda self, *a: False                   # Unreal refuses after all
+res = P.attach([table], cart)
+U.Actor.attach_to_actor = real_attach
+assert res[0][1] == "error" and all(a.comps[0].get_editor_property("mobility") == M.STATIC for a in (table, cup, plate))
+print("mobility under the child: OK")
+
+# --- Snap on children that are already attached: they snap now (Unreal ignores a same-place attach) ---------------
+reset()
+cup.loc.x = 100.0
+P.attach([cup], table)
+assert cup.loc.x == 100.0
+r = P.attach([cup], table, keep_world=False)[0]
+assert r[1] == "attached" and r[2].startswith("snapped onto Table") and cup.loc.x == 0.0 and cup._attach == (table, "")
+assert P.attach([cup], table, keep_world=True)[0][1] == "skip"
+cup.loc.x = 100.0
+print("re-snap: OK")
 
 # --- remove / clear / select ----------------------------------------------------------------------------------------
 reset()
@@ -155,6 +218,14 @@ win.on_clear_children()
 assert P.STATE["children"] == [] and not win.btn_attach.isEnabled()
 win.on_clear_parent()
 assert P.STATE["parent"] is None
+P.add_children([cup, plate, lamp])                     # the highlight follows the actor, not the row number
+win.refresh()
+win.list.item(1).setSelected(True)
+P.set_parent(cup)                                       # cup leaves the list: plate is now row 0
+win.refresh()
+assert [i.row() for i in win.list.selectedIndexes()] == [0] and P.STATE["children"] == [plate, lamp]
+win.on_remove()
+assert P.STATE["children"] == [lamp] and not win.list.selectedIndexes()
 print("list: OK")
 
 # --- quick: two selected, the first goes under the second (a movable parent: the static cup is matched) --------------
@@ -194,13 +265,40 @@ win.status("1 attached.")
 QtWidgets.QApplication.processEvents()
 win.grab().save(os.path.join(OUT, "parent_actors.png"))
 
-# --- pasted into the Output Log: becomes the module "parent_actors", keeps the panel's state -------------------------
+# --- closed and reopened: the Qt tick runs again (Linux/macOS need it) ------------------------------------------------
+win.close()
+assert P._TICK["handle"] is None
+again = P.show()
+assert again is win and P._TICK["handle"] is not None and win.isVisible()
+
+
+# --- pasted into the Output Log: becomes the module "parent_actors", keeps the panel's state; the console's shared
+# namespace (other pasted tools live there too) is left as it was ---------------------------------------------------
+def live_ticks():
+    return sum(1 for t in U.TICKS if t is not None)
+
+
 src = open(os.path.join(os.path.dirname(HERE), "parent_actors" + ".py"), encoding="utf-8").read()
-g = {"__name__": "__main__"}
-exec(compile(src, "<pasted>", "exec"), g)
-mod = sys.modules["parent_actors"]
-assert mod is not P and mod.STATE["parent"] is table and callable(mod.attach_selected)
-tops = [w for w in QtWidgets.QApplication.instance().topLevelWidgets()
-        if w.objectName() == P.WINDOW_OBJECT_NAME and w.isVisible()]
-assert len(tops) == 1, "the old panel was replaced"
+def other_tools_check(key, category, name): return "theirs"
+console = {"__name__": "__main__", "__doc__": None, "check": other_tools_check, "CONFIG": {"poll_seconds": 0.5},
+           "user_var": 7}
+before = dict(console)
+for n in range(3):
+    exec(compile(src, "<pasted>", "exec"), console)
+    mod = sys.modules["parent_actors"]
+    assert console["parent_actors"] is mod and mod is not P and mod.STATE["parent"] is table
+    assert set(console) == set(before) | {"parent_actors", "__builtins__"}, sorted(set(console) - set(before))
+    assert console["check"] is other_tools_check and console["CONFIG"] == {"poll_seconds": 0.5}
+assert mod.attach.__globals__ is mod.__dict__
+tops = [w for w in QtWidgets.QApplication.instance().topLevelWidgets() if w.objectName() == P.WINDOW_OBJECT_NAME]
+assert len(tops) == 1 and tops[0].isVisible(), "old panels were replaced, not left hidden"
+assert live_ticks() == 1, "re-pasting doesn't pile up per-frame callbacks: %d" % live_ticks()
+# another tool pasted later redefines names in the console: this one keeps working
+exec("def check(key, category, name): return None\nCONFIG = {}\ndef label(a): return 'wrong'", console)
+reset()
+mod.STATE["parent"], mod.STATE["children"] = None, []
+select(plate, table)
+res = mod.attach_selected()
+assert res and res[0][1] == "attached" and res[0][2] == "under Table", res
+assert mod.show() is tops[0]
 print("PARENT ACTORS OK")

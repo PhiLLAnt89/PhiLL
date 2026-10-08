@@ -227,8 +227,15 @@ class Actor(Object):
     def detach_from_actor(self, location_rule=None, rotation_rule=None, scale_rule=None):
         self._attach = None
 
+    _cac = None                 # the actor whose Child Actor Component spawned this one
+    def is_child_actor(self): return self._cac is not None
+    def get_parent_actor(self): return self._cac
+
 
 class Pawn(Actor): pass
+class Brush(Actor): pass
+class Volume(Brush): pass
+class LandscapeProxy(Actor): pass
 class CullDistanceVolume(Actor): pass
 
 
@@ -251,7 +258,27 @@ class ActorComponent(Object):
         o = self._owner
         return (o._attach[1] or "None") if (o is not None and o._attach and o.get_root_component() is self) else "None"
     def get_all_socket_names(self): return list(self.sockets)
-    def set_mobility(self, m): self.set_editor_property("mobility", m)
+
+    def get_children_components(self, include_all_descendants=True):
+        """Like the engine: the owner's other components (under its root) + roots of actors attached to it."""
+        o, out = self._owner, []
+        if o is None or o.get_root_component() is not self:
+            return out
+        out += o.comps[1:]
+        for a in EditorActorSubsystem.actors:
+            r = a.get_root_component() if a._attach and a._attach[0] is o else None
+            if r is not None:
+                out.append(r)
+                if include_all_descendants:
+                    out += r.get_children_components(True)
+        return out
+
+    def set_mobility(self, m):
+        self.set_editor_property("mobility", m)
+        if m == ComponentMobility.MOVABLE:              # the engine spreads Movable down, without Modify()
+            for c in self.get_children_components(False):
+                c.set_editor_property("mobility", m)
+                c.set_mobility(m)
 
 
 class SceneComponent(ActorComponent): pass

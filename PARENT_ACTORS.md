@@ -1,6 +1,6 @@
 # Parent Actors
 
-A single-file Python tool for **Unreal Engine 5.6**. It attaches actors (meshes, lights, Blueprints, anything with a root component) under a parent actor. The result is the same as dragging them onto the parent in the Outliner, but you can do many at once from a small panel. When Unreal can't attach an actor, the panel says why.
+A single-file Python tool for **Unreal Engine 5.6**. It attaches actors (meshes, lights, Blueprints, anything with a root component) under a parent actor. The result is the same as dragging them onto the parent in the Outliner, but you can do many at once from a small panel. When an actor can't be attached, the panel says why.
 
 ![Parent Actors](docs/parent_actors.png)
 
@@ -20,14 +20,28 @@ A single-file Python tool for **Unreal Engine 5.6**. It attaches actors (meshes,
    - Double-click a row to select that actor in the level.
    - **Remove** drops the highlighted rows; **Clear** empties the list.
 3. **Attach to parent:** attaches every listed actor. One **Ctrl+Z** undoes the whole attach.
-   - **Position:** *Keep where they are* (the default) leaves the children in place. *Snap onto the parent* moves them onto the parent's pivot, or onto the chosen socket, and keeps their scale.
-   - **Socket:** lists the sockets of the parent's mesh (static mesh sockets, bones). Leave it on *(no socket)* for a plain attach.
-   - **Match mobility:** Unreal can't attach a Static actor under a Movable or Stationary one. When this is ticked, such a child gets the parent's mobility. When it's unticked, the child is skipped and the panel says why.
+   - **Position:** *Keep where they are* (the default) leaves the children in place. *Snap onto the parent* moves them onto the parent's pivot, or onto the chosen socket, and keeps their scale. It also snaps children that are already attached.
+   - **Socket:** lists the sockets of the parent's root component: a Static Mesh Actor's sockets, or a Skeletal Mesh Actor's bones and sockets. Sockets on other components of a Blueprint aren't listed, because Unreal attaches actors to the root. Leave it on *(no socket)* for a plain attach.
+   - **Match mobility:** Unreal can't attach a Static actor under a Movable or Stationary one.
+     - When this is ticked, such a child gets the parent's mobility, and so does everything already attached under the child. The status says how many components that was.
+     - Ctrl+Z puts all of them back. If Unreal still refuses the attach, their mobility is restored right away.
+     - When it's unticked, the child is skipped and the panel says why.
+     - A Movable or Stationary mesh no longer uses baked static lighting.
 4. **Detach children:** detaches the listed actors from whatever they're attached to. They keep their place in the world.
 
 **Quick:** for one-off parenting, select the children, Ctrl+click the parent **last**, and click **Attach selection under the last selected**. With two actors selected, the first goes under the second. **Detach selection** detaches the selected actors.
 
-The status line and the Output Log say what was attached and what was skipped, and why: the actor was deleted, it's already attached there, it would make a loop, it's in a different level, or it has no root component.
+The status line and the Output Log say what was attached and what was skipped, and why. These are the Outliner's own refusals:
+- the actor no longer exists (deleted, or its level was unloaded);
+- it's already attached there;
+- it would make a loop;
+- it's in a different level;
+- it has no root component;
+- it's a BSP brush (volumes are fine);
+- it's a landscape actor;
+- it was spawned by a Blueprint's Child Actor Component, which would put it back.
+
+Class-specific editor rules that Python can't see aren't applied.
 
 ## Python functions
 ```python
