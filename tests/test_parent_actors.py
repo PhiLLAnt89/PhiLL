@@ -198,7 +198,58 @@ r = P.attach([cup], table, keep_world=False)[0]
 assert r[1] == "attached" and r[2].startswith("snapped onto Table") and cup.loc.x == 0.0 and cup._attach == (table, "")
 assert P.attach([cup], table, keep_world=True)[0][1] == "skip"
 cup.loc.x = 100.0
+# already attached, but now Static under a Stationary parent: Match mobility still applies, and it stays attached
+table.comps[0].set_editor_property("mobility", M.STATIONARY)
+cup.comps[0].set_editor_property("mobility", M.STATIC)
+r = P.attach([cup], table, keep_world=False, match_mobility=False)[0]
+assert r[1] == "error" and "Match mobility" in r[2] and cup.get_attach_parent_actor() is table and cup.loc.x == 100.0
+r = P.attach([cup], table, keep_world=False, match_mobility=True)[0]
+assert r[1] == "attached" and cup.comps[0].get_editor_property("mobility") == M.STATIONARY and cup.loc.x == 0.0
+table.comps[0].set_editor_property("mobility", M.STATIC)
+cup.comps[0].set_editor_property("mobility", M.STATIC)
+# without the relative-transform call: detach + attach; if Unreal refuses, the child goes back where it was
+cup.loc.x = 100.0
+saved_call = U.ActorComponent.set_relative_location_and_rotation
+del U.ActorComponent.set_relative_location_and_rotation
+r = P.attach([cup], table, keep_world=False)[0]
+assert r[1] == "attached" and cup.loc.x == 0.0 and cup.get_attach_parent_actor() is table
+cup.loc.x = 100.0
+real_attach = U.Actor.attach_to_actor
+U.Actor.attach_to_actor = lambda self, p, s, lr, *a: False if lr == U.AttachmentRule.SNAP_TO_TARGET else \
+    real_attach(self, p, s, lr, *a)
+r = P.attach([cup], table, keep_world=False)[0]
+U.Actor.attach_to_actor = real_attach
+U.ActorComponent.set_relative_location_and_rotation = saved_call
+assert r[1] == "error" and cup.get_attach_parent_actor() is table and cup.loc.x == 100.0, "left where it was"
 print("re-snap: OK")
+
+# --- a camera-like parent: Unreal attaches to its CameraComponent, not the root (Python can't see which) ----------
+reset()
+cam = U.CameraActor("CineCam", loc=U.Vector(500.0, 0.0, 0.0))
+cam.add(U.SceneComponent("SceneComponent", mobility=M.MOVABLE))
+cam.add(U.SceneComponent("CameraComponent", mobility=M.MOVABLE))
+U.EditorActorSubsystem.actors.append(cam)
+assert P.attach([plate], cam)[0][1] == "attached" and plate.get_attach_parent_actor() is cam
+assert P.attach([plate], cam)[0][2] == "already attached to it"
+r = P.attach([plate], cam, keep_world=False)[0]
+assert r[2].startswith("snapped onto CineCam") and plate.loc.x == 500.0
+U.EditorActorSubsystem.actors.remove(cam)
+plate.loc.x = 200.0
+plate.comps[0].set_editor_property("mobility", M.STATIC)
+print("camera parent: OK")
+
+# --- only what really changes is marked as changed (One File Per Actor: no needless re-saves of the parents) ------
+reset()
+cup._attach = (cart, "")
+cup.comps[0].set_editor_property("mobility", M.MOVABLE)
+for a in (table, cart, cup):
+    a.dirtied = 0
+    a.comps[0].dirtied = 0
+P.attach([cup], table)
+assert cup.get_attach_parent_actor() is table and cup.dirtied and cup.comps[0].dirtied
+assert table.dirtied == table.comps[0].dirtied == cart.dirtied == 0, "the new and old parents aren't re-saved"
+cup.comps[0].set_editor_property("mobility", M.STATIC)
+print("dirty packages: OK")
 
 # --- remove / clear / select ----------------------------------------------------------------------------------------
 reset()
@@ -301,4 +352,12 @@ select(plate, table)
 res = mod.attach_selected()
 assert res and res[0][1] == "attached" and res[0][2] == "under Table", res
 assert mod.show() is tops[0]
+
+# --- a renamed copy imported from Content/Python keeps its own names ------------------------------------------------
+import shutil, tempfile  # noqa: E401,E402
+tmp = tempfile.mkdtemp()
+shutil.copy(os.path.join(os.path.dirname(HERE), "parent_actors" + ".py"), os.path.join(tmp, "parent_actors_v2" + ".py"))
+sys.path.insert(0, tmp)
+import parent_actors_v2 as R  # noqa: E402
+assert callable(R.show) and callable(R.attach_selected) and R.STATE is sys.modules["parent_actors"].STATE
 print("PARENT ACTORS OK")

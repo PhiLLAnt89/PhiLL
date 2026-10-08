@@ -129,7 +129,10 @@ class Object(object):
             return self._outer.get_path_name() + ":" + self._name
         return (self._path or ("/Game/Mock/" + self._name)) + "." + self._name
 
-    def modify(self, always_mark_dirty=True): self.modified += 1
+    dirtied = 0
+    def modify(self, always_mark_dirty=True):
+        self.modified += 1
+        self.dirtied += 1 if always_mark_dirty else 0
 
     def get_typed_outer(self, cls):
         o = self._outer
@@ -200,11 +203,11 @@ class Actor(Object):
 
     def get_root_component(self): return self.comps[0] if self.comps else None
     root_component = property(get_root_component)
-    def get_default_attach_component(self): return self.get_root_component()
+    def _default_attach_component(self): return self.get_root_component()   # not exposed to Python in UE
     def get_attach_parent_actor(self): return self._attach[0] if self._attach else None
 
     def attach_to_actor(self, parent, socket_name, location_rule, rotation_rule, scale_rule, weld_simulated_bodies):
-        mine, theirs = self.get_root_component(), parent.get_default_attach_component()
+        mine, theirs = self.get_root_component(), parent._default_attach_component()
         if mine is None or theirs is None:
             return False
         if (mine.get_editor_property("mobility") == ComponentMobility.STATIC
@@ -233,6 +236,13 @@ class Actor(Object):
 
 
 class Pawn(Actor): pass
+
+
+class CameraActor(Actor):
+    """Like the engine: root is a SceneComponent, children attach to the CameraComponent (comps[1])."""
+    def _default_attach_component(self): return self.comps[1] if len(self.comps) > 1 else self.get_root_component()
+
+
 class Brush(Actor): pass
 class Volume(Brush): pass
 class LandscapeProxy(Actor): pass
@@ -252,12 +262,19 @@ class ActorComponent(Object):
     def get_attach_parent(self):
         o = self._owner
         if o is not None and o._attach and o.get_root_component() is self:
-            return o._attach[0].get_default_attach_component()
+            return o._attach[0]._default_attach_component()
         return None
     def get_attach_socket_name(self):
         o = self._owner
         return (o._attach[1] or "None") if (o is not None and o._attach and o.get_root_component() is self) else "None"
     def get_all_socket_names(self): return list(self.sockets)
+
+    def set_relative_location_and_rotation(self, new_location, new_rotation, sweep, teleport):
+        o = self._owner
+        if o is not None and o._attach and o.get_root_component() is self:
+            p = o._attach[0].loc
+            o.loc = Vector(p.x + new_location.x, p.y + new_location.y, p.z + new_location.z)
+        return None
 
     def get_children_components(self, include_all_descendants=True):
         """Like the engine: the owner's other components (under its root) + roots of actors attached to it."""

@@ -145,13 +145,8 @@ def root_of(a):
 
 
 def attach_point_of(parent):
-    """The component children get attached to: the parent's default attach component (usually its root)."""
-    try:
-        c = parent.get_default_attach_component()
-        if c is not None:
-            return c
-    except Exception:
-        pass
+    """The parent component the checks look at: its root. (Unreal attaches to the actor's default attach component,
+    which is the root except for a few classes such as cameras; Python can't read it.)"""
     return root_of(parent)
 
 
@@ -268,14 +263,8 @@ def _editor_refusal(child, parent):
 
 
 def _attached_here(child, parent, socket):
-    """Is child already attached to the parent's attach component, at that socket?"""
-    r = root_of(child)
-    try:
-        ap = r.get_attach_parent()
-        here = ap is not None and same(ap, attach_point_of(parent))
-    except Exception:
-        here = same(parent_of(child), parent)
-    return here and _socket_of(child) == (socket or "")
+    """Is child already attached under parent, at that socket?"""
+    return same(parent_of(child), parent) and _socket_of(child) == (socket or "")
 
 
 def check(child, parent, match_mobility=None, socket="", keep_world=True):
@@ -302,10 +291,9 @@ def check(child, parent, match_mobility=None, socket="", keep_world=True):
     lc, lp = _level_name(child), _level_name(parent)
     if lc and lp and lc != lp:
         return "error", "it is in a different level than the parent (%s vs %s)" % (_short(lc), _short(lp)), None
-    if _attached_here(child, parent, socket):
-        if keep_world:
-            return "skip", "already attached to it", None
-        return "ok", "resnap", None          # Unreal ignores an attach to the same place, so detach + attach
+    here = _attached_here(child, parent, socket)
+    if here and keep_world:
+        return "skip", "already attached to it", None
     cm, pm = _mobility(croot), _mobility(proot)
     new_mob = None
     if cm is not None and pm is not None and _mobility_rank(cm) == 0 and _mobility_rank(pm) > 0:
@@ -314,7 +302,8 @@ def check(child, parent, match_mobility=None, socket="", keep_world=True):
             return "error", "it is %s but the parent is %s: Unreal won't attach it (tick Match mobility)" % (
                 _mobility_name(cm), _mobility_name(pm)), None
         new_mob = pm
-    return "ok", "", new_mob
+    # already attached + Snap: Unreal ignores an attach to the same place, so the child is snapped in place
+    return "ok", ("resnap" if here else ""), new_mob
 
 
 def _rules(keep_world):
@@ -371,6 +360,23 @@ def _restore_mobility(saved):
             pass
 
 
+def _snap_in_place(child, root, parent, socket, D, lr, rr, sr):
+    """Snap an already attached child onto its parent (or socket): zero relative position and rotation, keep the
+    scale. Without that call, detach and attach again; if Unreal refuses, put it back where it was."""
+    try:
+        root.set_relative_location_and_rotation(unreal.Vector(0.0, 0.0, 0.0), unreal.Rotator(0.0, 0.0, 0.0),
+                                                False, False)
+        return True
+    except AttributeError:
+        pass
+    child.detach_from_actor(D.KEEP_WORLD, D.KEEP_WORLD, D.KEEP_WORLD)
+    if child.attach_to_actor(parent, socket, lr, rr, sr, False) is not False and same(parent_of(child), parent):
+        return True
+    K = unreal.AttachmentRule.KEEP_WORLD
+    child.attach_to_actor(parent, socket, K, K, K, False)
+    return False
+
+
 def attach(children, parent, keep_world=None, socket="", match_mobility=None):
     """Attach children under parent, in one undo step. Returns [(actor, status, message)], status "attached",
     "skip" or "error". keep_world False snaps them onto the parent (or socket)."""
@@ -390,7 +396,7 @@ def attach(children, parent, keep_world=None, socket="", match_mobility=None):
         with unreal.ScopedEditorTransaction(title):
             for obj in (parent, attach_point_of(parent)):
                 try:
-                    obj.modify()
+                    obj.modify(False)          # recorded for undo, but its file isn't marked changed (One File Per Actor)
                 except Exception:
                     pass
             for c, mob, resnap in todo:
@@ -401,7 +407,7 @@ def attach(children, parent, keep_world=None, socket="", match_mobility=None):
                     c.modify()
                     root.modify()
                     if was is not None:
-                        was.modify()
+                        was.modify(False)
                     note = ""
                     if mob is not None:
                         saved = _raise_mobility(c, root, mob)
@@ -410,8 +416,9 @@ def attach(children, parent, keep_world=None, socket="", match_mobility=None):
                             ", with %d component%s attached under it" % (extra, "" if extra == 1 else "s"))
                             if extra > 0 else "")
                     if resnap:
-                        c.detach_from_actor(D.KEEP_WORLD, D.KEEP_WORLD, D.KEEP_WORLD)
-                    ok = c.attach_to_actor(parent, socket, lr, rr, sr, False)
+                        ok = _snap_in_place(c, root, parent, socket, D, lr, rr, sr)
+                    else:
+                        ok = c.attach_to_actor(parent, socket, lr, rr, sr, False)
                     if ok is False or not same(parent_of(c), parent):
                         _restore_mobility(saved)
                         results.append((c, "error", "Unreal refused the attach (see the warnings above in the Output Log)"))
@@ -451,7 +458,7 @@ def detach(actors):
                     root = root_of(a)
                     if root is not None:
                         root.modify()
-                    was.modify()
+                    was.modify(False)
                     a.detach_from_actor(D.KEEP_WORLD, D.KEEP_WORLD, D.KEEP_WORLD)
                     if parent_of(a) is None:
                         results.append((a, "detached", "detached from %s" % label(was)))
@@ -1023,4 +1030,5 @@ if unreal is not None and not __name__.endswith("parent_actors"):
     _module.__dict__.update(globals())
     _module.__name__ = "parent_actors"
     sys.modules["parent_actors"] = _module
-    _move_to_module(globals(), _BEFORE_PASTE, _module).show(reuse=False)
+    _imported = getattr(sys.modules.get(__name__), "__dict__", None) is globals()     # a renamed copy, imported
+    _move_to_module(globals(), globals() if _imported else _BEFORE_PASTE, _module).show(reuse=False)
