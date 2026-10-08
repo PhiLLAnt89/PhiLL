@@ -35,6 +35,8 @@ def _enum(name, *members):
 
 BlendMode = _enum("BlendMode", "BLEND_OPAQUE", "BLEND_MASKED", "BLEND_TRANSLUCENT", "BLEND_ADDITIVE")
 ComponentMobility = _enum("ComponentMobility", "STATIC", "STATIONARY", "MOVABLE")
+AttachmentRule = _enum("AttachmentRule", "KEEP_RELATIVE", "KEEP_WORLD", "SNAP_TO_TARGET")
+DetachmentRule = _enum("DetachmentRule", "KEEP_RELATIVE", "KEEP_WORLD")
 NiagaraRendererMotionVectorSetting = _enum("NiagaraRendererMotionVectorSetting", "AUTO_DETECT", "PRECISE", "APPROXIMATE", "DISABLE")
 MaterialProperty = _enum("MaterialProperty", "MP_WORLD_POSITION_OFFSET", "MP_BASE_COLOR", "MP_OPACITY",
                          "MP_EMISSIVE_COLOR", "MP_ROUGHNESS")
@@ -192,6 +194,39 @@ class Actor(Object):
     def get_actor_rotation(self): return self.rot
     def get_actor_scale3d(self): return self.scale
 
+    # --- attachment (like the engine: K2_AttachToActor / K2_DetachFromActor) ---
+    _attach = None              # (parent actor, socket name)
+    attach_log = []             # every successful attach: (child, parent, socket, location rule)
+
+    def get_root_component(self): return self.comps[0] if self.comps else None
+    root_component = property(get_root_component)
+    def get_default_attach_component(self): return self.get_root_component()
+    def get_attach_parent_actor(self): return self._attach[0] if self._attach else None
+
+    def attach_to_actor(self, parent, socket_name, location_rule, rotation_rule, scale_rule, weld_simulated_bodies):
+        mine, theirs = self.get_root_component(), parent.get_default_attach_component()
+        if mine is None or theirs is None:
+            return False
+        if (mine.get_editor_property("mobility") == ComponentMobility.STATIC
+                and theirs.get_editor_property("mobility") != ComponentMobility.STATIC):
+            log_warning("AttachTo: '%s' is not static , cannot attach '%s' which is static to it. Aborting."
+                        % (theirs.get_name(), mine.get_name()))
+            return False
+        p = parent
+        while p is not None:
+            if p is self:
+                log_warning("AttachTo: would form a cycle")
+                return False
+            p = p.get_attach_parent_actor()
+        if location_rule == AttachmentRule.SNAP_TO_TARGET:
+            self.loc = Vector(parent.loc.x, parent.loc.y, parent.loc.z)
+        self._attach = (parent, str(socket_name or ""))
+        Actor.attach_log.append((self, parent, str(socket_name or ""), location_rule))
+        return True
+
+    def detach_from_actor(self, location_rule=None, rotation_rule=None, scale_rule=None):
+        self._attach = None
+
 
 class Pawn(Actor): pass
 class CullDistanceVolume(Actor): pass
@@ -206,7 +241,16 @@ class ActorComponent(Object):
     def get_owner(self): return self._owner
     def is_visible(self): return True
     def get_world_location(self): return self.loc
-    def get_attach_parent(self): return None
+    sockets = ()
+    def get_attach_parent(self):
+        o = self._owner
+        if o is not None and o._attach and o.get_root_component() is self:
+            return o._attach[0].get_default_attach_component()
+        return None
+    def get_attach_socket_name(self):
+        o = self._owner
+        return (o._attach[1] or "None") if (o is not None and o._attach and o.get_root_component() is self) else "None"
+    def get_all_socket_names(self): return list(self.sockets)
     def set_mobility(self, m): self.set_editor_property("mobility", m)
 
 
@@ -636,7 +680,8 @@ class ScopedSlowTask(object):
 
 
 class ScopedEditorTransaction(ScopedSlowTask):
-    def __init__(self, msg): pass
+    titles = []
+    def __init__(self, msg): ScopedEditorTransaction.titles.append(msg)
 
 
 class EditorActorSubsystem(object):

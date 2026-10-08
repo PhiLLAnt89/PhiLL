@@ -28,6 +28,6 @@ def check(name):
     print("%s OK (version %s)" % (name, m.group(1)))
 
 
-for script in ("world_perf_audit.py", "snow_painter.py"):
+for script in ("world_perf_audit.py", "snow_painter.py", "parent_actors.py"):
     check(script)
 print("STATIC OK")
