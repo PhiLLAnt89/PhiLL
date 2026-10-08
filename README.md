@@ -24,7 +24,7 @@ Also in this repo:
 
 **B. One line:** paste this into the Output Log in Python mode. It downloads the v1.1.0 release, **checks its SHA-256** and only then runs it:
 ```python
-import urllib.request as u, hashlib as h; s = u.urlopen("https://raw.githubusercontent.com/PhiLLAnt89/PhiLL/v1.1.0/world_perf_audit." + "py").read(); assert h.sha256(s).hexdigest() == "81c5b26592db7de8ed5b56c28aef1d503091f4c128f9097ce65cff204684f420", "checksum mismatch - not running it"; exec(s.decode("utf-8"), {"__name__": "__main__"})
+import urllib.request as u, hashlib as h; s = u.urlopen("https://raw.githubusercontent.com/PhiLLAnt89/PhiLL/v1.1.0/world_perf_audit." + "py").read(); assert h.sha256(s).hexdigest() == "a164e3851ebc9920e59551a0e1e8bde3d0fb0211aa1dabd3c636606302a9fc09", "checksum mismatch - not running it"; exec(s.decode("utf-8"), {"__name__": "__main__"})
 ```
 **C. File:** *Tools → Execute Python Script…* and pick `world_perf_audit.py`.
 
@@ -98,7 +98,8 @@ w.export_report()                     # HTML (or a .csv path)
 ## Security
 - **The one-liner** checks the downloaded file's SHA-256 against the value published with the release. Never run a version from a link whose hash you can't verify: GitHub serves fork commits under the original repo's URL.
 - **pip install:**
-  - **What gets installed:** `PySide6-Essentials>=6.5,<7`, prebuilt wheels only (`--only-binary=:all:`, so no build scripts run), straight from PyPI.
+  - **What gets installed:** `PySide6-Essentials>=6.5,<6.12`, prebuilt wheels only (`--only-binary=:all:`, so no build scripts run), straight from PyPI.
+  - **Not 6.12:** PySide6 6.12.0 frees Python's None, which crashes Unreal's Python 3.11. An installed 6.12 isn't loaded; the tool offers to replace it.
   - **pip settings are ignored:** `--isolated` means `PIP_*` environment variables and pip config files can't redirect the index.
   - **Where it goes:** a per-user folder outside the project, added to `sys.path` without running `.pth` files. Delete the folder to uninstall.
 - **What the tool writes:**
@@ -112,7 +113,7 @@ w.export_report()                     # HTML (or a .csv path)
 ## Tests
 The tests run the whole tool, UI included (rendered offscreen), against `tests/mock/unreal.py`, a small fake of the Unreal Python API:
 ```
-pip install PySide6-Essentials pyflakes
+pip install "PySide6-Essentials>=6.5,<6.12" pyflakes
 python tests/run_all.py
 ```
 CI runs the same on every push (`.github/workflows/tests.yml`). The mock checks the tool's logic, not Unreal itself, so do a manual pass in the editor before each release (see [RELEASE.md](RELEASE.md)).

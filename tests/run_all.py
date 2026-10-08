@@ -1,6 +1,6 @@
 """Run the test suite: every test_*.py in its own process, against tests/mock/unreal (a fake of the Unreal Python API).
 
-    python tests/run_all.py            (needs: pip install PySide6-Essentials pyflakes)
+    python tests/run_all.py            (needs: pip install "PySide6-Essentials>=6.5,<6.12" pyflakes)
 
 Qt renders offscreen. Screenshots of the UI land in tests/_out/.
 """

@@ -36,6 +36,7 @@
 - Ini writes: only `DefaultEngine.ini` and `DefaultScalability.ini`. Journal entries for quality levels and distance-field scale are validated (section names, console variable, numbers).
 - A journal with malformed entries no longer breaks the Revert menu.
 - Scan, Fix and Revert wait while a capture or screenshot job runs, so measurements and row states stay consistent.
+- **PySide6 6.12.0 is refused:** it drops a reference to Python's None each time a Qt call returns an empty value. Python 3.11, which Unreal 5.6 ships, can then free None and abort the editor. The installer now asks for `PySide6-Essentials>=6.5,<6.12`. An installed 6.12 isn't loaded: the tool explains the problem and offers to replace it, or gives the downgrade command if it lives outside the tool's folder. Snow Painter and Parent Actors have the same guard.
 
 ## 1.0.0 – first production release
 

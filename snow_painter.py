@@ -1398,6 +1398,45 @@ def _deps_dir():
     return os.path.join(base, "UnrealWorldPerfAudit", "py%d%d" % sys.version_info[:2], "site-packages")
 
 
+# PySide6 6.12.0 drops a reference to Python's None each time a Qt call returns an empty value (an unset
+# QModelIndex.data() role, for example). Before Python 3.12 (Unreal 5.6 ships 3.11) None can then be freed, which
+# aborts the editor. The installer stays below 6.12 and an installed 6.12 is not loaded.
+QT_SPEC = "PySide6-Essentials>=6.5,<6.12"
+_QT_BAD = []          # [(version, folder)] of a PySide6 that was found but not loaded
+
+
+def _bad_pyside6():
+    """(version, folder) of an installed PySide6 known to crash this Python, else None."""
+    if sys.version_info >= (3, 12):
+        return None
+    try:
+        m = importlib.import_module("PySide6")
+        v = str(m.__version__)
+    except Exception:
+        return None
+    if v.split(".")[:2] != ["6", "12"]:
+        return None
+    return v, os.path.dirname(os.path.dirname(os.path.abspath(m.__file__)))
+
+
+def _bad_qt_dialog():
+    """Explain a broken PySide6 and offer the fix. Returns True if Unreal has to be restarted."""
+    v, where = _QT_BAD[0]
+    head = ("PySide6 %s (in %s) has a bug that crashes Unreal: it frees Python's None, which Unreal's "
+            "Python %d.%d can't survive. It was not loaded.\n\n" % (v, where, sys.version_info[0], sys.version_info[1]))
+    if os.path.normcase(os.path.abspath(where)) == os.path.normcase(os.path.abspath(_deps_dir())):
+        r = unreal.EditorDialog.show_message(TOOL_NAME, head + "Yes: replace it with PySide6 6.11 (one-time download), "
+                                             "then restart Unreal.", unreal.AppMsgType.YES_NO)
+        if r == unreal.AppReturnType.YES and install_pyside6():
+            unreal.EditorDialog.show_message(TOOL_NAME, "Done. Restart Unreal, then open the tool again.",
+                                             unreal.AppMsgType.OK)
+            return True
+        return False
+    unreal.EditorDialog.show_message(TOOL_NAME, head + "Downgrade it, then restart Unreal:\n\"%s\" -m pip install \"%s\""
+                                     % (unreal.get_interpreter_executable_path(), QT_SPEC), unreal.AppMsgType.OK)
+    return True
+
+
 def _load_qt():
     global _QT
     if _QT is not None:
@@ -1406,6 +1445,12 @@ def _load_qt():
     if os.path.isdir(d) and d not in sys.path:
         sys.path.append(d)      # appended (never shadows engine modules); no .pth files are executed
     for binding in ("PySide6", "PyQt6", "PySide2", "PyQt5"):
+        if binding == "PySide6":
+            bad = _bad_pyside6()
+            if bad:
+                if bad not in _QT_BAD:
+                    _QT_BAD.append(bad)
+                continue
         try:
             mods = [importlib.import_module("%s.%s" % (binding, m)) for m in ("QtCore", "QtGui", "QtWidgets")]
             _QT = tuple(mods)
@@ -1423,7 +1468,7 @@ def install_pyside6():
     py = unreal.get_interpreter_executable_path()
     cmd = [py, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade",
            "--isolated", "--index-url", "https://pypi.org/simple",
-           "--only-binary=:all:", "--target", target, "PySide6-Essentials>=6.5,<7"]
+           "--only-binary=:all:", "--target", target, QT_SPEC]
     _log("Installing PySide6: %s" % " ".join(cmd))
     with unreal.ScopedSlowTask(1, "Installing PySide6 for %s (one-time, ~100 MB)..." % TOOL_NAME) as task:
         task.make_dialog(False)
@@ -1839,6 +1884,11 @@ def _stop_qt_tick():
 def show(reuse=True):
     """Open the tool window (offers to install PySide6 if Qt is missing)."""
     qt = _load_qt()
+    if qt is None and _QT_BAD:
+        _bad_qt_dialog()
+        _log("Text mode: select meshes, then snow_painter.start(); paint in Mesh Paint mode; "
+             "snow_painter.bake() when done.")
+        return None
     if qt is None:
         r = unreal.EditorDialog.show_message(
             TOOL_NAME, "The panel needs Qt for Python (PySide6), which Unreal doesn't ship.\n\n"
